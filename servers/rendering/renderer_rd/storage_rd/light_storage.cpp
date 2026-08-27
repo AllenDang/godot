@@ -1560,6 +1560,19 @@ void LightStorage::_reflection_atlas_clear(ReflectionAtlas *p_reflection_atlas) 
 	RD::get_singleton()->free_rid(p_reflection_atlas->reflection);
 	p_reflection_atlas->reflection = RID();
 
+	// Faces first, then their views, then the cube they slice, so every free is a leaf
+	// and nothing is torn down twice by the dependency cascade in RenderingDevice.
+	for (int i = 0; i < 6; i++) {
+		RD::get_singleton()->free_rid(p_reflection_atlas->color_fbs[i]);
+		p_reflection_atlas->color_fbs[i] = RID();
+
+		RD::get_singleton()->free_rid(p_reflection_atlas->color_views[i]);
+		p_reflection_atlas->color_views[i] = RID();
+	}
+
+	RD::get_singleton()->free_rid(p_reflection_atlas->color_buffer);
+	p_reflection_atlas->color_buffer = RID();
+
 	RD::get_singleton()->free_rid(p_reflection_atlas->depth_fb);
 	p_reflection_atlas->depth_fb = RID();
 
