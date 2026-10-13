@@ -71,6 +71,32 @@ void RendererSceneRenderRD::sky_set_mode(RID p_sky, RSE::SkyMode p_mode) {
 	sky.sky_set_mode(p_sky, p_mode);
 }
 
+void RendererSceneRenderRD::sky_request_capture(RID p_sky, RID p_material, int64_t p_generation, const Vector3 &p_origin, double p_capture_time, const Color &p_fallback, RID p_environment) {
+	sky.sky_request_capture(p_sky, p_material, p_generation, p_origin, p_capture_time, p_fallback, p_environment);
+}
+Dictionary RendererSceneRenderRD::sky_get_capture_status(RID p_sky) const {
+	return sky.sky_get_capture_status(p_sky);
+}
+void RendererSceneRenderRD::sky_set_physical_source(RID p_sky, const Dictionary &p_source) {
+	ERR_FAIL_NULL(sky.get_sky(p_sky));
+	sky.physical_sky_view.set_source(p_sky, p_source);
+}
+Dictionary RendererSceneRenderRD::sky_get_physical_source_status(RID p_sky) const {
+	return sky.physical_sky_view.get_status(p_sky);
+}
+Dictionary RendererSceneRenderRD::get_physical_sky_capabilities() const {
+	return RendererRD::PhysicalSkyView::get_capabilities();
+}
+bool RendererSceneRenderRD::prepare_reflection_probe_sky(RID p_environment, RID p_probe, const Vector3 &p_origin) {
+	return sky.physical_sky_view.prepare(p_environment.is_valid() ? environment_get_sky(p_environment) : RID(), p_probe, p_origin);
+}
+void RendererSceneRenderRD::finish_reflection_probe_sky(bool p_completed) {
+	sky.physical_sky_view.finish(p_completed);
+}
+void RendererSceneRenderRD::sky_cancel_capture(RID p_sky) {
+	sky.sky_cancel_capture(p_sky);
+}
+
 void RendererSceneRenderRD::sky_set_material(RID p_sky, RID p_material) {
 	sky.sky_set_material(p_sky, p_material);
 }
@@ -1556,6 +1582,10 @@ void RendererSceneRenderRD::set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_d
 
 void RendererSceneRenderRD::update() {
 	sky.update_dirty_skys();
+}
+
+void RendererSceneRenderRD::update_sky_captures() {
+	sky.process_captures();
 }
 
 void RendererSceneRenderRD::set_time(double p_time, double p_step) {

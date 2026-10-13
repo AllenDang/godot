@@ -47,7 +47,8 @@ uint64_t RenderingDeviceDriver::api_trait_get(ApiTrait p_trait) {
 			return 1;
 		case API_TRAIT_SECONDARY_VIEWPORT_SCISSOR:
 			return 1;
-		case API_TRAIT_CLEARS_WITH_COPY_ENGINE:
+		case API_TRAIT_BUFFER_CLEARS_WITH_COPY_ENGINE:
+		case API_TRAIT_TEXTURE_CLEARS_WITH_COPY_ENGINE:
 			return true;
 		case API_TRAIT_USE_GENERAL_IN_COPY_QUEUES:
 			return false;
@@ -61,5 +62,11 @@ uint64_t RenderingDeviceDriver::api_trait_get(ApiTrait p_trait) {
 }
 
 /******************/
+
+void RenderingDeviceDriver::command_begin_compute_pass(CommandBufferID p_cmd_buffer) {
+}
+
+void RenderingDeviceDriver::command_end_compute_pass(CommandBufferID p_cmd_buffer) {
+}
 
 RenderingDeviceDriver::~RenderingDeviceDriver() {}

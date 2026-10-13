@@ -3024,6 +3024,13 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("sky_set_radiance_size", "sky", "radiance_size"), &RenderingServer::sky_set_radiance_size);
 	ClassDB::bind_method(D_METHOD("sky_set_mode", "sky", "mode"), &RenderingServer::sky_set_mode);
 	ClassDB::bind_method(D_METHOD("sky_set_material", "sky", "material"), &RenderingServer::sky_set_material);
+	ClassDB::bind_method(D_METHOD("sky_request_capture", "sky", "snapshot_material", "generation", "origin", "capture_time", "fallback", "snapshot_environment"), &RenderingServer::sky_request_capture);
+	ClassDB::bind_method(D_METHOD("sky_get_capture_status", "sky"), &RenderingServer::sky_get_capture_status);
+	ClassDB::bind_method(D_METHOD("sky_set_physical_source", "sky", "source"), &RenderingServer::sky_set_physical_source);
+	ClassDB::bind_method(D_METHOD("sky_get_physical_source_status", "sky"), &RenderingServer::sky_get_physical_source_status);
+	ClassDB::bind_method(D_METHOD("get_physical_sky_capabilities"), &RenderingServer::get_physical_sky_capabilities);
+	ClassDB::bind_method(D_METHOD("get_sky_view_shader_source"), &RenderingServer::get_sky_view_shader_source);
+	ClassDB::bind_method(D_METHOD("sky_cancel_capture", "sky"), &RenderingServer::sky_cancel_capture);
 	ClassDB::bind_method(D_METHOD("sky_bake_panorama", "sky", "energy", "bake_irradiance", "size"), &RenderingServer::sky_bake_panorama);
 
 	BIND_ENUM_CONSTANT(RSE::SKY_MODE_AUTOMATIC);
@@ -3043,6 +3050,7 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
 	BIND_ENUM_CONSTANT(RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	BIND_ENUM_CONSTANT(RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
+	BIND_ENUM_CONSTANT(RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_POST_OPAQUE_FOG);
 
 	BIND_ENUM_CONSTANT(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE);
 	BIND_ENUM_CONSTANT(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE);
@@ -3075,6 +3083,15 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_adjustment", "env", "enable", "brightness", "contrast", "saturation", "use_1d_color_correction", "color_correction"), &RenderingServer::environment_set_adjustment);
 	ClassDB::bind_method(D_METHOD("environment_set_ssr", "env", "enable", "max_steps", "fade_in", "fade_out", "depth_tolerance"), &RenderingServer::environment_set_ssr);
 	ClassDB::bind_method(D_METHOD("environment_set_ssao", "env", "enable", "radius", "intensity", "power", "detail", "horizon", "sharpness", "light_affect", "ao_channel_affect"), &RenderingServer::environment_set_ssao);
+	ClassDB::bind_method(D_METHOD("environment_set_height_fog_state", "env", "state"), &RenderingServer::environment_set_height_fog_state);
+	ClassDB::bind_method(D_METHOD("environment_get_height_fog_state", "env"), &RenderingServer::environment_get_height_fog_state);
+	ClassDB::bind_method(D_METHOD("environment_get_height_fog_status", "env"), &RenderingServer::environment_get_height_fog_status);
+	ClassDB::bind_method(D_METHOD("get_height_fog_capabilities"), &RenderingServer::get_height_fog_capabilities);
+	ClassDB::bind_method(D_METHOD("environment_set_aerial_perspective_state", "environment", "state"), &RenderingServer::environment_set_aerial_perspective_state);
+	ClassDB::bind_method(D_METHOD("environment_get_aerial_perspective_state", "environment"), &RenderingServer::environment_get_aerial_perspective_state);
+	ClassDB::bind_method(D_METHOD("environment_get_aerial_perspective_status", "environment"), &RenderingServer::environment_get_aerial_perspective_status);
+	ClassDB::bind_method(D_METHOD("get_aerial_perspective_capabilities"), &RenderingServer::get_aerial_perspective_capabilities);
+	ClassDB::bind_method(D_METHOD("get_atmosphere_shader_library"), &RenderingServer::get_atmosphere_shader_library);
 	ClassDB::bind_method(D_METHOD("environment_set_fog", "env", "enable", "light_color", "light_energy", "sun_scatter", "density", "height", "height_density", "aerial_perspective", "sky_affect", "fog_mode"), &RenderingServer::environment_set_fog, DEFVAL(RSE::ENV_FOG_MODE_EXPONENTIAL));
 	ClassDB::bind_method(D_METHOD("environment_set_fog_depth", "env", "curve", "begin", "end"), &RenderingServer::environment_set_fog_depth);
 	ClassDB::bind_method(D_METHOD("environment_set_sdfgi", "env", "enable", "cascades", "min_cell_size", "y_scale", "use_occlusion", "bounce_feedback", "read_sky", "energy", "normal_bias", "probe_bias"), &RenderingServer::environment_set_sdfgi);

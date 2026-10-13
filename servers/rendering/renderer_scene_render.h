@@ -80,6 +80,21 @@ public:
 	virtual void sky_set_radiance_size(RID p_sky, int p_radiance_size) = 0;
 	virtual void sky_set_mode(RID p_sky, RSE::SkyMode p_samples) = 0;
 	virtual void sky_set_material(RID p_sky, RID p_material) = 0;
+	virtual void sky_request_capture(RID p_sky, RID p_material, int64_t p_generation, const Vector3 &p_origin, double p_capture_time, const Color &p_fallback, RID p_environment) {}
+	virtual Dictionary sky_get_capture_status(RID p_sky) const {
+		Dictionary d;
+		d["state"] = "UNSUPPORTED";
+		return d;
+	}
+	virtual void sky_cancel_capture(RID p_sky) {}
+	virtual void sky_set_physical_source(RID p_sky, const Dictionary &p_source) {}
+	virtual Dictionary sky_get_physical_source_status(RID p_sky) const;
+	virtual Dictionary get_physical_sky_capabilities() const;
+	String get_sky_view_shader_source() const;
+	// Internal native six-face lifecycle; no scheduling API is exposed.
+	virtual bool prepare_reflection_probe_sky(RID p_environment, RID p_probe, const Vector3 &p_origin) { return true; }
+	virtual void finish_reflection_probe_sky(bool p_completed = false) {}
+
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) = 0;
 
 	/* COMPOSITOR EFFECT API */
@@ -147,6 +162,16 @@ public:
 	RendererEnvironmentStorage::TonemapParameters environment_get_tonemap_parameters(RID p_env, bool p_limit_agx_white, float p_output_max_value) const;
 
 	// Fog
+	void environment_set_height_fog_state(RID p_env, const Dictionary &p_state);
+	Dictionary environment_get_height_fog_state(RID p_env) const;
+	Dictionary environment_get_height_fog_status(RID p_env) const;
+	Dictionary get_height_fog_capabilities() const;
+	void environment_set_aerial_perspective_state(RID p_env, const Dictionary &p_state);
+	Dictionary environment_get_aerial_perspective_state(RID p_env) const;
+	Dictionary environment_get_aerial_perspective_status(RID p_env) const;
+	Dictionary get_aerial_perspective_capabilities() const;
+	String get_atmosphere_shader_library() const;
+
 	void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode);
 	bool environment_get_fog_enabled(RID p_env) const;
 	RSE::EnvironmentFogMode environment_get_fog_mode(RID p_env) const;
@@ -354,5 +379,6 @@ public:
 	virtual void material_set_use_debanding(bool p_enable) = 0;
 
 	virtual void update() = 0;
+	virtual void update_sky_captures() {}
 	virtual ~RendererSceneRender() {}
 };

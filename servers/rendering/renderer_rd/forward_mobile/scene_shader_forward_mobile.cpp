@@ -236,6 +236,13 @@ void SceneShaderForwardMobile::ShaderData::set_code(const String &p_code) {
 	print_line("\n**fragment_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
 #endif
 
+	if (blend_mode == BLEND_MODE_ADD || blend_mode == BLEND_MODE_SUB) {
+		gen_code.defines.push_back("\n#define HEIGHT_FOG_BLEND_ADD_SUB\n");
+	} else if (blend_mode == BLEND_MODE_MUL) {
+		gen_code.defines.push_back("\n#define HEIGHT_FOG_BLEND_MUL\n");
+	} else if (blend_mode == BLEND_MODE_PREMULTIPLIED_ALPHA) {
+		gen_code.defines.push_back("\n#define HEIGHT_FOG_BLEND_PREMULTIPLIED\n");
+	}
 	SceneShaderForwardMobile::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
 	ubo_size = gen_code.uniform_total_size;
@@ -421,6 +428,11 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 		} else {
 			// Unknown pipeline version.
 		}
+	}
+
+	if (p_pipeline_key.version >= SHADER_VERSION_COLOR_FOG_MASK) {
+		// These variants are only used by opaque/alpha-clipped surfaces.
+		blend_state = RD::PipelineColorBlendState::create_disabled(2);
 	}
 
 	// Convert the specialization from the key to pipeline specialization constants.
@@ -617,6 +629,10 @@ void SceneShaderForwardMobile::init(const String p_defines) {
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group_multiview, base_define + "\n#define USE_MULTIVIEW\n#define USE_LIGHTMAP\n", false)); // SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group_multiview, base_define + "\n#define USE_MULTIVIEW\n#define MODE_RENDER_DEPTH\n#define SHADOW_PASS\n", false)); // SHADER_VERSION_SHADOW_PASS_MULTIVIEW
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group_multiview, base_define + "\n#define USE_MULTIVIEW\n#define MODE_RENDER_MOTION_VECTORS\n", false)); // SHADER_VERSION_MOTION_VECTORS_MULTIVIEW
+				shader_versions.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define DEFER_OPAQUE_FOG\n", default_enabled));
+				shader_versions.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define DEFER_OPAQUE_FOG\n#define USE_LIGHTMAP\n", default_enabled));
+				shader_versions.push_back(ShaderRD::VariantDefine(shader_group_multiview, base_define + "\n#define DEFER_OPAQUE_FOG\n#define USE_MULTIVIEW\n", false));
+				shader_versions.push_back(ShaderRD::VariantDefine(shader_group_multiview, base_define + "\n#define DEFER_OPAQUE_FOG\n#define USE_MULTIVIEW\n#define USE_LIGHTMAP\n", false));
 			}
 		}
 

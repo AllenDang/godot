@@ -838,6 +838,13 @@ public:
 	FUNC2(sky_set_radiance_size, RID, int)
 	FUNC2(sky_set_mode, RID, RSE::SkyMode)
 	FUNC2(sky_set_material, RID, RID)
+	FUNC7(sky_request_capture, RID, RID, int64_t, const Vector3 &, double, const Color &, RID)
+	FUNC1RC(Dictionary, sky_get_capture_status, RID)
+	FUNC2(sky_set_physical_source, RID, const Dictionary &)
+	FUNC1RC(Dictionary, sky_get_physical_source_status, RID)
+	FUNC0RC(Dictionary, get_physical_sky_capabilities)
+	FUNC0RC(String, get_sky_view_shader_source)
+	FUNC1(sky_cancel_capture, RID)
 	FUNC4R(Ref<Image>, sky_bake_panorama, RID, float, bool, const Size2i &)
 
 	/* ENVIRONMENT */
@@ -872,6 +879,16 @@ public:
 	FUNC2(environment_set_tonemap_agx_contrast, RID, float)
 
 	FUNC7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)
+
+	FUNC2(environment_set_height_fog_state, RID, const Dictionary &)
+	FUNC1RC(Dictionary, environment_get_height_fog_state, RID)
+	FUNC1RC(Dictionary, environment_get_height_fog_status, RID)
+	FUNC0RC(Dictionary, get_height_fog_capabilities)
+	FUNC2(environment_set_aerial_perspective_state, RID, const Dictionary &)
+	FUNC1RC(Dictionary, environment_get_aerial_perspective_state, RID)
+	FUNC1RC(Dictionary, environment_get_aerial_perspective_status, RID)
+	FUNC0RC(Dictionary, get_aerial_perspective_capabilities)
+	FUNC0RC(String, get_atmosphere_shader_library)
 
 	FUNC11(environment_set_fog, RID, bool, const Color &, float, float, float, float, float, float, float, RSE::EnvironmentFogMode)
 
