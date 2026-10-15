@@ -3,7 +3,14 @@
 #include "ange_tracy_abi.h"
 #include "core/profiling/profiling.h"
 
-#if defined(GODOT_USE_TRACY) && defined(TRACY_ON_DEMAND) && defined(__APPLE__) && defined(__aarch64__)
+// Hosts whose extension side looks the entry point up in the main executable:
+// macOS arm64 (dlsym RTLD_MAIN_ONLY) and Windows x86_64 (GetProcAddress on
+// GetModuleHandle(nullptr)).
+#if (defined(__APPLE__) && defined(__aarch64__)) || (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)))
+#define ANGE_TRACY_HOST_PLATFORM 1
+#endif
+
+#if defined(GODOT_USE_TRACY) && defined(TRACY_ON_DEMAND) && defined(ANGE_TRACY_HOST_PLATFORM)
 #include <new>
 #include <common/TracyVersion.hpp>
 
@@ -35,11 +42,15 @@ static void ange_tracy_end(AngeTracyZoneStorage *storage) {
 #endif
 
 extern "C"
-#if defined(__APPLE__)
+#if defined(_WIN32)
+// Puts the symbol in the executable's export table for GetProcAddress. The
+// linker keeps this object alive via /INCLUDE (core/profiling/SCsub).
+__declspec(dllexport)
+#elif defined(__APPLE__)
 __attribute__((visibility("default")))
 #endif
 const AngeTracyHostApiV1 *ange_tracy_get_api_v1() {
-#if defined(GODOT_USE_TRACY) && defined(TRACY_ON_DEMAND) && defined(__APPLE__) && defined(__aarch64__)
+#if defined(GODOT_USE_TRACY) && defined(TRACY_ON_DEMAND) && defined(ANGE_TRACY_HOST_PLATFORM)
 	static const AngeTracyHostApiV1 api = {
 		ANGE_TRACY_ABI_VERSION, sizeof(AngeTracyHostApiV1),
 		ANGE_TRACY_STORAGE_SIZE, ANGE_TRACY_STORAGE_ALIGNMENT,
