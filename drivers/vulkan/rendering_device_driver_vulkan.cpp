@@ -2006,6 +2006,10 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 				alloc_create_info.pool = _find_or_create_small_allocs_pool(mem_type_index);
 			}
 		} break;
+		case MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE: {
+			// This driver does not report SUPPORTS_GPU_MAPPABLE_BUFFER.
+			ERR_FAIL_V_MSG(BufferID(), "GPU mappable buffers are unsupported on this device.");
+		} break;
 	}
 
 	VkBuffer vk_buffer = VK_NULL_HANDLE;
