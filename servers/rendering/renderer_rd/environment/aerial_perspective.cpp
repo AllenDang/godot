@@ -1,8 +1,37 @@
+/**************************************************************************/
+/*  aerial_perspective.cpp                                                */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
 #include "aerial_perspective.h"
 
-#include "atmosphere_shader_library.h"
-
 #include "core/os/os.h"
+#include "servers/rendering/renderer_rd/environment/atmosphere_shader_library.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -112,13 +141,13 @@ AerialPerspective::~AerialPerspective() {
 	environments.clear();
 	RD *rd = RD::get_singleton();
 	if (pipeline.is_valid()) {
-		rd->free(pipeline);
+		rd->free_rid(pipeline);
 	}
 	if (shader.is_valid()) {
-		rd->free(shader);
+		rd->free_rid(shader);
 	}
 	if (sampler.is_valid()) {
-		rd->free(sampler);
+		rd->free_rid(sampler);
 	}
 	singleton = nullptr;
 }
@@ -128,7 +157,7 @@ AerialPerspective::Source::~Source() {
 	}
 	for (RID texture : textures) {
 		if (texture.is_valid()) {
-			RD::get_singleton()->free(texture);
+			RD::get_singleton()->free_rid(texture);
 		}
 	}
 }
@@ -147,15 +176,15 @@ void AerialPerspective::View::free_data() {
 	if (RD::get_singleton()) {
 		for (RID &texture : volumes) {
 			if (texture.is_valid()) {
-				RD::get_singleton()->free(texture);
+				RD::get_singleton()->free_rid(texture);
 			}
 			texture = RID();
 		}
 		if (uniform_buffer.is_valid()) {
-			RD::get_singleton()->free(uniform_buffer);
+			RD::get_singleton()->free_rid(uniform_buffer);
 		}
 		if (medium_buffer.is_valid()) {
-			RD::get_singleton()->free(medium_buffer);
+			RD::get_singleton()->free_rid(medium_buffer);
 		}
 	}
 	uniform_buffer = RID();
@@ -476,10 +505,10 @@ bool AerialPerspective::render_view(const RenderDataRD *p_data, Ref<View> view, 
 	// before all draws, which would give serial probe faces the last face's
 	// camera. Immutable per-dispatch UBOs retain their own frame data.
 	if (view->uniform_buffer.is_valid()) {
-		rd->free(view->uniform_buffer);
+		rd->free_rid(view->uniform_buffer);
 	}
 	if (view->medium_buffer.is_valid()) {
-		rd->free(view->medium_buffer);
+		rd->free_rid(view->medium_buffer);
 	}
 	view->uniform_buffer = rd->uniform_buffer_create(sizeof(data), Span<uint8_t>(reinterpret_cast<uint8_t *>(&data), sizeof(data)));
 #ifdef DEBUG_ENABLED

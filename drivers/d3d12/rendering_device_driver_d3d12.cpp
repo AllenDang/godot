@@ -913,6 +913,10 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 				resource_desc.Flags = resource_desc.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 			}
 		} break;
+		case MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE: {
+			// This driver does not report SUPPORTS_GPU_MAPPABLE_BUFFER.
+			ERR_FAIL_V_MSG(BufferID(), "GPU mappable buffers are unsupported on this device.");
+		} break;
 	}
 
 	ComPtr<ID3D12Resource> buffer;
@@ -5863,7 +5867,9 @@ uint64_t RenderingDeviceDriverD3D12::api_trait_get(ApiTrait p_trait) {
 			return D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 		case API_TRAIT_SECONDARY_VIEWPORT_SCISSOR:
 			return false;
-		case API_TRAIT_CLEARS_WITH_COPY_ENGINE:
+		case API_TRAIT_BUFFER_CLEARS_WITH_COPY_ENGINE:
+			return false;
+		case API_TRAIT_TEXTURE_CLEARS_WITH_COPY_ENGINE:
 			return false;
 		case API_TRAIT_USE_GENERAL_IN_COPY_QUEUES:
 			return true;

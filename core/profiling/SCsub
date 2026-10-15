@@ -108,6 +108,11 @@ elif env["profiler_path"]:
 if env["profiler"] == "tracy" and env["platform"] == "macos" and env["arch"] == "arm64":
     env.Append(LINKFLAGS=["-Wl,-u,_ange_tracy_get_api_v1"])
 
+# Pull the bridge object out of the core static library so its dllexport
+# lands in the executable's export table (GetProcAddress from the extension).
+if env["profiler"] == "tracy" and env["platform"] == "windows" and env["arch"] == "x86_64" and env.msvc:
+    env.Append(LINKFLAGS=["/INCLUDE:ange_tracy_get_api_v1"])
+
 env.CommandNoCache(
     "profiling.gen.h",
     [
