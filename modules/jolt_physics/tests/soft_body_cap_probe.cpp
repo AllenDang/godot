@@ -32,7 +32,6 @@
 
 #include "soft_body_cap_probe.h"
 
-#include "../capabilities/soft_body_capabilities.h"
 #include "../jolt_physics_server_3d.h"
 #include "../misc/jolt_type_conversions.h"
 #include "../objects/jolt_soft_body_3d.h"
@@ -47,10 +46,6 @@
 #include <Jolt/Jolt.h>
 
 #include <Jolt/Physics/Body/Body.h>
-#include <Jolt/Physics/Collision/CastResult.h>
-#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
-#include <Jolt/Physics/Collision/RayCast.h>
-#include <Jolt/Physics/Collision/ShapeFilter.h>
 #include <Jolt/Physics/SoftBody/SoftBodyContactListener.h>
 #include <Jolt/Physics/SoftBody/SoftBodyManifold.h>
 #include <Jolt/Physics/SoftBody/SoftBodyMotionProperties.h>
@@ -58,7 +53,6 @@
 #include <Jolt/Physics/StateRecorder.h>
 
 #include <atomic>
-#include <cfloat>
 
 namespace {
 
@@ -88,22 +82,6 @@ public:
 	bool IsEOF() const override { return failed; }
 	bool IsFailed() const override { return failed; }
 };
-
-// Unit-spaced +X chain: N-1 stretch-shear rods and N-2 bend-twist constraints.
-void build_chain(JPH::SoftBodySharedSettings &r_settings, int p_joints) {
-	for (int i = 0; i < p_joints; i++) {
-		JPH::SoftBodySharedSettings::Vertex vertex;
-		vertex.mPosition = JPH::Float3((float)i, 0.0f, 0.0f);
-		vertex.mInvMass = 1.0f;
-		r_settings.mVertices.push_back(vertex);
-	}
-	for (int i = 0; i + 1 < p_joints; i++) {
-		r_settings.mRodStretchShearConstraints.push_back(JPH::SoftBodySharedSettings::RodStretchShear((JPH::uint32)i, (JPH::uint32)(i + 1), 0.0f));
-	}
-	for (int i = 0; i + 2 < p_joints; i++) {
-		r_settings.mRodBendTwistConstraints.push_back(JPH::SoftBodySharedSettings::RodBendTwist((JPH::uint32)i, (JPH::uint32)(i + 1), 0.0f));
-	}
-}
 
 } // namespace
 
@@ -190,42 +168,6 @@ Constraint face(RID p_body, int p_index) {
 	}
 	return result;
 }
-int update_group_count(RID p_body) {
-	const auto *motion = resolve(p_body);
-	if (motion == nullptr) {
-		return -1;
-	}
-	const auto &settings = *motion->GetSettings();
-	// Read private update groups through the public binary-state stream.
-	SnapshotRecorder prefix, full;
-	prefix.Write(settings.mVertices);
-	prefix.Write(settings.mFaces);
-	prefix.Write(settings.mEdgeConstraints);
-	prefix.Write(settings.mDihedralBendConstraints);
-	prefix.Write(settings.mVolumeConstraints);
-	prefix.Write(settings.mSkinnedConstraints);
-	settings.SaveBinaryState(full);
-	size_t offset = prefix.bytes.size();
-	for (size_t stride : { sizeof(uint32_t), sizeof(JPH::SoftBodySharedSettings::LRA) }) {
-		if (offset + sizeof(uint32_t) > size_t(full.bytes.size())) {
-			return -1;
-		}
-		uint32_t count;
-		memcpy(&count, full.bytes.ptr() + offset, sizeof(count));
-		offset += sizeof(count);
-		if (count > (size_t(full.bytes.size()) - offset) / stride) {
-			return -1;
-		}
-		offset += count * stride;
-	}
-	if (offset + sizeof(uint32_t) > size_t(full.bytes.size())) {
-		return -1;
-	}
-	uint32_t count;
-	memcpy(&count, full.bytes.ptr() + offset, sizeof(count));
-	return count <= INT32_MAX ? int(count) : -1;
-}
-
 Constraint edge(RID p_body, int p_index) {
 	Constraint result;
 	const auto *motion = resolve(p_body);
@@ -470,18 +412,6 @@ int ContactScope::count() const {
 	return implementation == nullptr ? -1 : static_cast<ContactRecorder *>(implementation)->contacts.load(std::memory_order_relaxed);
 }
 
-bool face_ray_hit(RID p_body, const Vector3 &p_origin, const Vector3 &p_direction) {
-	if (resolve(p_body) == nullptr) {
-		return false;
-	}
-	const auto *body = JoltPhysicsServer3D::get_singleton()->get_soft_body_for_tests(p_body)->get_jolt_body();
-	JPH::RayCastSettings settings;
-	settings.mBackFaceModeTriangles = JPH::EBackFaceMode::IgnoreBackFaces;
-	JPH::AllHitCollisionCollector<JPH::CastRayCollector> collector;
-	body->GetShape()->CastRay(JPH::RayCast(to_jolt(p_origin), to_jolt(p_direction)), settings, JPH::SubShapeIDCreator(), collector, JPH::ShapeFilter());
-	return collector.HadHit();
-}
-
 bool volume_control(RID p_body) {
 	auto *server = JoltPhysicsServer3D::get_singleton();
 	auto *body = server == nullptr ? nullptr : server->get_soft_body_for_tests(p_body);
@@ -521,50 +451,12 @@ bool set_vertex_local(RID p_body, int p_vertex, const Vector3 &p_position, const
 	return true;
 }
 
-bool skip_next_skin_call(RID p_body) {
-	auto *server = JoltPhysicsServer3D::get_singleton();
-	auto *body = server == nullptr ? nullptr : server->get_soft_body_for_tests(p_body);
-	if (body == nullptr) {
-		return false;
-	}
-	body->skip_next_skin_call_for_tests();
-	return true;
-}
-
 bool invoke_pre_step(RID p_body, float p_step) {
 	if (resolve(p_body) == nullptr || !Math::is_finite(p_step) || p_step <= 0) {
 		return false;
 	}
 	JoltPhysicsServer3D::get_singleton()->get_soft_body_for_tests(p_body)->pre_step(p_step);
 	return true;
-}
-
-Constraint fixture_bend(bool p_square, int p_mode, int &r_edges, int &r_dihedrals) {
-	JPH::SoftBodySharedSettings settings;
-	settings.mVertices.emplace_back(JPH::Float3(0, 0, 0));
-	settings.mVertices.emplace_back(JPH::Float3(1, 0, 0));
-	settings.mVertices.emplace_back(JPH::Float3(1, 0, 1));
-	settings.mVertices.emplace_back(JPH::Float3(p_square ? 0.0f : -0.7f, 0, p_square ? 1.0f : 0.4f));
-	settings.mFaces.emplace_back(2, 1, 0);
-	settings.mFaces.emplace_back(3, 2, 0);
-	JPH::SoftBodySharedSettings::VertexAttributes attributes;
-	attributes.mBendCompliance = 1.0e-4f;
-	const auto mode = p_mode == 1 ? JPH::SoftBodySharedSettings::EBendType::Distance : p_mode == 2 ? JPH::SoftBodySharedSettings::EBendType::Dihedral
-																								   : JPH::SoftBodySharedSettings::EBendType::None;
-	settings.CreateConstraints(&attributes, 1, mode);
-	r_edges = settings.mEdgeConstraints.size();
-	r_dihedrals = settings.mDihedralBendConstraints.size();
-	Constraint result;
-	for (const auto &edge : settings.mEdgeConstraints) {
-		if ((edge.mVertex[0] == 1 && edge.mVertex[1] == 3) || (edge.mVertex[0] == 3 && edge.mVertex[1] == 1)) {
-			result.valid = true;
-			result.vertices[0] = edge.mVertex[0];
-			result.vertices[1] = edge.mVertex[1];
-			result.rest = edge.mRestLength;
-			result.compliance = edge.mCompliance;
-		}
-	}
-	return result;
 }
 
 int rod_count(RID p_body) {
@@ -577,34 +469,12 @@ int rod_bend_twist_count(RID p_body) {
 	return motion == nullptr ? -1 : (int)motion->GetSettings()->mRodBendTwistConstraints.size();
 }
 
-bool rod_state_is_readable(RID p_body, int p_index) {
-	const JPH::SoftBodyMotionProperties *motion = resolve(p_body);
-	if (motion == nullptr || p_index < 0 || p_index >= (int)motion->GetSettings()->mRodStretchShearConstraints.size()) {
-		return false;
-	}
-	// Initialize sizes mRodStates by constraint count; undersizing makes this
-	// read out of bounds.
-	return motion->GetRodRotation((JPH::uint)p_index).IsNormalized();
-}
-
 float rod_length(RID p_body, int p_index) {
 	const JPH::SoftBodyMotionProperties *motion = resolve(p_body);
 	if (motion == nullptr || p_index < 0 || p_index >= (int)motion->GetSettings()->mRodStretchShearConstraints.size()) {
 		return -1.0f;
 	}
 	return motion->GetSettings()->mRodStretchShearConstraints[p_index].mLength;
-}
-
-float min_rod_length(RID p_body) {
-	const JPH::SoftBodyMotionProperties *motion = resolve(p_body);
-	if (motion == nullptr) {
-		return -1.0f;
-	}
-	float smallest = FLT_MAX;
-	for (const JPH::SoftBodySharedSettings::RodStretchShear &rod : motion->GetSettings()->mRodStretchShearConstraints) {
-		smallest = MIN(smallest, rod.mLength);
-	}
-	return smallest == FLT_MAX ? -1.0f : smallest;
 }
 
 bool all_bishop_frames_set(RID p_body) {
@@ -623,44 +493,6 @@ bool all_bishop_frames_set(RID p_body) {
 		}
 	}
 	return true;
-}
-
-bool rod_angular_velocities_are_zero(RID p_body) {
-	const JPH::SoftBodyMotionProperties *motion = resolve(p_body);
-	if (motion == nullptr) {
-		return false;
-	}
-	const int count = (int)motion->GetSettings()->mRodStretchShearConstraints.size();
-	for (int i = 0; i < count; i++) {
-		if (!motion->GetRodAngularVelocity((JPH::uint)i).IsNearZero()) {
-			return false;
-		}
-	}
-	return true;
-}
-
-int rod_vertex(RID p_body, int p_rod, int p_which) {
-	const JPH::SoftBodyMotionProperties *motion = resolve(p_body);
-	if (motion == nullptr || p_which < 0 || p_which > 1) {
-		return -1;
-	}
-	const JPH::Array<JPH::SoftBodySharedSettings::RodStretchShear> &rods = motion->GetSettings()->mRodStretchShearConstraints;
-	if (p_rod < 0 || p_rod >= (int)rods.size()) {
-		return -1;
-	}
-	return (int)rods[p_rod].mVertex[p_which];
-}
-
-int bend_twist_rod(RID p_body, int p_bend, int p_which) {
-	const JPH::SoftBodyMotionProperties *motion = resolve(p_body);
-	if (motion == nullptr || p_which < 0 || p_which > 1) {
-		return -1;
-	}
-	const JPH::Array<JPH::SoftBodySharedSettings::RodBendTwist> &bends = motion->GetSettings()->mRodBendTwistConstraints;
-	if (p_bend < 0 || p_bend >= (int)bends.size()) {
-		return -1;
-	}
-	return (int)bends[p_bend].mRod[p_which];
 }
 
 float rod_compliance(RID p_body, int p_index) {
@@ -686,59 +518,6 @@ bool update_position(RID p_body) {
 
 bool is_inner_jolt_server(const void *p_server) {
 	return (const void *)JoltPhysicsServer3D::get_singleton() == p_server;
-}
-
-int capability_count() {
-	return (int)all_capabilities().size();
-}
-
-String capability_prefix(int p_cap) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), String());
-	return String(all_capabilities()[p_cap]->prefix);
-}
-
-String capability_required_key(int p_cap) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), String());
-	return String(all_capabilities()[p_cap]->required_key);
-}
-
-int capability_property_count(int p_cap) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), -1);
-	return (int)all_capabilities()[p_cap]->props.size();
-}
-
-String capability_property_name(int p_cap, int p_prop) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), String());
-	ERR_FAIL_INDEX_V(p_prop, capability_property_count(p_cap), String());
-	return String(all_capabilities()[p_cap]->props[p_prop].name);
-}
-
-int capability_property_type(int p_cap, int p_prop) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), -1);
-	ERR_FAIL_INDEX_V(p_prop, capability_property_count(p_cap), -1);
-	return (int)all_capabilities()[p_cap]->props[p_prop].type;
-}
-
-bool capability_property_live_read(int p_cap, int p_prop) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), false);
-	ERR_FAIL_INDEX_V(p_prop, capability_property_count(p_cap), false);
-	return all_capabilities()[p_cap]->props[p_prop].live_read;
-}
-
-bool capability_property_stored(int p_cap, int p_prop) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), false);
-	ERR_FAIL_INDEX_V(p_prop, capability_property_count(p_cap), false);
-	return all_capabilities()[p_cap]->props[p_prop].stored;
-}
-bool capability_property_clearable(int p_cap, int p_prop) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), false);
-	ERR_FAIL_INDEX_V(p_prop, capability_property_count(p_cap), false);
-	return all_capabilities()[p_cap]->props[p_prop].clearable;
-}
-bool capability_property_rebuild(int p_cap, int p_prop) {
-	ERR_FAIL_INDEX_V(p_cap, capability_count(), false);
-	ERR_FAIL_INDEX_V(p_prop, capability_property_count(p_cap), false);
-	return all_capabilities()[p_cap]->props[p_prop].rebuild_on_write;
 }
 
 namespace {
@@ -785,20 +564,47 @@ struct ThreadedBackend {
 		wrapper->set_active(true);
 	}
 	~ThreadedBackend() {
-		wrapper->sync();
-		wrapper->end_sync();
-		// Queued tasks may not wake an idle pump: join it before fencing workers.
-		// Keep its allocator until all callbacks return, then drain its jobs.
-		JoltJobSystem *jobs = inner->release_job_system_for_tests();
-		wrapper->finish();
-		finish_worker_callbacks();
-		delete jobs;
-		memdelete(wrapper);
+		destroy_test_server(wrapper, inner);
 		JoltPhysicsServer3D::set_singleton_for_tests(saved_jolt);
 		PhysicsServer3D::set_singleton_for_tests(saved);
 	}
 };
 } //namespace
+
+void *current_jolt_server() {
+	return JoltPhysicsServer3D::get_singleton();
+}
+
+void destroy_test_server(void *p_server, void *p_jolt_server) {
+	if (p_server == nullptr) {
+		return;
+	}
+	auto *server = static_cast<PhysicsServer3D *>(p_server);
+	auto *inner = static_cast<JoltPhysicsServer3D *>(p_jolt_server);
+	PhysicsServer3D *saved = PhysicsServer3D::get_singleton();
+	JoltPhysicsServer3D *saved_jolt = JoltPhysicsServer3D::get_singleton();
+	if (saved == server || (inner != nullptr && saved == inner)) {
+		saved = nullptr;
+	}
+	if (saved_jolt == inner) {
+		saved_jolt = nullptr;
+	}
+
+	server->sync();
+	server->end_sync();
+	// Queued tasks may not wake an idle pump: join it before fencing workers.
+	// Keep its allocator until all callbacks return, then drain its jobs.
+	JoltJobSystem *jobs = inner != nullptr ? inner->release_job_system_for_tests() : nullptr;
+	server->finish();
+	if (inner != nullptr) {
+		finish_worker_callbacks();
+	}
+	delete jobs;
+	memdelete(server);
+	JoltPhysicsServer3D::set_singleton_for_tests(saved_jolt);
+	PhysicsServer3D::set_singleton_for_tests(saved);
+}
+
 ThreadedServerScope::ThreadedServerScope() {
 	implementation = memnew(ThreadedBackend);
 }
@@ -810,99 +616,6 @@ void *ThreadedServerScope::server() const {
 }
 bool ThreadedServerScope::actual_separate_thread() const {
 	return static_cast<ThreadedBackend *>(implementation)->inner->is_on_separate_thread();
-}
-
-int capability_source_file_count() {
-	return (int)(sizeof(CAP_SOURCE_FILES) / sizeof(CAP_SOURCE_FILES[0]));
-}
-
-String capability_source_file(int p_index) {
-	ERR_FAIL_INDEX_V(p_index, capability_source_file_count(), String());
-	return String(CAP_SOURCE_FILES[p_index]);
-}
-
-bool calculate_rod_properties_keeps_chain_order(int p_joints) {
-	if (p_joints < 2) {
-		return false;
-	}
-	JPH::SoftBodySharedSettings settings;
-	build_chain(settings, p_joints);
-	settings.CalculateRodProperties();
-
-	const JPH::Array<JPH::SoftBodySharedSettings::RodStretchShear> &rods = settings.mRodStretchShearConstraints;
-	for (int i = 0; i < (int)rods.size(); i++) {
-		if (rods[i].mVertex[0] != (JPH::uint32)i || rods[i].mVertex[1] != (JPH::uint32)(i + 1)) {
-			return false;
-		}
-		// Every segment of the chain is one unit long, laid out along +X.
-		if (!Math::is_equal_approx((real_t)rods[i].mLength, (real_t)1.0)) {
-			return false;
-		}
-		if (rods[i].mBishop == JPH::Quat::sZero() || !rods[i].mBishop.IsNormalized()) {
-			return false;
-		}
-		// The Bishop frame's Z axis is the segment tangent
-		// (`SoftBodySharedSettings.cpp`: the tangent is the third column).
-		const JPH::Vec3 tangent = rods[i].mBishop * JPH::Vec3(0, 0, 1);
-		if (!Math::is_equal_approx((real_t)tangent.GetX(), (real_t)1.0, (real_t)1e-4)) {
-			return false;
-		}
-	}
-	const JPH::Array<JPH::SoftBodySharedSettings::RodBendTwist> &bends = settings.mRodBendTwistConstraints;
-	for (int i = 0; i < (int)bends.size(); i++) {
-		if (bends[i].mRod[0] != (JPH::uint32)i || bends[i].mRod[1] != (JPH::uint32)(i + 1)) {
-			return false;
-		}
-		// A straight chain has no twist between adjacent rods.
-		if (!bends[i].mOmega0.IsNormalized()) {
-			return false;
-		}
-	}
-	return true;
-}
-
-bool optimize_is_identity_for_chain(int p_joints) {
-	if (p_joints < 2) {
-		return false;
-	}
-	JPH::SoftBodySharedSettings settings;
-	build_chain(settings, p_joints);
-	settings.CalculateRodProperties();
-
-	JPH::SoftBodySharedSettings::OptimizationResults results;
-	settings.Optimize(results);
-
-	// Identity remapping preserves authored indices: rod/state[i] is mRodStates[i].
-	if (results.mRodStretchShearConstraintRemap.size() != (size_t)(p_joints - 1)) {
-		return false;
-	}
-	for (JPH::uint i = 0; i < results.mRodStretchShearConstraintRemap.size(); i++) {
-		if (results.mRodStretchShearConstraintRemap[i] != i) {
-			return false;
-		}
-	}
-
-	// Bend-twist order is private and may change. Require a permutation that
-	// preserves adjacent rod pairs.
-	const size_t bend_count = (size_t)MAX(p_joints - 2, 0);
-	if (results.mRodBendTwistConstraintRemap.size() != bend_count) {
-		return false;
-	}
-	JPH::Array<bool> seen;
-	seen.resize(bend_count, false);
-	for (JPH::uint i = 0; i < results.mRodBendTwistConstraintRemap.size(); i++) {
-		const JPH::uint mapped = results.mRodBendTwistConstraintRemap[i];
-		if (mapped >= (JPH::uint)bend_count || seen[mapped]) {
-			return false;
-		}
-		seen[mapped] = true;
-	}
-	for (const JPH::SoftBodySharedSettings::RodBendTwist &bend : settings.mRodBendTwistConstraints) {
-		if (bend.mRod[1] != bend.mRod[0] + 1) {
-			return false;
-		}
-	}
-	return true;
 }
 
 } // namespace JoltSoftBodyCapProbe

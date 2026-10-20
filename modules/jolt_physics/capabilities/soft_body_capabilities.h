@@ -43,13 +43,6 @@ extern const CapabilitySpec CAP_VERTEX;
 extern const CapabilitySpec CAP_VOLUME;
 extern const CapabilitySpec CAP_SKIN;
 
-#ifdef TESTS_ENABLED
-// Test-only geometry provider for replace_count > 1 arbitration.
-extern const CapabilitySpec CAP_TEST_REPLACE;
-
-#include "cap_files.gen.h"
-#endif
-
 // Shared registry for lookup and enumeration. External spec linkage prevents
 // static archives from discarding capability objects.
 inline Span<const CapabilitySpec *const> all_capabilities() {
@@ -61,9 +54,6 @@ inline Span<const CapabilitySpec *const> all_capabilities() {
 		&CAP_VERTEX,
 		&CAP_VOLUME,
 		&CAP_SKIN,
-#ifdef TESTS_ENABLED
-		&CAP_TEST_REPLACE,
-#endif
 	};
 	return kAll;
 }

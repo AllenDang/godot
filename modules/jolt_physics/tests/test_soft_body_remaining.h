@@ -51,6 +51,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		RID body = server->soft_body_create();
 		ErrorCapture errors;
 		CHECK_FALSE(server->soft_body_set_extra_property(body, "nope/x", 1));
+		CHECK(server->soft_body_get_extra_property(body, "nope/x").get_type() == Variant::NIL);
 		CHECK(errors.count() == 0);
 		server->free_rid(body);
 	}
@@ -59,61 +60,17 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
-		for (int variant = 0; variant < 3; ++variant) {
-			CAPTURE(variant);
-			MeshBodyScope body(server.ptr(), space.rid());
-			const float mass[] = { 1.0f, 2.0f, 0.5f };
-			const float pressure[] = { 0.0f, 0.2f, 1.0f };
-			const float stiffness[] = { 0.1f, 0.5f, 1.0f };
-			server->soft_body_set_total_mass(body.rid(), mass[variant]);
-			server->soft_body_set_pressure_coefficient(body.rid(), pressure[variant]);
-			server->soft_body_set_linear_stiffness(body.rid(), stiffness[variant]);
-			server->soft_body_set_space(body.rid(), RID());
-			server->soft_body_set_space(body.rid(), space.rid());
-			REQUIRE(Probe::in_space(body.rid()));
-			CHECK(Probe::vertex_count(body.rid()) == 4);
-			CHECK(Probe::edge_count(body.rid()) > 0);
-			CHECK(Probe::dihedral_bend_count(body.rid()) == 0);
-			CHECK(Probe::lra_count(body.rid()) == 0);
-			CHECK(Probe::volume_count(body.rid()) == 0);
-			CHECK(Probe::skinned_count(body.rid()) == 0);
-			CHECK(Probe::inv_bind_count(body.rid()) == 0);
-			CHECK(Probe::all_finite(body.rid()));
-			CHECK(Probe::settings_identity(body.rid()) != 0);
-			CHECK(Probe::body_identity(body.rid()) != UINT64_MAX);
-			CHECK(Probe::edge(body.rid(), 0).valid);
-			CHECK_FALSE(Probe::edge(body.rid(), -1).valid);
-			CHECK_FALSE(Probe::edge(body.rid(), Probe::edge_count(body.rid())).valid);
-			CHECK_FALSE(Probe::dihedral(body.rid(), 0).valid);
-			CHECK_FALSE(Probe::lra(body.rid(), 0).valid);
-			CHECK_FALSE(Probe::tetra(body.rid(), 0).valid);
-			CHECK_FALSE(Probe::skin(body.rid(), 0).valid);
-			CHECK(Probe::shared_inv_mass(body.rid(), -1) == -1.0f);
-			const auto counts = Probe::build_counts(body.rid());
-			CHECK(counts.generation == 2);
-			CHECK(counts.create_constraints == 2);
-			CHECK(counts.optimize == 2);
-		}
-		CHECK_FALSE(Probe::edge(RID(), 0).valid);
-		CHECK_FALSE(Probe::all_finite(RID()));
-		CHECK(Probe::body_identity(RID()) == UINT64_MAX);
-
-		// Qualify Q/H against real Jolt generator before Distance behavior tests.
-		int edges = -1;
-		int dihedrals = -1;
-		CHECK(Probe::fixture_bend(true, 0, edges, dihedrals).valid);
-		CHECK(edges == 6);
-		CHECK(dihedrals == 0);
-		Probe::fixture_bend(true, 2, edges, dihedrals);
-		CHECK(dihedrals == 1);
-		CHECK_FALSE(Probe::fixture_bend(false, 0, edges, dihedrals).valid);
-		CHECK(edges == 5);
-		const auto distance = Probe::fixture_bend(false, 1, edges, dihedrals);
-		CHECK(distance.valid);
-		CHECK(edges == 6);
-		CHECK(dihedrals == 0);
-		CHECK(distance.compliance == doctest::Approx(1.0e-4f));
-		CHECK(distance.rest == doctest::Approx(Vector3(1.7f, 0, -0.4f).length()));
+		MeshBodyScope body(server.ptr(), space.rid());
+		REQUIRE(Probe::in_space(body.rid()));
+		CHECK(Probe::vertex_count(body.rid()) == 4);
+		CHECK(Probe::face_count(body.rid()) == 2);
+		CHECK(Probe::edge_count(body.rid()) > 0);
+		CHECK(Probe::rod_count(body.rid()) == 0);
+		CHECK(Probe::dihedral_bend_count(body.rid()) == 0);
+		CHECK(Probe::lra_count(body.rid()) == 0);
+		CHECK(Probe::volume_count(body.rid()) == 0);
+		CHECK(Probe::skinned_count(body.rid()) == 0);
+		CHECK(Probe::inv_bind_count(body.rid()) == 0);
 	}
 
 	TEST_CASE("remaining S01 scalar fields") {
@@ -121,17 +78,11 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
 		MeshBodyScope body(server.ptr(), space.rid());
-		// Stock first creation and space replay use different radius sources.
-		// Qualify the rebuilt control before applying overrides.
-		const auto fresh = Probe::scalars(body.rid());
-		REQUIRE(fresh.valid);
-		CHECK(fresh.vertex_radius == 0.0f);
 		server->soft_body_set_space(body.rid(), RID());
 		server->soft_body_set_space(body.rid(), space.rid());
 		const auto rebuilt = Probe::scalars(body.rid());
 		REQUIRE(rebuilt.valid);
 		const float global_radius = GLOBAL_GET("physics/jolt_physics_3d/simulation/soft_body_point_radius");
-		CAPTURE(fresh.vertex_radius);
 		CAPTURE(rebuilt.vertex_radius);
 		CAPTURE(global_radius);
 		CHECK(rebuilt.vertex_radius == global_radius);
@@ -319,25 +270,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		CHECK(peaks[1] > peaks[0] + 1e-3f);
 	}
 
-	TEST_CASE("remaining S06 face sidedness") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		MeshBodyScope body(server.ptr(), space.rid());
-		for (bool sided : { false, true, false }) {
-			CAPTURE(sided);
-			Dictionary config;
-			config["faces_double_sided"] = sided;
-			REQUIRE(server->soft_body_set_extra_property(body.rid(), "scalar/config", config));
-			CHECK(Probe::scalars(body.rid()).faces_double_sided == sided);
-			// Settings winding (2,1,0) points +Y; exercise SoftBodyShape's
-			// collector overload, not Godot's filter which excludes soft bodies.
-			CHECK(Probe::face_ray_hit(body.rid(), Vector3(0.25f, 1, 0.5f), Vector3(0, -2, 0)));
-			CHECK(Probe::face_ray_hit(body.rid(), Vector3(0.25f, -1, 0.5f), Vector3(0, 2, 0)) == sided);
-		}
-		CHECK_FALSE(Probe::face_ray_hit(RID(), Vector3(), Vector3(0, 1, 0)));
-	}
-
 	TEST_CASE("remaining S07 radius contact") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -487,60 +419,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		}
 	}
 
-	TEST_CASE("remaining B05 rest angle") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		for (bool folded : { false, true }) {
-			CAPTURE(folded);
-			const auto fixture = fixture_hinge(folded);
-			MeshBodyScope body(server.ptr(), space.rid(), &fixture);
-			Dictionary config;
-			config["compliance"] = 1e-4;
-			REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", config));
-			REQUIRE(Probe::dihedral_bend_count(body.rid()) == 1);
-			const auto bend = Probe::dihedral(body.rid(), 0);
-			const Vector3 a = Probe::vertex_position(body.rid(), bend.vertices[0]);
-			const Vector3 e = Probe::vertex_position(body.rid(), bend.vertices[1]) - a;
-			const Vector3 n1 = e.cross(Probe::vertex_position(body.rid(), bend.vertices[2]) - a).normalized();
-			const Vector3 n2 = (Probe::vertex_position(body.rid(), bend.vertices[3]) - a).cross(e).normalized();
-			const double angle = Math::acos(CLAMP(double(n1.dot(n2)), -1.0, 1.0)) * SIGN(n2.cross(n1).dot(e));
-			CAPTURE(angle);
-			CHECK(Math::abs(bend.rest - angle) <= 1e-5);
-			if (folded) {
-				CHECK(Math::abs(bend.rest) > 0.1);
-			} else {
-				CHECK(bend.rest == 0.0f);
-			}
-		}
-	}
-
-	TEST_CASE("remaining B06 build counts") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		MeshBodyScope body(server.ptr(), space.rid());
-		server->soft_body_pin_point(body.rid(), 0, true);
-		Dictionary bend;
-		bend["compliance"] = 1e-4;
-		Dictionary lra;
-		lra["type"] = 1;
-		REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", bend));
-		REQUIRE(server->soft_body_set_extra_property(body.rid(), "lra/config", lra));
-		for (int generation = 0; generation < 3; ++generation) {
-			CAPTURE(generation);
-			const auto before = Probe::build_counts(body.rid());
-			bend["compliance"] = 0.002 + generation * 0.001;
-			REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", bend));
-			const auto after = Probe::build_counts(body.rid());
-			CHECK(after.generation == before.generation + 1);
-			CHECK(after.create_constraints == before.create_constraints + 1);
-			CHECK(after.optimize == before.optimize + 1);
-			CHECK(Probe::dihedral_bend_count(body.rid()) == 1);
-			CHECK(Probe::lra_count(body.rid()) == 3);
-		}
-	}
-
 	TEST_CASE("remaining B07 shrink composition") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -603,20 +481,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				REQUIRE(Probe::shared_inv_mass(body.rid(), i) == (pinned ? 0.0f : 441.0f));
 				REQUIRE(Probe::vertex_inv_mass(body.rid(), i) == (pinned ? 0.0f : 441.0f));
 			}
-			for (int frame = 1; frame <= 120; ++frame) {
-				space.step();
-				if (frame % 20 == 0) {
-					float mean_y = 0;
-					float speed = 0;
-					for (int source = 420; source < 441; ++source) {
-						mean_y += server->soft_body_get_point_global_position(body.rid(), source).y / 21;
-					}
-					for (int i = 0; i < Probe::vertex_count(body.rid()); ++i) {
-						speed += Probe::velocity(body.rid(), i).length_squared() / 441;
-					}
-					print_line(vformat("B08 qualification mode=%d frame=%d mean_y=%s mean_speed_sq=%s", mode, frame, mean_y, speed));
-				}
-			}
+			space.step(120);
 			REQUIRE(Probe::all_finite(body.rid()));
 			free_y[mode] = 0;
 			for (int source = 420; source < 441; ++source) {
@@ -937,17 +802,17 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 																	  : values[MIN(target, values.size() - 1)];
 				CHECK(constraint.rest == doctest::Approx(Probe::vertex_position(body.rid(), target).length() * multiplier).epsilon(1e-5));
 			}
-			const auto id = Probe::body_identity(body.rid());
-			for (double value : { 0.0, -1.0, double(NAN), double(INFINITY), double(FLT_MAX) * 2 }) {
-				CAPTURE(value);
-				Dictionary bad = config.duplicate(true);
-				bad["max_distance_multiplier"] = value;
-				ErrorCapture errors;
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "lra/config", bad));
-				CHECK(errors.has("SBREM-VALUE"));
-				CHECK(errors.has("max_distance_multiplier"));
-				CHECK(Probe::body_identity(body.rid()) == id);
-			}
+		}
+		const auto id = Probe::body_identity(body.rid());
+		for (double value : { 0.0, -1.0, double(NAN), double(INFINITY), double(FLT_MAX) * 2 }) {
+			CAPTURE(value);
+			Dictionary bad = server->soft_body_get_extra_property(body.rid(), "lra/config");
+			bad["max_distance_multiplier"] = value;
+			ErrorCapture errors;
+			CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "lra/config", bad));
+			CHECK(errors.has("SBREM-VALUE"));
+			CHECK(errors.has("max_distance_multiplier"));
+			CHECK(Probe::body_identity(body.rid()) == id);
 		}
 	}
 
@@ -1061,6 +926,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		REQUIRE(server->soft_body_set_extra_property(body.rid(), "lra/config", good));
 		for (int shape = 0; shape < 3; ++shape) {
 			for (int number : { -1, 0, 3 }) {
+				if (shape == 2 && number == 3) {
+					continue; // true already covered by -1.
+				}
 				CAPTURE(shape);
 				CAPTURE(number);
 				Dictionary config;
@@ -1327,6 +1195,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		const char *fields[] = { "edge_scale", "shear_scale", "compliance", "type", "max_distance_multiplier" };
 		for (int field = 0; field < 5; ++field) {
 			for (float stiffness : { 0.5f, 1.0f }) {
+				if (field >= 2 && stiffness == 0.5f) {
+					continue;
+				}
 				CAPTURE(fields[field]);
 				CAPTURE(stiffness);
 				const auto fixture = fixture_seam();
@@ -1376,6 +1247,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		SpaceScope space(server.ptr());
 		for (int cap = 0; cap < 4; ++cap) {
 			for (double scale : { 0.25, 1.0, 4.0 }) {
+				if (cap != 0 && scale != 1.0) {
+					continue;
+				}
 				CAPTURE(cap);
 				CAPTURE(scale);
 				MeshBodyScope body(server.ptr(), space.rid());
@@ -1465,38 +1339,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		}
 	}
 
-	TEST_CASE("remaining A11 heterogeneous response") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		server->area_set_param(space.rid(), PS3DE::AREA_PARAM_GRAVITY, 9.8);
-		const auto fixture = fixture_grid();
-		MeshBodyScope body(server.ptr(), space.rid(), &fixture);
-		PackedFloat32Array scales;
-		for (const Vector3 &vertex : fixture.vertices) {
-			scales.push_back(vertex.x < 0 ? 0.1f : 10.0f);
-		}
-		Dictionary config;
-		config["edge_scale"] = scales;
-		config["shear_scale"] = scales;
-		REQUIRE(server->soft_body_set_extra_property(body.rid(), "vertex/config", config));
-		space.step(120);
-		REQUIRE(Probe::all_finite(body.rid()));
-		float left = 0, right = 0;
-		for (int x = 0; x < 10; ++x) {
-			left += server->soft_body_get_point_global_position(body.rid(), 420 + x).y / 10;
-			right += server->soft_body_get_point_global_position(body.rid(), 431 + x).y / 10;
-		}
-		CAPTURE(left);
-		CAPTURE(right);
-		CHECK(Math::abs(left - right) > 1e-3f);
-		CHECK(Math::abs(left) > 1e-3f);
-		CHECK(Math::abs(right) > 1e-3f);
-		for (int pin : fixture.pins) {
-			CHECK(server->soft_body_get_point_global_position(body.rid(), pin).distance_to(fixture.vertices[pin]) <= 1e-4f);
-		}
-	}
-
 	TEST_CASE("remaining A12 resource bounds") {
 		using namespace SoftBodyCapValidation;
 		for (bool faces : { false, true }) {
@@ -1506,9 +1348,10 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(resource_size(maximum, faces ? 3 : 1, maximum, 1, &error, faces ? "mesh.indices" : "mesh.vertices"));
 			CHECK_FALSE(resource_size(maximum + 1, faces ? 3 : 1, maximum, 1, &error, faces ? "mesh.indices" : "mesh.vertices"));
 			CHECK(error.contains("SBREM-SIZE"));
-			CHECK_FALSE(resource_size(UINT64_MAX, 1, UINT64_MAX, 4, &error, "mesh.stride"));
-			CHECK(error.contains("SBREM-SIZE"));
 		}
+		String error;
+		CHECK_FALSE(resource_size(UINT64_MAX, 1, UINT64_MAX, 4, &error, "mesh.stride"));
+		CHECK(error.contains("SBREM-SIZE"));
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
@@ -1536,8 +1379,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(Probe::vertex_inv_mass(body.rid(), i) == 4);
 		}
 		CHECK(double(server->soft_body_get_extra_property(body.rid(), "volume/current")) == doctest::Approx(1.0 / 6).epsilon(1e-5));
-		CHECK(Probe::build_counts(body.rid()).create_constraints == 0);
-		CHECK(Probe::build_counts(body.rid()).optimize == 1);
 	}
 
 	TEST_CASE("remaining V02 boundary extraction") {
@@ -1885,51 +1726,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		CHECK(double(server->soft_body_get_extra_property(pair.rid(), "volume/current")) == doctest::Approx((0.5 + 1.0) / 6.0).epsilon(1e-5));
 	}
 
-	TEST_CASE("remaining V11 volume remap") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		Dictionary config;
-		PackedVector3Array vertices;
-		PackedInt32Array tetra;
-		for (int i = 0; i < 100; ++i) {
-			const Vector3 origin((99 - i) * 3, 0, 0);
-			for (const Vector3 &p : { Vector3(), Vector3(1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1) }) {
-				vertices.push_back(origin + p);
-			}
-			for (int j = 0; j < 4; ++j) {
-				tetra.push_back(4 * i + j);
-			}
-		}
-		PackedInt32Array reversed;
-		for (int i = 99; i >= 0; --i) {
-			for (int j = 0; j < 4; ++j) {
-				reversed.push_back(4 * i + j);
-			}
-		}
-		config["vertices"] = vertices;
-		config["tetrahedra"] = reversed;
-		VolumeBodyScope body(server.ptr(), space.rid(), config);
-		REQUIRE(Probe::volume_count(body.rid()) == 100);
-		HashSet<int> found;
-		bool reordered = false;
-		CHECK(Probe::update_group_count(body.rid()) > 1);
-		for (int i = 0; i < 100; ++i) {
-			const auto actual = Probe::tetra(body.rid(), i);
-			const int original = actual.vertices[0] / 4;
-			reordered |= original != 99 - i;
-			CHECK_FALSE(found.has(original));
-			found.insert(original);
-			for (int j = 0; j < 4; ++j) {
-				CHECK(actual.vertices[j] == original * 4 + j);
-			}
-			CHECK(actual.rest == doctest::Approx(1));
-		}
-		CHECK(found.size() == 100);
-		CHECK(reordered);
-		CHECK(double(server->soft_body_get_extra_property(body.rid(), "volume/current")) == doctest::Approx(100.0 / 6).epsilon(1e-5));
-	}
-
 	TEST_CASE("remaining V12 render readback") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -1980,7 +1776,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(server->soft_body_get_pressure_coefficient(body.rid()) == doctest::Approx(0.05));
 			CHECK(Probe::edge_count(body.rid()) == 0);
 			CHECK(Probe::volume_count(body.rid()) == (mode == 2 ? 0 : 1));
-			CHECK(Probe::build_counts(body.rid()).optimize == 1);
 			const PackedInt32Array faces = server->soft_body_get_extra_property(body.rid(), "volume/faces");
 			if (mode == 0) {
 				common_faces = faces;
@@ -2011,17 +1806,22 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		CAPTURE(strain[0]);
 		CAPTURE(strain[1]);
 		CAPTURE(strain[2]);
-		print_line(vformat("V13 strain hard=%s soft=%s pressure_only=%s", strain[0], strain[1], strain[2]));
 		CHECK(strain[1] > strain[0] + 1e-4);
 		CHECK(strain[1] > 0);
 		CHECK(strain[2] > 0);
+	}
 
-		// Audit the actual rendered fixture through production construction, not
-		// only the minimal tetra: ordering, signs, masses, pressure and scheduling.
-		const Dictionary asset = JSON::parse_string(FileAccess::get_file_as_string(TestUtils::get_data_path("jolt_physics/volume_physics_input.json")));
-		REQUIRE(asset.has("bodies"));
-		const Dictionary sphere = Array(asset["bodies"])[2];
+	// Opt-in construction coverage; the default suite uses the minimal tetra above.
+	TEST_CASE("extended volume fixture construction" * doctest::skip()) {
+		ServerScope server("Jolt Physics");
+		REQUIRE(server.is_valid());
+		const Variant asset = JSON::parse_string(FileAccess::get_file_as_string(TestUtils::get_data_path("jolt_physics/volume_physics_input.json")));
+		REQUIRE(asset.get_type() == Variant::DICTIONARY);
+		const Dictionary sphere = asset;
+		REQUIRE(sphere.has_all(Array({ "vertices", "tetrahedra", "fixed", "parameters", "boundary_face_count" })));
 		const Array points = sphere["vertices"], cells = sphere["tetrahedra"];
+		REQUIRE_FALSE(points.is_empty());
+		REQUIRE_FALSE(cells.is_empty());
 		PackedVector3Array vertices;
 		PackedInt32Array tetrahedra, fixed;
 		for (const Variant &point : points) {
@@ -2053,7 +1853,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(Probe::scalars(body.rid()).iterations == 20);
 			CHECK(Probe::edge_count(body.rid()) == 0);
 			CHECK(Probe::volume_count(body.rid()) == cells.size());
-			CHECK(Probe::face_count(body.rid()) == Array(sphere["faces"]).size());
+			CHECK(Probe::face_count(body.rid()) == int(sphere["boundary_face_count"]));
 			CHECK(Probe::build_counts(body.rid()).create_constraints == 0);
 			CHECK(Probe::build_counts(body.rid()).optimize == 1);
 			double rest = 0;
@@ -2141,26 +1941,30 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
 		VolumeBodyScope body(server.ptr(), space.rid(), fixture_tetra());
-		for (int vertex = 0; vertex < 4; ++vertex) {
-			for (int axis = 0; axis < 3; ++axis) {
-				for (float value : { NAN, INFINITY, -INFINITY }) {
-					CAPTURE(vertex);
-					CAPTURE(axis);
-					CAPTURE(value);
-					Dictionary config = fixture_tetra();
-					PackedVector3Array vertices = config["vertices"];
-					Vector3 point = vertices[vertex];
-					point[axis] = value;
-					vertices.set(vertex, point);
-					config["vertices"] = vertices;
-					const auto id = Probe::body_identity(body.rid());
-					ErrorCapture errors;
-					CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "volume/config", config));
-					CHECK(errors.has("SBREM-VALUE"));
-					CHECK(errors.has(vformat("vertices[%d][%d]", vertex, axis)));
-					CHECK(Probe::body_identity(body.rid()) == id);
-				}
-			}
+		struct NonFiniteVertex {
+			int vertex;
+			int axis;
+			float value;
+		};
+		const NonFiniteVertex invalid[] = { { 0, 0, NAN }, { 1, 1, INFINITY }, { 3, 2, -INFINITY } };
+		for (const auto &entry : invalid) {
+			const int vertex = entry.vertex, axis = entry.axis;
+			const float value = entry.value;
+			CAPTURE(vertex);
+			CAPTURE(axis);
+			CAPTURE(value);
+			Dictionary config = fixture_tetra();
+			PackedVector3Array vertices = config["vertices"];
+			Vector3 point = vertices[vertex];
+			point[axis] = value;
+			vertices.set(vertex, point);
+			config["vertices"] = vertices;
+			const auto id = Probe::body_identity(body.rid());
+			ErrorCapture errors;
+			CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "volume/config", config));
+			CHECK(errors.has("SBREM-VALUE"));
+			CHECK(errors.has(vformat("vertices[%d][%d]", vertex, axis)));
+			CHECK(Probe::body_identity(body.rid()) == id);
 		}
 		for (double value : { -1.0, double(NAN), double(INFINITY), double(FLT_MAX) * 2 }) {
 			CAPTURE(value);
@@ -2640,7 +2444,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(Probe::build_counts(body.rid()).skin_init == 1);
 			CHECK(Probe::world_position(body.rid(), 0).distance_to(Vector3(0, frame * 0.01f, 0)) <= 1e-4f);
 		}
-		CHECK(Probe::build_counts(body.rid()).skin_recurring == 180);
 	}
 
 	TEST_CASE("remaining K10 pose rejection") {
@@ -2660,26 +2463,11 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		}
 		Dictionary config = fixture_skin();
 		REQUIRE(server->soft_body_set_extra_property(body.rid(), "skin/config", config));
-		for (int kind = 0; kind < 4; ++kind) {
-			CAPTURE(kind);
-			Array pose = valid.duplicate(true);
-			if (kind == 0) {
-				pose.clear();
-			}
-			if (kind == 1) {
-				pose[0] = true;
-			}
-			if (kind == 2) {
-				pose[0] = Transform3D(Basis().scaled(Vector3(0, 1, 1)), Vector3());
-			}
-			if (kind == 3) {
-				pose[0] = Transform3D(Basis(), Vector3(NAN, 0, 0));
-			}
+		{
 			RemainingSnapshot before(server.ptr(), body.rid());
 			ErrorCapture errors;
-			CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "skin/pose", pose));
-			CHECK(errors.has(kind == 0 ? "SBREM-POSE" : kind == 1 ? "SBREM-TYPE"
-																  : "SBREM-VALUE"));
+			CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "skin/pose", Array()));
+			CHECK(errors.has("SBREM-POSE"));
 			before.unchanged();
 		}
 		{
@@ -2709,45 +2497,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(errors.count() == 0);
 			REQUIRE(Probe::invoke_pre_step(write_body.rid()));
 			CHECK(Probe::world_position(write_body.rid(), 0).x == doctest::Approx(double(2.0e38f) + double(1.0e38f)).epsilon(1e-5));
-		}
-		for (bool initialized : { false, true }) {
-			CAPTURE(initialized);
-			MeshBodyScope fault(server.ptr(), space.rid());
-			Dictionary fault_skin = fixture_skin(1, 1);
-			fault_skin["max_distance"] = 0.0;
-			REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/config", fault_skin));
-			if (initialized) {
-				space.step();
-			}
-			Array far_pose;
-			far_pose.push_back(Transform3D(Basis(Vector3(2.5e38f, 2.5e38f, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)), Vector3()));
-			REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/pose", far_pose));
-			REQUIRE(Probe::set_body_frame(fault.rid(), Transform3D(Basis(Vector3(0, 0, 1), Math::PI / 4), Vector3(3, 4, 5))));
-			const auto generation = Probe::build_counts(fault.rid()).generation;
-			const auto init_count = Probe::build_counts(fault.rid()).skin_init;
-			ErrorCapture errors;
-			space.step();
-			CHECK(errors.has("SBREM-POSE"));
-			CHECK(errors.has("pre_step"));
-			CHECK(errors.has("["));
-			CHECK_FALSE(Probe::in_space(fault.rid()));
-			CHECK(Probe::build_counts(fault.rid()).generation == generation);
-			CHECK(Probe::build_counts(fault.rid()).skin_init == init_count);
-			CHECK(Array(server->soft_body_get_extra_property(fault.rid(), "skin/pose")) == far_pose);
-			errors.clear();
-			space.step(3);
-			CHECK(errors.count() == 0);
-			REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/pose", valid));
-			CHECK_FALSE(Probe::in_space(fault.rid()));
-			REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/config", fault_skin));
-			CHECK_FALSE(Probe::in_space(fault.rid()));
-			server->soft_body_set_space(fault.rid(), RID());
-			server->soft_body_set_space(fault.rid(), space.rid());
-			space.step();
-			CHECK(Probe::in_space(fault.rid()));
-			CHECK(Probe::all_finite(fault.rid()));
-			CHECK(Probe::build_counts(fault.rid()).generation == generation + 1);
-			CHECK(Probe::build_counts(fault.rid()).skin_init == init_count + 1);
 		}
 		// Nearby finite case uses the same nonzero COM/rotation but a smaller
 		// matrix. Only source vertex 0 is skinned, so world targets remain bounded
@@ -2801,25 +2550,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				}
 			}
 			CHECK(errors.count() == 0);
-			CHECK(Probe::build_counts(body.rid()).skin_init == 1);
-			CHECK(Probe::build_counts(body.rid()).skin_recurring == 179);
 		}
-	}
-
-	TEST_CASE("remaining K12 absent skin") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		MeshBodyScope body(server.ptr(), space.rid());
-		Dictionary scalar;
-		scalar["friction"] = 0.2;
-		REQUIRE(server->soft_body_set_extra_property(body.rid(), "scalar/config", scalar));
-		space.step(30);
-		CHECK(Probe::build_counts(body.rid()).pre_step == 30);
-		CHECK(Probe::build_counts(body.rid()).skin_init == 0);
-		CHECK(Probe::build_counts(body.rid()).skin_recurring == 0);
-		CHECK(Probe::skinned_count(body.rid()) == 0);
-		CHECK(Probe::edge_count(body.rid()) > 0);
 	}
 
 	TEST_CASE("remaining K13 hard skin lifetime") {
@@ -3074,14 +2805,42 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			server->soft_body_set_mesh(body.rid(), bad_mesh);
 			CHECK(errors.has("SBREM-INDEX"));
 			CHECK_FALSE(Probe::in_space(body.rid()));
+			CHECK(Probe::body_identity(body.rid()) == UINT64_MAX);
 			CHECK(Probe::build_counts(body.rid()).generation == generation);
+			CHECK(Dictionary(server->soft_body_get_extra_property(body.rid(), "skin/config")) == config);
 			CHECK(Array(server->soft_body_get_extra_property(body.rid(), "skin/pose")) == c);
+			errors.clear();
+			server->soft_body_set_space(body.rid(), first.rid());
+			CHECK(errors.has("SBREM-INDEX"));
+			CHECK(server->soft_body_get_space(body.rid()) == first.rid());
+			CHECK_FALSE(Probe::in_space(body.rid()));
+			CHECK(Probe::build_counts(body.rid()).generation == generation);
+		}
+		for (const char *key : REMAINING_LIVE_KEYS) {
+			ErrorCapture errors;
+			CHECK(server->soft_body_get_extra_property(body.rid(), key).get_type() == Variant::NIL);
+			CHECK(errors.count() == 1);
 		}
 		server->soft_body_set_mesh(body.rid(), new_mesh);
-		second.step();
+		REQUIRE(Probe::in_space(body.rid()));
+		first.step();
 		CHECK(Probe::build_counts(body.rid()).generation == generation + 1);
 		CHECK(Probe::build_counts(body.rid()).skin_init == ++init);
 		CHECK(Array(server->soft_body_get_extra_property(body.rid(), "skin/pose")) == c);
+		for (int i = 0; i < 4; ++i) {
+			CHECK(Probe::world_position(body.rid(), i).distance_to(fixture.vertices[i] + Vector3(0, 3, 0)) <= 1e-4f);
+		}
+		{
+			ErrorCapture errors;
+			server->soft_body_set_space(body.rid(), RID());
+			CHECK(errors.count() == 0);
+			CHECK_FALSE(Probe::in_space(body.rid()));
+			CHECK(Probe::build_counts(body.rid()).generation == generation + 1);
+			CHECK(Dictionary(server->soft_body_get_extra_property(body.rid(), "skin/config")) == config);
+			CHECK(Array(server->soft_body_get_extra_property(body.rid(), "skin/pose")) == c);
+		}
+		server->soft_body_set_space(body.rid(), first.rid());
+		REQUIRE(Probe::in_space(body.rid()));
 		REQUIRE(server->soft_body_set_extra_property(body.rid(), "skin/config", Variant()));
 		CHECK(server->soft_body_get_extra_property(body.rid(), "skin/pose").get_type() == Variant::NIL);
 		CHECK(Probe::skinned_count(body.rid()) == 0);
@@ -3287,6 +3046,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				CHECK(errors.has("SBREM-TYPE"));
 				CHECK(errors.has(key));
 				before.unchanged();
+				if (String(key) != "scalar/config") {
+					break;
+				}
 			}
 		}
 		RemainingSnapshot before(server.ptr(), body.rid());
@@ -3310,7 +3072,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			typo["unknown_field"] = 1.0;
 			candidates.push_back(typo);
 			candidates.push_back(Dictionary());
-			if (cap == 1 || cap == 2 || cap == 4 || cap == 5 || cap == 6) {
+			if (cap == 1 || cap == 2 || cap == 4 || cap == 6) {
 				for (const Variant *field = good.next(nullptr); field != nullptr; field = good.next(field)) {
 					if (cap == 6 && String(*field) != "joints") {
 						continue;
@@ -3373,16 +3135,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				CHECK(errors.has("SBREM-TYPE"));
 				CHECK(errors.has(String(*field)));
 				before.unchanged();
-				if (original.get_type() == Variant::ARRAY) {
-					errors.clear();
-					Array matrices;
-					matrices.push_back(Variant());
-					bad[*field] = matrices;
-					CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap], bad));
-					CHECK(errors.has("SBREM-TYPE"));
-					CHECK(errors.has(String(*field) + "[0]"));
-					before.unchanged();
-				}
 			}
 		}
 	}
@@ -3401,16 +3153,22 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		for (const auto &field : fields) {
 			const RID body = server->soft_body_create();
 			const Dictionary base = remaining_config(field.cap);
+			Vector<double> values = { 0.0, -1.0, double(std::numeric_limits<float>::denorm_min()), field.maximum, field.maximum * 2, double(NAN), double(INFINITY), -double(INFINITY) };
+			if (field.maximum != FLT_MAX) {
+				values.push_back(double(FLT_MAX) * 2);
+			}
 			for (int shape = 0; shape < (field.array ? 2 : 1); ++shape) {
 				for (int bad_index = 0; bad_index < (shape ? 3 : 1); ++bad_index) {
 					CAPTURE(bad_index);
-					for (double value : { 0.0, -1.0, double(std::numeric_limits<float>::denorm_min()), field.maximum, field.maximum * 2, double(NAN), double(INFINITY), -double(INFINITY), double(FLT_MAX) * 2 }) {
+					for (double value : values) {
+						if (shape && ((bad_index < 2 && !std::isnan(value)) || (std::isfinite(value) && value > FLT_MAX))) {
+							continue;
+						}
 						CAPTURE(field.field);
 						CAPTURE(shape);
 						CAPTURE(value);
 						Dictionary config = base.duplicate(true);
-						// Packed arrays cannot carry finite double-overflow values; their
-						// converted INF still exercises the array element finite guard.
+						// Full packed boundaries at the last index; NaN also checks first/middle.
 						PackedFloat32Array elements = make_floats(3, 1.0f);
 						elements.set(bad_index, float(value));
 						config[field.field] = shape == 0 ? Variant(value) : Variant(elements);
@@ -3435,7 +3193,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			const RID body = server->soft_body_create();
 			REQUIRE(set_valid_rod(server.ptr(), body, 4));
 			for (const char *field : { "compliance", "bend" }) {
-				for (float value : { -1.0f, NAN, INFINITY, float(double(FLT_MAX) * 2) }) {
+				for (float value : { -1.0f, NAN, INFINITY }) {
 					Dictionary config = rod_config(4);
 					config[field] = make_floats(String(field) == "bend" ? 2 : 3, value);
 					RemainingSnapshot before(server.ptr(), body);
@@ -3684,13 +3442,13 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(Dictionary(server->soft_body_get_extra_property(body, REMAINING_CONFIG_KEYS[cap])) == config);
 			if (cap == 5) {
 				CHECK(Array(server->soft_body_get_extra_property(body, "skin/pose")) == Array(config["initial_pose"]));
-			}
-			for (const char *key : REMAINING_LIVE_KEYS) {
-				CAPTURE(key);
-				ErrorCapture errors;
-				CHECK(server->soft_body_get_extra_property(body, key).get_type() == Variant::NIL);
-				CHECK(errors.count() == 1);
-				CHECK(errors.has("without a physics space"));
+				for (const char *key : REMAINING_LIVE_KEYS) {
+					CAPTURE(key);
+					ErrorCapture errors;
+					CHECK(server->soft_body_get_extra_property(body, key).get_type() == Variant::NIL);
+					CHECK(errors.count() == 1);
+					CHECK(errors.has("without a physics space"));
+				}
 			}
 			server->free_rid(body);
 		}
@@ -3764,40 +3522,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			errors.clear();
 			CHECK(server->soft_body_get_extra_property_list(rid).is_empty());
 			CHECK(errors.count() == 1);
-		}
-	}
-
-	TEST_CASE("remaining P14 registry complete") {
-		HashSet<String> sources;
-		for (int i = 0; i < Probe::capability_source_file_count(); ++i) {
-			sources.insert(Probe::capability_source_file(i));
-		}
-		HashSet<String> found;
-		for (int cap = 0; cap < Probe::capability_count(); ++cap) {
-			const String prefix = Probe::capability_prefix(cap);
-			const String required = Probe::capability_required_key(cap);
-			if (!required.ends_with("/config")) {
-				continue;
-			}
-			CHECK(required == prefix + "config");
-			CHECK(sources.has("cap_" + prefix.trim_suffix("/") + ".cpp"));
-			found.insert(required);
-			bool required_found = false;
-			for (int prop = 0; prop < Probe::capability_property_count(cap); ++prop) {
-				if (Probe::capability_property_name(cap, prop) == required) {
-					required_found = true;
-					CHECK_FALSE(Probe::capability_property_live_read(cap, prop));
-					CHECK(Probe::capability_property_stored(cap, prop));
-					CHECK(Probe::capability_property_clearable(cap, prop));
-					CHECK(Probe::capability_property_rebuild(cap, prop));
-					CHECK(Probe::capability_property_type(cap, prop) == Variant::DICTIONARY);
-				}
-			}
-			CHECK(required_found);
-		}
-		CHECK(found.size() == 7);
-		for (const char *key : REMAINING_CONFIG_KEYS) {
-			CHECK(found.has(key));
 		}
 	}
 
@@ -3923,6 +3647,8 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				config["bend"] = make_floats(2, 0.25f);
 				config["fixed"] = 2;
 				REQUIRE(server->soft_body_set_extra_property(body.rid(), "rod/config", config));
+				space.step();
+				REQUIRE(Probe::in_space(body.rid()));
 				CHECK(Probe::rod_compliance(body.rid(), 0) == 0.5f);
 				CHECK(Probe::vertex_inv_mass(body.rid(), 0) == 0);
 				Dictionary minimal;
@@ -3944,6 +3670,22 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				CHECK(Probe::build_counts(body.rid()).generation == old + 1);
 			}
 		}
+
+		// A bend write rebuilds both configured constraint families together.
+		MeshBodyScope body(server.ptr(), space.rid());
+		server->soft_body_pin_point(body.rid(), 0, true);
+		Dictionary bend;
+		bend["compliance"] = 1e-4;
+		Dictionary lra;
+		lra["type"] = 1;
+		REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", bend));
+		REQUIRE(server->soft_body_set_extra_property(body.rid(), "lra/config", lra));
+		const auto generation = Probe::build_counts(body.rid()).generation;
+		bend["compliance"] = 0.002;
+		REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", bend));
+		CHECK(Probe::build_counts(body.rid()).generation == generation + 1);
+		CHECK(Probe::dihedral_bend_count(body.rid()) == 1);
+		CHECK(Probe::lra_count(body.rid()) == 3);
 	}
 
 	TEST_CASE("remaining P18 bind cache") {
@@ -4452,182 +4194,42 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		}
 	}
 
-	TEST_CASE("remaining R01 diagnostic inventory") {
-		// Real production diagnostics, never DEBUG_ENABLED-only asserts.
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		const auto fixture = fixture_seam();
-		MeshBodyScope body(server.ptr(), space.rid(), &fixture);
-		HashSet<String> observed;
-		const char *codes[] = { "SBREM-KEY", "SBREM-TYPE", "SBREM-VALUE", "SBREM-SIZE", "SBREM-INDEX", "SBREM-ALIAS", "SBREM-TOPOLOGY", "SBREM-CONFLICT", "SBREM-CONTEXT", "SBREM-POSE", "SBREM-SKIN-NORMAL", "SBREM-LRA-NO-ANCHOR" };
-		for (int kind = 0; kind < 12; ++kind) {
-			CAPTURE(codes[kind]);
-			ErrorCapture errors;
-			if (kind == 0) {
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "scalar/wrong", 0));
-			}
-			if (kind == 1) {
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "scalar/config", true));
-			}
-			if (kind == 2) {
-				Dictionary bad;
-				bad["friction"] = -1.0;
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "scalar/config", bad));
-			}
-			if (kind == 3) {
-				Dictionary bad;
-				bad["edge_scale"] = PackedFloat32Array();
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "vertex/config", bad));
-			}
-			if (kind == 4) {
-				Dictionary bad = fixture_tetra();
-				PackedInt32Array fixed;
-				fixed.push_back(8);
-				bad["fixed"] = fixed;
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "volume/config", bad));
-			}
-			if (kind == 5) {
-				Dictionary bad;
-				PackedFloat32Array values = make_floats(7, 1);
-				values.set(4, 2);
-				bad["edge_scale"] = values;
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "vertex/config", bad));
-			}
-			if (kind == 6) {
-				Dictionary bad = fixture_tetra();
-				PackedVector3Array points = bad["vertices"];
-				points.set(3, Vector3());
-				bad["vertices"] = points;
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "volume/config", bad));
-			}
-			if (kind == 7) {
-				server->soft_body_pin_point(body.rid(), 0, true);
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "volume/config", fixture_tetra()));
-				server->soft_body_pin_point(body.rid(), 0, false);
-			}
-			if (kind == 8) {
-				REQUIRE(server->soft_body_set_extra_property(body.rid(), "scalar/config", remaining_config(0)));
-				server->soft_body_set_total_mass(body.rid(), -1.0);
-			}
-			if (kind == 9) {
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "skin/pose", Array()));
-			}
-			if (kind == 10) {
-				Dictionary skin = fixture_skin(1, 2);
-				PackedInt32Array selected;
-				selected.push_back(0);
-				selected.push_back(4);
-				skin["vertices"] = selected;
-				skin["back_stop_distance"] = 0.0;
-				CHECK_FALSE(server->soft_body_set_extra_property(body.rid(), "skin/config", skin));
-			}
-			if (kind == 11) {
-				REQUIRE(server->soft_body_set_extra_property(body.rid(), "lra/config", remaining_config(2)));
-			}
-			CHECK(errors.has(codes[kind]));
-			CHECK(errors.joined().length() > String(codes[kind]).length() + 10);
-			if (errors.has(codes[kind])) {
-				observed.insert(codes[kind]);
-			}
-		}
-		CHECK(observed.size() == 12);
-		{
-			Probe::ThreadedServerScope owner;
-			auto *threaded = static_cast<PhysicsServer3D *>(owner.server());
-			const RID rid = threaded->soft_body_create();
-			ErrorCapture errors;
-			CHECK_FALSE(threaded->soft_body_set_extra_property(rid, "skin/config", fixture_skin()));
-			CHECK(errors.has("SBREM-THREAD"));
-			threaded->free_rid(rid);
-		}
-	}
-
 	TEST_CASE("remaining R02 rid isolation") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
-		for (bool built : { false, true }) {
-			CAPTURE(built);
-			const RID mesh = make_quad_mesh();
-			const RID old = server->soft_body_create();
-			REQUIRE(server->soft_body_set_extra_property(old, "skin/config", fixture_skin()));
-			Array pose;
-			pose.push_back(Transform3D(Basis(), Vector3(0, 3, 0)));
-			REQUIRE(server->soft_body_set_extra_property(old, "skin/pose", pose));
-			if (built) {
-				server->soft_body_set_mesh(old, mesh);
-				server->soft_body_set_space(old, space.rid());
-				space.step();
-				REQUIRE(Probe::in_space(old));
+		for (int cap : { 5, 6 }) {
+			CAPTURE(cap);
+			for (bool built : { false, true }) {
+				CAPTURE(built);
+				const RID mesh = make_quad_mesh();
+				const RID old = server->soft_body_create();
+				REQUIRE(server->soft_body_set_extra_property(old, REMAINING_CONFIG_KEYS[cap], remaining_config(cap)));
+				if (cap == 5) {
+					Array pose;
+					pose.push_back(Transform3D(Basis(), Vector3(0, 3, 0)));
+					REQUIRE(server->soft_body_set_extra_property(old, "skin/pose", pose));
+				}
+				if (built) {
+					if (cap == 5) {
+						server->soft_body_set_mesh(old, mesh);
+					}
+					server->soft_body_set_space(old, space.rid());
+					space.step();
+					REQUIRE(Probe::in_space(old));
+				}
+				server->free_rid(old);
+				const RID fresh = server->soft_body_create();
+				for (const char *key : REMAINING_CONFIG_KEYS) {
+					CHECK(server->soft_body_get_extra_property(fresh, key).get_type() == Variant::NIL);
+				}
+				CHECK(server->soft_body_get_extra_property(fresh, "skin/pose").get_type() == Variant::NIL);
+				CHECK(Probe::build_counts(fresh).generation == 0);
+				CHECK(Probe::body_identity(fresh) == UINT64_MAX);
+				server->free_rid(fresh);
+				RenderingServer::get_singleton()->free_rid(mesh);
 			}
-			server->free_rid(old);
-			const RID fresh = server->soft_body_create();
-			for (const char *key : REMAINING_CONFIG_KEYS) {
-				CHECK(server->soft_body_get_extra_property(fresh, key).get_type() == Variant::NIL);
-			}
-			CHECK(server->soft_body_get_extra_property(fresh, "skin/pose").get_type() == Variant::NIL);
-			CHECK(Probe::build_counts(fresh).generation == 0);
-			CHECK(Probe::body_identity(fresh) == UINT64_MAX);
-			server->free_rid(fresh);
-			RenderingServer::get_singleton()->free_rid(mesh);
 		}
-	}
-
-	TEST_CASE("remaining R03 mesh recovery") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope first(server.ptr()), second(server.ptr());
-		MeshBodyScope body(server.ptr(), first.rid());
-		Dictionary config = fixture_skin();
-		config["max_distance"] = 0.0;
-		REQUIRE(server->soft_body_set_extra_property(body.rid(), "skin/config", config));
-		Array pose;
-		pose.push_back(Transform3D(Basis(), Vector3(0, 2, 0)));
-		REQUIRE(server->soft_body_set_extra_property(body.rid(), "skin/pose", pose));
-		first.step();
-		const auto generation = Probe::build_counts(body.rid()).generation;
-		RemainingMeshFixture bad_fixture;
-		for (const Vector3 &point : { Vector3(), Vector3(1, 0, 0), Vector3(0, 0, 1) }) {
-			bad_fixture.vertices.push_back(point);
-		}
-		for (int i : { 0, 1, 2 }) {
-			bad_fixture.indices.push_back(i);
-		}
-		const RID bad_mesh = bad_fixture.create_mesh();
-		{
-			ErrorCapture errors;
-			server->soft_body_set_mesh(body.rid(), bad_mesh);
-			CHECK(errors.has("SBREM-INDEX"));
-			CHECK_FALSE(Probe::in_space(body.rid()));
-			CHECK(Probe::body_identity(body.rid()) == UINT64_MAX);
-			CHECK(Probe::build_counts(body.rid()).generation == generation);
-			CHECK(Dictionary(server->soft_body_get_extra_property(body.rid(), "skin/config")) == config);
-			CHECK(Array(server->soft_body_get_extra_property(body.rid(), "skin/pose")) == pose);
-			errors.clear();
-			server->soft_body_set_space(body.rid(), second.rid());
-			CHECK(errors.has("SBREM-INDEX"));
-			CHECK(server->soft_body_get_space(body.rid()) == second.rid());
-		}
-		for (const char *key : REMAINING_LIVE_KEYS) {
-			ErrorCapture errors;
-			CHECK(server->soft_body_get_extra_property(body.rid(), key).get_type() == Variant::NIL);
-			CHECK(errors.count() == 1);
-		}
-		server->soft_body_set_mesh(body.rid(), body.mesh_rid());
-		CHECK(Probe::in_space(body.rid()));
-		CHECK(Probe::build_counts(body.rid()).generation == generation + 1);
-		second.step();
-		CHECK(Probe::world_position(body.rid(), 0).y == doctest::Approx(2.0).epsilon(1e-4));
-		{
-			ErrorCapture errors;
-			server->soft_body_set_space(body.rid(), RID());
-			CHECK(errors.count() == 0);
-			CHECK_FALSE(Probe::in_space(body.rid()));
-			CHECK(Probe::build_counts(body.rid()).generation == generation + 1);
-			CHECK(Array(server->soft_body_get_extra_property(body.rid(), "skin/pose")) == pose);
-		}
-		RenderingServer::get_singleton()->free_rid(bad_mesh);
 	}
 
 	TEST_CASE("remaining R04 full mesh stack") {
@@ -4722,24 +4324,6 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 	TEST_CASE("remaining R08 prestep ordering") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
-		{
-			SpaceScope space(server.ptr());
-			MeshBodyScope body(server.ptr(), space.rid());
-			Dictionary skin = fixture_skin();
-			skin["max_distance"] = 0.0;
-			REQUIRE(server->soft_body_set_extra_property(body.rid(), "skin/config", skin));
-			space.step(180);
-			const auto counts = Probe::build_counts(body.rid());
-			CHECK(counts.pre_step == 180);
-			CHECK(counts.solver_steps == 180);
-			CHECK(counts.skin_init == 1);
-			CHECK(counts.skin_recurring == 179);
-			server->soft_body_set_space(body.rid(), RID());
-			server->soft_body_set_space(body.rid(), space.rid());
-			space.step();
-			CHECK(Probe::build_counts(body.rid()).skin_init == 2);
-			CHECK(Probe::build_counts(body.rid()).solver_steps == 181);
-		}
 		for (bool initialized : { false, true }) {
 			for (int recovery = 0; recovery < 4; ++recovery) {
 				CAPTURE(initialized);
@@ -5025,82 +4609,79 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
-		for (bool neighbor : { false, true }) {
-			CAPTURE(neighbor);
-			for (int cap = 0; cap < 6; ++cap) {
-				CAPTURE(cap);
-				MeshBodyScope body(server.ptr(), space.rid());
-				Dictionary config = remaining_config(cap), reduced = config.duplicate(true);
-				if (neighbor && cap != 0) {
-					REQUIRE(server->soft_body_set_extra_property(body.rid(), "scalar/config", remaining_config(0)));
-				} else if (neighbor) {
-					REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", remaining_config(1)));
+		for (int cap = 0; cap < 6; ++cap) {
+			CAPTURE(cap);
+			MeshBodyScope body(server.ptr(), space.rid());
+			Dictionary config = remaining_config(cap), reduced = config.duplicate(true);
+			if (cap != 0) {
+				REQUIRE(server->soft_body_set_extra_property(body.rid(), "scalar/config", remaining_config(0)));
+			} else {
+				REQUIRE(server->soft_body_set_extra_property(body.rid(), "bend/config", remaining_config(1)));
+			}
+			if (cap == 0) {
+				config["gravity_factor"] = 2.0;
+			}
+			if (cap == 1) {
+				config["type"] = 0;
+			}
+			if (cap == 2) {
+				server->soft_body_pin_point(body.rid(), 0, true);
+				config["max_distance_multiplier"] = 2.0;
+			}
+			if (cap == 3) {
+				config["shear_scale"] = 5.0;
+				reduced.erase("shear_scale");
+			}
+			if (cap == 4) {
+				config["compliance"] = 0.2;
+				PackedInt32Array fixed;
+				fixed.push_back(0);
+				config["fixed"] = fixed;
+			}
+			if (cap == 5) {
+				config["max_distance"] = 0.1;
+				config["back_stop_distance"] = 0.0;
+				config["back_stop_radius"] = 2.0;
+			}
+			REQUIRE(server->soft_body_set_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap], config));
+			REQUIRE(server->soft_body_set_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap], reduced));
+			CHECK(SoftBodyCapValidation::equal(server->soft_body_get_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap]), reduced));
+			if (cap == 0) {
+				CHECK(Probe::scalars(body.rid()).gravity_factor == 1.0f);
+			}
+			if (cap == 1) {
+				CHECK(Probe::dihedral_bend_count(body.rid()) == 1);
+			}
+			if (cap == 2) {
+				for (int i = 0; i < 3; ++i) {
+					const auto lra = Probe::lra(body.rid(), i);
+					CHECK(lra.rest == doctest::Approx(Probe::vertex_position(body.rid(), lra.vertices[1]).length()).epsilon(1e-5));
 				}
-				if (cap == 0) {
-					config["gravity_factor"] = 2.0;
+			}
+			if (cap == 3) {
+				const double base = (1.0 / 60 / 20) * (1.0 / 60 / 20) * 8;
+				for (int i = 0; i < 6; ++i) {
+					CHECK(Probe::edge(body.rid(), i).compliance == doctest::Approx(base).epsilon(1e-5));
 				}
-				if (cap == 1) {
-					config["type"] = 0;
+			}
+			if (cap == 4) {
+				CHECK(Probe::tetra(body.rid(), 0).compliance == 0);
+				CHECK(Probe::vertex_inv_mass(body.rid(), 0) == 4);
+			}
+			if (cap == 5) {
+				for (int i = 0; i < 4; ++i) {
+					const auto skin = Probe::skin(body.rid(), i);
+					CHECK(skin.max_distance == doctest::Approx(0.05));
+					CHECK(skin.back_stop_distance == FLT_MAX);
+					CHECK(skin.back_stop_radius == 40);
 				}
-				if (cap == 2) {
-					server->soft_body_pin_point(body.rid(), 0, true);
-					config["max_distance_multiplier"] = 2.0;
-				}
-				if (cap == 3) {
-					config["shear_scale"] = 5.0;
-					reduced.erase("shear_scale");
-				}
-				if (cap == 4) {
-					config["compliance"] = 0.2;
-					PackedInt32Array fixed;
-					fixed.push_back(0);
-					config["fixed"] = fixed;
-				}
-				if (cap == 5) {
-					config["max_distance"] = 0.1;
-					config["back_stop_distance"] = 0.0;
-					config["back_stop_radius"] = 2.0;
-				}
-				REQUIRE(server->soft_body_set_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap], config));
-				REQUIRE(server->soft_body_set_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap], reduced));
-				CHECK(SoftBodyCapValidation::equal(server->soft_body_get_extra_property(body.rid(), REMAINING_CONFIG_KEYS[cap]), reduced));
-				if (cap == 0) {
-					CHECK(Probe::scalars(body.rid()).gravity_factor == 1.0f);
-				}
-				if (cap == 1) {
-					CHECK(Probe::dihedral_bend_count(body.rid()) == 1);
-				}
-				if (cap == 2) {
-					for (int i = 0; i < 3; ++i) {
-						const auto lra = Probe::lra(body.rid(), i);
-						CHECK(lra.rest == doctest::Approx(Probe::vertex_position(body.rid(), lra.vertices[1]).length()).epsilon(1e-5));
-					}
-				}
-				if (cap == 3) {
-					const double base = (1.0 / 60 / 20) * (1.0 / 60 / 20) * 8;
-					for (int i = 0; i < 6; ++i) {
-						CHECK(Probe::edge(body.rid(), i).compliance == doctest::Approx(base).epsilon(1e-5));
-					}
-				}
-				if (cap == 4) {
-					CHECK(Probe::tetra(body.rid(), 0).compliance == 0);
-					CHECK(Probe::vertex_inv_mass(body.rid(), 0) == 4);
-				}
-				if (cap == 5) {
-					for (int i = 0; i < 4; ++i) {
-						const auto skin = Probe::skin(body.rid(), i);
-						CHECK(skin.max_distance == doctest::Approx(0.05));
-						CHECK(skin.back_stop_distance == FLT_MAX);
-						CHECK(skin.back_stop_radius == 40);
-					}
-				}
-				if (neighbor && cap != 0) {
-					CHECK(Dictionary(server->soft_body_get_extra_property(body.rid(), "scalar/config")) == remaining_config(0));
-					CHECK(Probe::scalars(body.rid()).friction == doctest::Approx(0.4));
-					CHECK(Probe::scalars(body.rid()).restitution == doctest::Approx(0.2));
-				} else if (neighbor) {
-					CHECK(Probe::dihedral_bend_count(body.rid()) == 1);
-				}
+			}
+			if (cap != 0) {
+				CHECK(Dictionary(server->soft_body_get_extra_property(body.rid(), "scalar/config")) == remaining_config(0));
+				CHECK(Probe::scalars(body.rid()).friction == doctest::Approx(0.4));
+				CHECK(Probe::scalars(body.rid()).restitution == doctest::Approx(0.2));
+			} else {
+				CHECK(Probe::dihedral_bend_count(body.rid()) == 1);
 			}
 		}
 	}

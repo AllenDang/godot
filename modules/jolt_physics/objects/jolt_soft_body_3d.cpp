@@ -835,12 +835,6 @@ void JoltSoftBody3D::pre_step(float p_step) {
 		if (cap->pre_step == nullptr) {
 			continue;
 		}
-#ifdef TESTS_ENABLED
-		if (test_skip_skin_call && String(cap->prefix) == "skin/") {
-			test_skip_skin_call = false;
-			continue;
-		}
-#endif
 		String error;
 		if (!cap->pre_step(cap_state, *jolt_body, p_step, space->get_temp_allocator(), &error)) {
 			ERR_PRINT(error);

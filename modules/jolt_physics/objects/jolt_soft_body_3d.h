@@ -49,7 +49,6 @@ class JoltSoftBody3D final : public JoltObject3D {
 
 	JoltSoftBodyCapState cap_state;
 #ifdef TESTS_ENABLED
-	bool test_skip_skin_call = false;
 	bool test_without_volume_constraints = false;
 	mutable uint64_t test_renderer_reads = 0;
 	uint64_t test_body_creations = 0;
@@ -132,7 +131,6 @@ public:
 	}
 	void record_solver_step_for_tests() { ++cap_state.test_counts.solver_steps; }
 	void record_removal_during_traversal_for_tests() { ++cap_state.test_counts.removals_during_traversal; }
-	void skip_next_skin_call_for_tests() { test_skip_skin_call = true; }
 	void set_volume_control_for_tests() { test_without_volume_constraints = true; }
 #endif
 	JoltSoftBody3D();

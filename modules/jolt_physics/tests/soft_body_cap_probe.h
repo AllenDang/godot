@@ -32,7 +32,6 @@
 
 #include "core/math/transform_3d.h"
 #include "core/math/vector3.h"
-#include "core/string/ustring.h"
 #include "core/templates/rid.h"
 
 // Keep tests Jolt-header-free: missing JPH_DEBUG_RENDERER causes layout mismatch.
@@ -85,7 +84,6 @@ struct BuildCounts {
 };
 Constraint edge(RID p_body, int p_index);
 Constraint face(RID p_body, int p_index);
-int update_group_count(RID p_body);
 Constraint dihedral(RID p_body, int p_index);
 Constraint lra(RID p_body, int p_index);
 Constraint tetra(RID p_body, int p_index);
@@ -127,27 +125,16 @@ public:
 	ContactScope &operator=(const ContactScope &) = delete;
 	int count() const;
 };
-bool face_ray_hit(RID p_body, const Vector3 &p_origin, const Vector3 &p_direction);
-bool skip_next_skin_call(RID p_body);
 bool volume_control(RID p_body);
 bool clear_faces(RID p_body);
 bool set_body_frame(RID p_body, const Transform3D &p_frame);
 bool set_vertex_local(RID p_body, int p_vertex, const Vector3 &p_position, const Vector3 &p_velocity = Vector3());
 bool invoke_pre_step(RID p_body, float p_step = 1.0f / 60.0f);
-// Direct Jolt fixture: None=0, Distance=1, Dihedral=2. No registry emulation.
-Constraint fixture_bend(bool p_square, int p_mode, int &r_edges, int &r_dihedrals);
 
 int rod_count(RID p_body);
 int rod_bend_twist_count(RID p_body);
-// mRodStates has no size accessor; read its last constraint-indexed entry.
-bool rod_state_is_readable(RID p_body, int p_index);
 float rod_length(RID p_body, int p_index);
-float min_rod_length(RID p_body);
 bool all_bishop_frames_set(RID p_body);
-bool rod_angular_velocities_are_zero(RID p_body);
-// `p_which` is 0 or 1.
-int rod_vertex(RID p_body, int p_rod, int p_which);
-int bend_twist_rod(RID p_body, int p_bend, int p_which);
 float rod_compliance(RID p_body, int p_index);
 float bend_twist_compliance(RID p_body, int p_index);
 
@@ -156,22 +143,12 @@ bool update_position(RID p_body);
 // Detect the backend itself; PhysicsServer3DManager returns a wrapper, hence false.
 bool is_inner_jolt_server(const void *p_server);
 
-// Expose the registry without including its Jolt-dependent header.
-int capability_count();
-String capability_prefix(int p_cap);
-String capability_required_key(int p_cap);
-int capability_property_count(int p_cap);
-String capability_property_name(int p_cap, int p_prop);
-// Return Variant::Type as int to keep engine enums out of the interface.
-int capability_property_type(int p_cap, int p_prop);
-bool capability_property_live_read(int p_cap, int p_prop);
-bool capability_property_stored(int p_cap, int p_prop);
-bool capability_property_clearable(int p_cap, int p_prop);
-bool capability_property_rebuild(int p_cap, int p_prop);
-
-// The build-time list of `capabilities/cap_*.cpp`, basenames only.
-int capability_source_file_count();
-String capability_source_file(int p_index);
+// Capture the backend when creating a cached Jolt wrapper. Do not resolve it
+// from the singleton during teardown: another server may have replaced it.
+void *current_jolt_server();
+// Finish and delete a test-owned wrapper/backend pair after worker callbacks.
+// p_jolt_server is nullptr for non-Jolt backends.
+void destroy_test_server(void *p_server, void *p_jolt_server);
 
 // Own a real threaded wrapper/backend pair without exposing JPH types.
 class ThreadedServerScope {
@@ -183,9 +160,5 @@ public:
 	void *server() const;
 	bool actual_separate_thread() const;
 };
-
-// Fresh-settings checks requiring no body, space, server or RID.
-bool calculate_rod_properties_keeps_chain_order(int p_joints);
-bool optimize_is_identity_for_chain(int p_joints);
 
 } // namespace JoltSoftBodyCapProbe

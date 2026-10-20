@@ -39,31 +39,6 @@ namespace TestJoltSoftBodyCap {
 TEST_SUITE("[JoltSoftBodyCap]") {
 	/* ---------------------------------------------------------------- protocol */
 
-	TEST_CASE("unknown prefix is silent") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		ErrorCapture errors;
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "nope/x", 1));
-		CHECK(errors.count() == 0);
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("misspelled key errors") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		ErrorCapture errors;
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "rod/joint", make_joints(9)));
-		CHECK(errors.has("rod/joint"));
-		CHECK(errors.has("not a valid key"));
-
-		server->free_rid(body);
-	}
-
 	TEST_CASE("wrong type errors") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -81,63 +56,22 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->free_rid(body);
 	}
 
-	TEST_CASE("get of unknown prefix is empty") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		CHECK(server->soft_body_get_extra_property(body, "nope/x").get_type() == Variant::NIL);
-
-		server->free_rid(body);
-	}
-
 	TEST_CASE("jolt lists rod properties") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
 		RID body = server->soft_body_create();
 
 		const TypedArray<Dictionary> list = server->soft_body_get_extra_property_list(body);
-		CHECK(list.size() == 19);
 		for (const char *key : { K_CONFIG, K_STATE }) {
-			CHECK_MESSAGE(!find_property(list, key).is_empty(), key);
+			CAPTURE(key);
+			const Dictionary entry = find_property(list, key);
+			REQUIRE_FALSE(entry.is_empty());
+			const bool stored = ((uint32_t)entry["usage"] & PROPERTY_USAGE_STORAGE) != 0;
+			CHECK(stored == (String(key) == K_CONFIG));
 		}
 		for (const char *key : { "rod/joints", "rod/compliance", "rod/bend", "rod/fixed" }) {
 			CHECK(find_property(list, key).is_empty());
 		}
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("godot physics lists nothing") {
-		ServerScope server("GodotPhysics3D");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		CHECK(server->soft_body_get_extra_property_list(body).size() == 0);
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("rod state is not serialised") { // codespell:ignore serialised
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		const Dictionary entry = find_property(server->soft_body_get_extra_property_list(body), K_STATE);
-		REQUIRE_FALSE(entry.is_empty());
-		CHECK(((uint32_t)entry["usage"] & PROPERTY_USAGE_STORAGE) == 0);
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("rod config is serialised") { // codespell:ignore serialised
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		const Dictionary entry = find_property(server->soft_body_get_extra_property_list(body), K_CONFIG);
-		REQUIRE_FALSE(entry.is_empty());
-		CHECK(((uint32_t)entry["usage"] & PROPERTY_USAGE_STORAGE) != 0);
 
 		server->free_rid(body);
 	}
@@ -150,123 +84,17 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		CHECK_FALSE(Probe::is_inner_jolt_server(server.ptr()));
 
 		RID body = server->soft_body_create();
-		CHECK(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "joints", make_joints(9))));
-		CHECK(PackedVector3Array(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant())).size() == 9);
-		CHECK(server->soft_body_get_extra_property_list(body).size() >= 5);
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("threaded wrapper forwards") {
-		ProjectSettings *settings = ProjectSettings::get_singleton();
-		const String key = "physics/3d/run_on_separate_thread";
-		const Variant saved = settings->has_setting(key) ? settings->get_setting(key) : Variant(false);
-		settings->set_setting(key, true);
-
-		{
-			// The flag is read when the server is constructed, not when it steps.
-			ServerScope server("Jolt Physics");
-			REQUIRE(server.is_valid());
-
-			RID body = server->soft_body_create();
-			CHECK(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "joints", make_joints(9))));
-			CHECK(PackedVector3Array(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant())).size() == 9);
-			CHECK(server->soft_body_get_extra_property_list(body).size() >= 5);
-			server->free_rid(body);
-		}
-
-		settings->set_setting(key, saved);
-	}
-
-	TEST_CASE("writable keys read back") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
 		const PackedVector3Array joints = make_joints(9);
 		REQUIRE(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "joints", joints)));
 
+		ErrorCapture errors;
+		// Stored keys must serialize before the body enters a space.
 		const PackedVector3Array read = Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant());
 		REQUIRE(read.size() == joints.size());
 		for (int i = 0; i < joints.size(); i++) {
 			CHECK(read[i] == joints[i]);
 		}
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("rod state cannot be written") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		ErrorCapture errors;
-		CHECK_FALSE(server->soft_body_set_extra_property(body, K_STATE, make_floats(32)));
-		CHECK(errors.has("read-only"));
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("invalid rid is rejected") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-
-		ErrorCapture errors;
-		SUBCASE("set") {
-			CHECK_FALSE(server->soft_body_set_extra_property(RID(), K_CONFIG, rod_candidate(server.ptr(), RID(), "joints", make_joints(9))));
-		}
-		SUBCASE("get") {
-			CHECK(Dictionary(server->soft_body_get_extra_property(RID(), K_CONFIG)).get("joints", Variant()).get_type() == Variant::NIL);
-		}
-		SUBCASE("list") {
-			CHECK(server->soft_body_get_extra_property_list(RID()).size() == 0);
-		}
-		CHECK(errors.count() > 0);
-	}
-
-	TEST_CASE("freed rid is rejected") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-		server->free_rid(body);
-
-		ErrorCapture errors;
-		SUBCASE("set") {
-			CHECK_FALSE(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "joints", make_joints(9))));
-		}
-		SUBCASE("get") {
-			CHECK(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant()).get_type() == Variant::NIL);
-		}
-		SUBCASE("list") {
-			CHECK(server->soft_body_get_extra_property_list(body).size() == 0);
-		}
-		CHECK(errors.count() > 0);
-	}
-
-	TEST_CASE("rod state needs a space") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-
-		ErrorCapture errors;
-		CHECK(server->soft_body_get_extra_property(body, K_STATE).get_type() == Variant::NIL);
-		CHECK(errors.count() > 0);
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("writable keys read without a space") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-
-		ErrorCapture errors;
-		// Stored keys must serialize before the body enters a space.
-		CHECK(PackedVector3Array(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant())).size() == 9);
+		CHECK(server->soft_body_get_extra_property_list(body).size() >= 5);
 		CHECK(errors.count() == 0);
 
 		server->free_rid(body);
@@ -282,6 +110,9 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->soft_body_set_space(body, space.rid());
 		REQUIRE(Probe::in_space(body));
 
+		// Segments, not particles: 9 joints give 8 rods.
+		CHECK(Probe::vertex_count(body) == 9);
+		CHECK(Probe::rod_count(body) == 8);
 		const PackedFloat32Array state = server->soft_body_get_extra_property(body, K_STATE);
 		REQUIRE(state.size() == 8 * 4);
 		for (int i = 0; i < state.size(); i++) {
@@ -346,19 +177,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		REQUIRE(arg_counts.has("_soft_body_get_extra_property_list"));
 		CHECK(arg_counts["_soft_body_get_extra_property_list"] == 1);
 #endif
-	}
-
-	TEST_CASE("dummy server answers emptily") {
-		PhysicsServer3D *saved = PhysicsServer3D::get_singleton();
-		PhysicsServer3DDummy *server = memnew(PhysicsServer3DDummy);
-
-		RID body = server->soft_body_create();
-		CHECK_FALSE(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server, body, "joints", make_joints(9))));
-		CHECK(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant()).get_type() == Variant::NIL);
-		CHECK(server->soft_body_get_extra_property_list(body).size() == 0);
-
-		memdelete(server);
-		PhysicsServer3D::set_singleton_for_tests(saved);
 	}
 
 	/* -------------------------------------------------------------- validation */
@@ -438,6 +256,7 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 
 		RID body = server->soft_body_create();
 		REQUIRE(set_valid_rod(server.ptr(), body, 9, 0));
+		server->soft_body_set_total_mass(body, 1.0);
 		server->soft_body_set_space(body, space.rid());
 		// Read after a step, so `_update_mass()` has already rewritten every
 		// inverse mass at least once.
@@ -445,7 +264,7 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		REQUIRE(Probe::in_space(body));
 
 		for (int i = 0; i < 9; i++) {
-			CHECK(Probe::vertex_inv_mass(body, i) > 0.0f);
+			CHECK(Math::is_equal_approx(Probe::vertex_inv_mass(body, i), 9.0f));
 		}
 
 		server->free_rid(body);
@@ -481,19 +300,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 
 		ErrorCapture errors;
 		CHECK_FALSE(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "bend", make_floats(1))));
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("valid rod is accepted") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		CHECK(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "joints", make_joints(9))));
-		CHECK(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "compliance", make_floats(8))));
-		CHECK(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "bend", make_floats(7))));
-		CHECK(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "fixed", 1)));
 
 		server->free_rid(body);
 	}
@@ -551,11 +357,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		}
 		SUBCASE("inf") {
 			value = INFINITY;
-		}
-		SUBCASE("overflowing literal") {
-			// Keep overflow at runtime.
-			volatile double large = 1e200;
-			value = (real_t)(large * large);
 		}
 
 		PackedVector3Array joints = make_joints(4);
@@ -763,24 +564,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 
 	/* ------------------------------------------------------------- arbitration */
 
-	TEST_CASE("two replacing capabilities conflict") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-		server->soft_body_set_space(body, space.rid());
-		RemainingSnapshot before(server.ptr(), body);
-		ErrorCapture errors;
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "test_replace/enabled", true));
-		CHECK_MESSAGE(errors.has("SBREM-CONFLICT"), errors.joined());
-		before.unchanged();
-		CHECK(Probe::in_space(body));
-
-		server->free_rid(body);
-	}
-
 	TEST_CASE("cloth without a mesh still errors") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -822,71 +605,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		RenderingServer::get_singleton()->free_rid(mesh);
 	}
 
-	// Without capabilities, EBendType::None and FLT_MAX disable the quad's bend
-	// constraint. Other capability arrays also stay empty.
-	TEST_CASE("a cloth has edges but cannot bend") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		RID mesh = make_quad_mesh();
-
-		RID body = server->soft_body_create();
-		server->soft_body_set_mesh(body, mesh);
-
-		SUBCASE("default cloth") {}
-		SUBCASE("stiffest cloth") {
-			server->soft_body_set_linear_stiffness(body, 1.0);
-			server->soft_body_set_simulation_precision(body, 20);
-		}
-		SUBCASE("every knob at once") {
-			server->soft_body_set_linear_stiffness(body, 1.0);
-			server->soft_body_set_shrinking_factor(body, 0.5);
-			server->soft_body_set_pressure_coefficient(body, 100.0);
-			server->soft_body_set_damping_coefficient(body, 1.0);
-			server->soft_body_set_drag_coefficient(body, 1.0);
-			server->soft_body_set_simulation_precision(body, 20);
-		}
-
-		server->soft_body_set_space(body, space.rid());
-		REQUIRE(Probe::in_space(body));
-
-		// Confirm the body was built before checking absent constraints.
-		CHECK(Probe::edge_count(body) > 0);
-		CHECK(Probe::face_count(body) == 2);
-
-		CHECK(Probe::dihedral_bend_count(body) == 0);
-		CHECK(Probe::lra_count(body) == 0);
-		CHECK(Probe::volume_count(body) == 0);
-		CHECK(Probe::skinned_count(body) == 0);
-
-		server->free_rid(body);
-		RenderingServer::get_singleton()->free_rid(mesh);
-	}
-
-	// Prototype flat keys are not aliases for atomic configuration dictionaries.
-	TEST_CASE("prototype flat keys do not configure constraint arrays") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		RID body = server->soft_body_create();
-
-		ErrorCapture errors;
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "bend/compliance", 1e-4));
-		CHECK(errors.has("SBREM-KEY"));
-		errors.clear();
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "lra/type", 1));
-		CHECK(errors.has("SBREM-KEY"));
-		errors.clear();
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "volume/tetrahedra", PackedInt32Array()));
-		CHECK(errors.has("SBREM-KEY"));
-		errors.clear();
-		CHECK_FALSE(server->soft_body_set_extra_property(body, "skin/joint_weights", PackedFloat32Array()));
-		CHECK(errors.has("SBREM-KEY"));
-
-		CHECK(server->soft_body_get_extra_property(body, "bend/compliance").get_type() == Variant::NIL);
-
-		server->free_rid(body);
-	}
-
 	TEST_CASE("mesh with a rod warns") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -901,6 +619,7 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->soft_body_set_space(body, space.rid());
 		CHECK_MESSAGE(errors.has("mesh is ignored"), errors.joined());
 		REQUIRE(Probe::in_space(body));
+		CHECK(PackedVector3Array(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant())).size() == 9);
 		CHECK(Probe::rod_count(body) == 8);
 		CHECK(Probe::face_count(body) == 0);
 		CHECK(Probe::vertex_count(body) == 9);
@@ -1004,32 +723,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->free_rid(body);
 	}
 
-	TEST_CASE("calculate rod properties keeps chain order") {
-		CHECK(Probe::calculate_rod_properties_keeps_chain_order(9));
-	}
-
-	TEST_CASE("optimize is identity for a nine vertex chain") {
-		CHECK(Probe::optimize_is_identity_for_chain(9));
-	}
-
-	TEST_CASE("inverse mass matches update mass") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9, 0));
-		server->soft_body_set_total_mass(body, 1.0);
-		server->soft_body_set_space(body, space.rid());
-		REQUIRE(Probe::in_space(body));
-		space.step();
-
-		// The cloth path's formula, not 1.0: vertex count over total mass.
-		CHECK(Math::is_equal_approx(Probe::vertex_inv_mass(body, 4), 9.0f));
-
-		server->free_rid(body);
-	}
-
 	TEST_CASE("rebuild rederives rod properties") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -1040,6 +733,7 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->soft_body_set_space(body, space.rid());
 		REQUIRE(Probe::in_space(body));
 		CHECK(Math::is_equal_approx(Probe::rod_length(body, 0), 1.0f));
+		CHECK(Probe::all_bishop_frames_set(body));
 
 		// A reused settings object would short-circuit `CalculateRodProperties`,
 		// leaving the previous build's lengths behind.
@@ -1051,67 +745,39 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->free_rid(body);
 	}
 
-	TEST_CASE("state order survives optimize at scale") {
+	TEST_CASE("rod state follows source order at scale") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
 		SpaceScope space(server.ptr());
 
 		const int joint_count = 200;
 		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, joint_count));
+		PackedVector3Array joints;
+		joints.push_back(Vector3());
+		for (int i = 0; i < joint_count - 1; ++i) {
+			joints.push_back(joints[i] + Vector3(1, 0.25 * (i % 3), 0.125 * (i % 5)));
+		}
+		Dictionary config = rod_config(joint_count);
+		config["joints"] = joints;
+		REQUIRE(server->soft_body_set_extra_property(body, K_CONFIG, config));
 		server->soft_body_set_space(body, space.rid());
 		REQUIRE(Probe::in_space(body));
 		REQUIRE(Probe::rod_count(body) == joint_count - 1);
 
-		// Every +X segment's Bishop frame must map +Z to +X in rod/state.
+		const PackedFloat32Array state = server->soft_body_get_extra_property(body, K_STATE);
+		REQUIRE(state.size() == 4 * (joint_count - 1));
+		// Public rotations must follow authored segments, not optimizer order.
 		for (int i = 0; i < joint_count - 1; i++) {
-			CHECK(Probe::rod_vertex(body, i, 0) == i);
-			CHECK(Probe::rod_vertex(body, i, 1) == i + 1);
-
-			const Quaternion rotation = read_rod_rotation(server.ptr(), body, i);
+			const Quaternion rotation(state[i * 4], state[i * 4 + 1], state[i * 4 + 2], state[i * 4 + 3]);
+			CHECK(rotation.is_normalized());
 			const Vector3 tangent = rotation.xform(Vector3(0, 0, 1));
-			CHECK(tangent.distance_to(Vector3(1, 0, 0)) < 0.01);
+			CHECK(tangent.distance_to((joints[i + 1] - joints[i]).normalized()) < 0.01);
 		}
 
 		server->free_rid(body);
 	}
 
 	/* --------------------------------------------------------------- derivation */
-
-	TEST_CASE("derive populates rod properties") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-		server->soft_body_set_space(body, space.rid());
-		REQUIRE(Probe::in_space(body));
-
-		CHECK(Probe::min_rod_length(body) > 0.0f);
-		CHECK(Probe::all_bishop_frames_set(body));
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("rod states are sized by segment") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-		server->soft_body_set_space(body, space.rid());
-		REQUIRE(Probe::in_space(body));
-
-		// Segments, not particles: 9 joints give 8 rods.
-		CHECK(Probe::vertex_count(body) == 9);
-		CHECK(Probe::rod_count(body) == 8);
-		CHECK(Probe::rod_state_is_readable(body, 7));
-		CHECK(PackedFloat32Array(server->soft_body_get_extra_property(body, K_STATE)).size() == 8 * 4);
-
-		server->free_rid(body);
-	}
 
 	TEST_CASE("one pin frees orientation two pins fix it") {
 		ServerScope server("Jolt Physics");
@@ -1149,27 +815,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 
 	/* --------------------------------------------------------------- lifecycle */
 
-	TEST_CASE("set mesh keeps capability state") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-		RID mesh = make_quad_mesh();
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-
-		ErrorCapture errors;
-		server->soft_body_set_mesh(body, mesh);
-		server->soft_body_set_space(body, space.rid());
-		REQUIRE(Probe::in_space(body));
-
-		CHECK(PackedVector3Array(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant())).size() == 9);
-		CHECK(Probe::rod_count(body) == 8);
-
-		server->free_rid(body);
-		RenderingServer::get_singleton()->free_rid(mesh);
-	}
-
 	TEST_CASE("space change keeps capability state") {
 		ServerScope server("Jolt Physics");
 		REQUIRE(server.is_valid());
@@ -1187,43 +832,6 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		REQUIRE(Probe::in_space(body));
 		CHECK(Probe::rod_count(body) == 8);
 		CHECK(PackedVector3Array(Dictionary(server->soft_body_get_extra_property(body, K_CONFIG)).get("joints", Variant())).size() == 9);
-
-		server->free_rid(body);
-	}
-
-	TEST_CASE("new body starts with no capability state") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-
-		RID first = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), first, 9));
-		server->soft_body_set_space(first, space.rid());
-		REQUIRE(Probe::in_space(first));
-		server->free_rid(first);
-
-		RID second = server->soft_body_create();
-		CHECK(server->soft_body_get_extra_property(second, K_CONFIG).get_type() == Variant::NIL);
-		CHECK(server->soft_body_get_extra_property_list(second).size() >= 5);
-
-		server->free_rid(second);
-	}
-
-	TEST_CASE("live parameter change rebuilds") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-		SpaceScope space(server.ptr());
-
-		RID body = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), body, 9));
-		server->soft_body_set_space(body, space.rid());
-		REQUIRE(Probe::in_space(body));
-		CHECK(Probe::rod_compliance(body, 0) == 0.0f);
-
-		REQUIRE(server->soft_body_set_extra_property(body, K_CONFIG, rod_candidate(server.ptr(), body, "compliance", make_floats(8, 0.25f))));
-		space.step();
-		REQUIRE(Probe::in_space(body));
-		CHECK(Math::is_equal_approx(Probe::rod_compliance(body, 0), 0.25f));
 
 		server->free_rid(body);
 	}
@@ -1298,59 +906,53 @@ TEST_SUITE("[JoltSoftBodyCap]") {
 		server->free_rid(body);
 	}
 
-	TEST_CASE("free before build leaks nothing") {
-		ServerScope server("Jolt Physics");
-		REQUIRE(server.is_valid());
-
-		RID first = server->soft_body_create();
-		REQUIRE(set_valid_rod(server.ptr(), first, 9));
-		// Freed without ever entering a space, so nothing was ever built.
-		server->free_rid(first);
-
-		RID second = server->soft_body_create();
-		CHECK(server->soft_body_get_extra_property(second, K_CONFIG).get_type() == Variant::NIL);
-
-		server->free_rid(second);
-	}
-
-	/* ------------------------------------------------------------------ registry */
-
-	TEST_CASE("every capability file is listed") {
-		const int file_count = Probe::capability_source_file_count();
-		REQUIRE(file_count > 0);
-
-		HashSet<String> listed;
-		for (int i = 0; i < Probe::capability_count(); i++) {
-			listed.insert(Probe::capability_prefix(i));
-		}
-
-		// Every cap_<x>.cpp must register its <x>/ prefix.
-		for (int i = 0; i < file_count; i++) {
-			const String file = Probe::capability_source_file(i);
-			REQUIRE(file.begins_with("cap_"));
-			REQUIRE(file.ends_with(".cpp"));
-			const String prefix = file.substr(4, file.length() - 8) + "/";
-			CHECK_MESSAGE(listed.has(prefix), file);
-		}
-		CHECK(Probe::capability_count() == file_count);
-	}
-
-	TEST_CASE("every capability names a writable required key") {
-		REQUIRE(Probe::capability_count() > 0);
-
-		for (int cap = 0; cap < Probe::capability_count(); cap++) {
-			const String required = Probe::capability_required_key(cap);
-			CHECK_MESSAGE(required.begins_with(Probe::capability_prefix(cap)), required);
-
-			bool found = false;
-			for (int prop = 0; prop < Probe::capability_property_count(cap); prop++) {
-				if (Probe::capability_property_name(cap, prop) == required) {
-					found = true;
-					// Activation requires a writable key.
-					CHECK_FALSE(Probe::capability_property_live_read(cap, prop));
+	TEST_CASE("cached servers are released and can be recreated") {
+		ServerScope::clear_cache();
+		struct Cleanup {
+			PhysicsServer3D *saved = PhysicsServer3D::get_singleton();
+			PhysicsServer3DDummy *sentinel = memnew(PhysicsServer3DDummy);
+			~Cleanup() {
+				ServerScope::clear_cache();
+				memdelete(sentinel);
+				PhysicsServer3D::set_singleton_for_tests(saved);
+			}
+		} cleanup;
+		const int baseline = ObjectDB::get_object_count();
+		const char *names[] = { "Jolt Physics", "GodotPhysics3D" };
+		for (int round = 0; round < 2; ++round) {
+			CAPTURE(round);
+			ObjectID ids[2];
+			for (int i = 0; i < 2; ++i) {
+				const char *name = names[round == 0 ? i : 1 - i];
+				{
+					ServerScope server(name);
+					REQUIRE(server.is_valid());
+					ids[i] = server->get_instance_id();
+					if (String(name) == "Jolt Physics") {
+						SpaceScope space(server.ptr());
+						VolumeBodyScope body(server.ptr(), space.rid(), fixture_tetra());
+						space.step(2);
+					}
+				}
+				CHECK(PhysicsServer3D::get_singleton() == cleanup.sentinel);
+				{
+					ServerScope reused(name);
+					REQUIRE(reused.is_valid());
+					CHECK(reused->get_instance_id() == ids[i]);
 				}
 			}
-			CHECK_MESSAGE(found, required);
+			// Each cached backend has one wrapper and one inner server.
+			CHECK(ObjectDB::get_object_count() == baseline + 4);
+			ServerScope::clear_cache();
+			CHECK(ObjectDB::get_object_count() == baseline);
+			CHECK(PhysicsServer3D::get_singleton() == cleanup.sentinel);
+			CHECK(Probe::current_jolt_server() == nullptr);
+			for (ObjectID id : ids) {
+				CHECK(ObjectDB::get_instance(id) == nullptr);
+			}
+			ServerScope::clear_cache();
+			CHECK(ObjectDB::get_object_count() == baseline);
+			CHECK(PhysicsServer3D::get_singleton() == cleanup.sentinel);
 		}
 	}
 

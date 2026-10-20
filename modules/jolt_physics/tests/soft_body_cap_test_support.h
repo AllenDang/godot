@@ -53,10 +53,19 @@ constexpr const char *K_CONFIG = "rod/config";
 constexpr const char *K_STATE = "rod/state";
 
 // Non-SceneTree/Editor tests start without a physics singleton. Restore it even
-// when REQUIRE aborts. Cache one server per name: per-case init/finish corrupts
-// Jolt's global job/Factory/RegisterTypes state. Isolate cases with fresh spaces
-// and bodies instead.
+// when REQUIRE aborts. Reuse servers across cases, isolating spaces and bodies.
+// The run-end listener releases the cache before engine/worker-pool shutdown.
 class ServerScope {
+	struct CachedServer {
+		PhysicsServer3D *server = nullptr;
+		void *jolt_backend = nullptr;
+	};
+
+	static HashMap<String, CachedServer> &_servers() {
+		static HashMap<String, CachedServer> servers;
+		return servers;
+	}
+
 	PhysicsServer3D *saved = nullptr;
 	PhysicsServer3D *server = nullptr;
 
@@ -64,16 +73,21 @@ public:
 	explicit ServerScope(const String &p_name) {
 		saved = PhysicsServer3D::get_singleton();
 
-		static HashMap<String, PhysicsServer3D *> servers;
-		if (HashMap<String, PhysicsServer3D *>::Iterator found = servers.find(p_name)) {
-			server = found->value;
+		HashMap<String, CachedServer> &servers = _servers();
+		if (HashMap<String, CachedServer>::Iterator found = servers.find(p_name)) {
+			server = found->value.server;
 		} else {
+			CachedServer entry;
 			server = PhysicsServer3DManager::get_singleton()->new_server(p_name);
+			entry.server = server;
 			if (server != nullptr) {
+				if (p_name == "Jolt Physics") {
+					entry.jolt_backend = Probe::current_jolt_server();
+				}
 				server->init();
 				server->set_active(true);
 			}
-			servers.insert(p_name, server);
+			servers.insert(p_name, entry);
 		}
 
 		// Reuse does not run the constructor that claimed the singleton.
@@ -86,10 +100,41 @@ public:
 		PhysicsServer3D::set_singleton_for_tests(saved);
 	}
 
+	// Call only after all ServerScope instances and their spaces/bodies are gone.
+	static void clear_cache() {
+		HashMap<String, CachedServer> &servers = _servers();
+		for (const KeyValue<String, CachedServer> &entry : servers) {
+			Probe::destroy_test_server(entry.value.server, entry.value.jolt_backend);
+		}
+		servers.clear();
+	}
+
 	bool is_valid() const { return server != nullptr; }
 	PhysicsServer3D *ptr() const { return server; }
 	PhysicsServer3D *operator->() const { return server; }
 };
+
+struct ServerCacheCleanupListener : public doctest::IReporter {
+	explicit ServerCacheCleanupListener(const doctest::ContextOptions &) {}
+
+	void test_run_end(const doctest::TestRunStats &) override {
+		ServerScope::clear_cache();
+	}
+
+	void report_query(const doctest::QueryData &) override {}
+	void test_run_start() override {}
+	void test_case_start(const doctest::TestCaseData &) override {}
+	void test_case_reenter(const doctest::TestCaseData &) override {}
+	void test_case_end(const doctest::CurrentTestCaseStats &) override {}
+	void test_case_exception(const doctest::TestCaseException &) override {}
+	void subcase_start(const doctest::SubcaseSignature &) override {}
+	void subcase_end() override {}
+	void log_assert(const doctest::AssertData &) override {}
+	void log_message(const doctest::MessageData &) override {}
+	void test_case_skipped(const doctest::TestCaseData &) override {}
+};
+
+REGISTER_LISTENER("JoltSoftBodyServerCacheCleanup", 2, ServerCacheCleanupListener);
 
 // Capture offending values in diagnostics while suppressing expected error output.
 // Error handlers still run with printing disabled.
