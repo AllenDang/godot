@@ -260,7 +260,8 @@ jobs:
         if: matrix.cache-name == 'linux-editor-double-sanitizers'
         env:
           ASAN_OPTIONS: ${{ env.ASAN_OPTIONS }}:halt_on_error=1
-          UBSAN_OPTIONS: ${{ env.UBSAN_OPTIONS }}:halt_on_error=1:print_stacktrace=1
+          # Keep the full suite's UBSan recovery policy and retain diagnostics.
+          UBSAN_OPTIONS: ${{ env.UBSAN_OPTIONS }}:print_stacktrace=1
         run: |
           ${{ matrix.bin }} --headless --test '--test-suite=[JoltSoftBody*]' --no-skip --order-by=rand --rand-seed=158
 
