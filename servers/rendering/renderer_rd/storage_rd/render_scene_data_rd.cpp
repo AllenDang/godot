@@ -74,8 +74,7 @@ RID RenderSceneDataRD::create_uniform_buffer() {
 void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier) {
 	RendererSceneRenderRD *render_scene_render = RendererSceneRenderRD::get_singleton();
 
-	UBODATA ubo_data;
-	memset(&ubo_data, 0, sizeof(UBODATA));
+	UBODATA ubo_data{};
 
 	// just for easy access..
 	UBO &ubo = ubo_data.ubo;
@@ -201,13 +200,20 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 			ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
 		}
 
-		if ((ubo.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP) || (ubo.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP)) {
+		if ((ubo.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP) || (ubo.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP) || RendererEnvironmentStorage::get_singleton()->environment_get_height_fog_data(p_env).source[3] > 0.0f) {
 			Basis sky_transform = render_scene_render->environment_get_sky_orientation(p_env);
 			sky_transform = sky_transform.inverse() * cam_transform.basis;
 			RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
 		}
 
 		ubo.flags |= render_scene_render->environment_get_fog_enabled(p_env) ? SCENE_DATA_FLAGS_USE_FOG : 0;
+		ubo.height_fog = RendererEnvironmentStorage::get_singleton()->environment_get_height_fog_data(p_env);
+		ubo.height_fog_view[0] = cam_orthogonal ? 1.0f : 0.0f;
+		for (int i = 0; i < 4; i++) {
+			ubo.aerial_perspective[i] = aerial_perspective_parameters[i];
+		}
+		ubo.height_fog_view[1] = p_reflection_probe_instance.is_valid() ? 1.0f : 0.0f;
+
 		ubo.fog_density = render_scene_render->environment_get_fog_density(p_env);
 		ubo.fog_height = render_scene_render->environment_get_fog_height(p_env);
 		ubo.fog_height_density = render_scene_render->environment_get_fog_height_density(p_env);
@@ -237,6 +243,16 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		}
 	}
 
+	for (int i = 0; i < 4; i++) {
+		ubo.sky_capture_data[i] = 0.0f;
+		ubo.sky_capture_fallback[i] = 0.0f;
+	}
+	Basis old_capture_correction, next_capture_correction;
+	if (p_env.is_valid()) {
+		render_scene_render->get_sky()->sky_get_capture_orientation_corrections(render_scene_render->environment_get_sky(p_env), render_scene_render->environment_get_sky_orientation(p_env), old_capture_correction, next_capture_correction);
+	}
+	RendererRD::MaterialStorage::store_transform_3x3(old_capture_correction, ubo.sky_capture_old_xform);
+	RendererRD::MaterialStorage::store_transform_3x3(next_capture_correction, ubo.sky_capture_next_xform);
 	if (p_camera_attributes.is_valid()) {
 		ubo.emissive_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
 		ubo.IBL_exposure_normalization = 1.0;
@@ -255,6 +271,18 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 	} else {
 		ubo.emissive_exposure_normalization = 1.0;
 		ubo.IBL_exposure_normalization = 1.0;
+	}
+
+	if (p_env.is_valid()) {
+		RID capture_sky = render_scene_render->environment_get_sky(p_env);
+		if (render_scene_render->get_sky()->sky_get_capture_sampling(capture_sky, p_reflection_probe_instance.is_valid(), ubo.sky_capture_data, ubo.sky_capture_fallback)) {
+			ubo.height_fog_view[2] = ubo.sky_capture_data[2];
+			// Managed maps store canonical FP16 radiance including sky artistry.
+			// The material shader applies its output storage conversion after lighting.
+			// Only camera exposure belongs here, or Mobile would divide radiance twice.
+			ubo.IBL_exposure_normalization = p_camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) : 1.0f;
+			ubo.ambient_light_color_energy[3] = 1.0f;
+		}
 	}
 
 	bool roughness_limiter_enabled = p_opaque_render_buffers && render_scene_render->screen_space_roughness_limiter_is_active();

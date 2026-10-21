@@ -1,3 +1,5 @@
+#include "environment/height_fog_inc.glsl"
+
 // Scene data stores all our 3D rendering globals for a frame such as our matrices
 // where this information is independent of the different RD implementations.
 // This enables us to use this UBO in our main scene render shaders but also in
@@ -81,4 +83,11 @@ struct SceneData {
 	float IBL_exposure_normalization;
 	uint camera_visible_layers;
 	float pass_alpha_multiplier;
+	vec4 sky_capture_data;
+	vec4 sky_capture_fallback;
+	mat3 sky_capture_old_xform;
+	mat3 sky_capture_next_xform;
+	HeightFogData height_fog;
+	vec4 height_fog_view;
+	vec4 aerial_perspective;
 };

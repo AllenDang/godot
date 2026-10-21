@@ -844,6 +844,7 @@ void main() {
 /* Include our forward mobile UBOs definitions etc. */
 #include "scene_forward_mobile_inc.glsl"
 
+
 /* Varyings */
 
 // All interpolators are intentionally kept at full precision as storageInputOutput16 is not
@@ -1022,6 +1023,9 @@ layout(location = 1) out vec4 specular_buffer; //specular and SSS (subsurface sc
 #else
 
 layout(location = 0) out vec4 frag_color;
+#ifdef DEFER_OPAQUE_FOG
+layout(location = 1) out float fog_eligibility;
+#endif
 #endif // MODE_MULTIPLE_RENDER_TARGETS
 
 #endif // RENDER DEPTH
@@ -1045,6 +1049,9 @@ layout(location = 0) out vec4 frag_color;
 	Only supporting normal fog here.
 */
 
+
+#include "../environment/mobile_fog_transport_inc.glsl"
+
 hvec4 fog_process(vec3 vertex) {
 	vec3 fog_color = scene_data_block.data.fog_light_color;
 
@@ -1057,14 +1064,12 @@ hvec4 fog_process(vec3 vertex) {
 		float roughness_lod, blend;
 		blend = modf(mip_level * MAX_ROUGHNESS_LOD, roughness_lod);
 		float cube_lod = vec3_to_oct_lod(dFdx(cube_view), dFdy(cube_view), scene_data_block.data.radiance_pixel_size);
-		vec2 cube_uv = vec3_to_oct_with_border(cube_view, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-		vec3 sky_sample_a = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(cube_uv, roughness_lod), cube_lod).rgb;
-		vec3 sky_sample_b = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(cube_uv, roughness_lod + 1), cube_lod).rgb;
+		vec3 sky_sample_a = sample_sky_radiance(cube_view, roughness_lod, cube_lod).rgb;
+		vec3 sky_sample_b = sample_sky_radiance(cube_view, roughness_lod + 1, cube_lod).rgb;
 		sky_fog_color = mix(sky_sample_a, sky_sample_b, blend);
 #else
 		float roughness_lod = mip_level * MAX_ROUGHNESS_LOD;
-		vec2 cube_uv = vec3_to_oct_with_border(cube_view, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-		sky_fog_color = textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), cube_uv, roughness_lod).rgb;
+		sky_fog_color = sample_sky_radiance(cube_view, 0.0, roughness_lod).rgb;
 #endif //USE_RADIANCE_OCTMAP_ARRAY
 		fog_color = mix(fog_color, sky_fog_color, scene_data_block.data.fog_aerial_perspective);
 	}
@@ -1295,6 +1300,10 @@ void main() {
 	half premul_alpha = half(premul_alpha_highp);
 #endif
 	hvec4 fog = hvec4(fog_highp);
+#ifndef MODE_RENDER_DEPTH
+	vec4 native_height_fog = vec4(0.0, 0.0, 0.0, 1.0);
+	bool use_native_height_fog = false;
+#endif
 #ifdef CUSTOM_RADIANCE_USED
 	hvec4 custom_radiance = hvec4(custom_radiance_highp);
 #endif
@@ -1453,19 +1462,43 @@ void main() {
 #endif // MODE_RENDER_MATERIAL
 #endif
 
+// These materials do not have a matching screen-depth reconstruction, or own
+// their transport explicitly. Preserve their material fog and mark them out
+// of the native deferred-fog composite.
+#if defined(DEFER_OPAQUE_FOG) && !defined(FOG_DISABLED) && !defined(CUSTOM_FOG_USED) && !defined(DEPTH_USED) && !defined(DEPTH_DRAW_NEVER_USED) && !defined(DEPTH_TEST_DISABLED_USED) && !defined(OVERRIDE_POSITION)
+#define DEFER_NATIVE_FOG
+#endif
+
 	/////////////////////// FOG //////////////////////
 #ifndef MODE_RENDER_DEPTH
 
 #ifndef FOG_DISABLED
+#ifndef DEFER_NATIVE_FOG
 #ifndef CUSTOM_FOG_USED
 	// Draw "fixed" fog before volumetric fog to ensure volumetric fog can appear in front of the sky.
 
-	if (!sc_disable_fog() && bool(scene_data.flags & SCENE_DATA_FLAGS_USE_FOG)) {
+	if (scene_data.height_fog.options.z > 0.0) {
+		use_native_height_fog = true;
+		native_height_fog = native_height_fog_process(vertex);
+	} else if (!sc_disable_fog() && bool(scene_data.flags & SCENE_DATA_FLAGS_USE_FOG)) {
 		fog = fog_process(vertex);
 	}
 
 #endif //!CUSTOM_FOG_USED
 
+ if(native_ap_enabled()) {
+  vec4 ap=native_ap_process(vertex);
+  if(!use_native_height_fog) {
+   // Preserve the native depth/custom fog layer, when present. Its source
+   // is already exposed; the shared tail expects canonical scene radiance.
+   native_height_fog=vec4(vec3(fog.rgb)*float(fog.a)/max(scene_data.emissive_exposure_normalization,1e-8),1.0-float(fog.a));
+  }
+  native_height_fog=vec4(native_height_fog.rgb+native_height_fog.a*ap.rgb,native_height_fog.a*clamp(ap.a,0.0,1.0));
+  if(scene_data.aerial_perspective.z>0.0) native_height_fog=ap;
+  use_native_height_fog=true;
+ }
+
+#endif // deferred native fog
 #endif //!FOG_DISABLED
 #endif //!MODE_RENDER_DEPTH
 
@@ -1606,16 +1639,14 @@ void main() {
 		half blend = half(modf(float(sqrt(roughness) * MAX_ROUGHNESS_LOD), lod));
 
 		float ref_lod = vec3_to_oct_lod(dFdx(vec3(ref_vec)), dFdy(vec3(ref_vec)), scene_data_block.data.radiance_pixel_size);
-		vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-		hvec3 indirect_sample_a = hvec3(textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, float(lod)), ref_lod).rgb);
-		hvec3 indirect_sample_b = hvec3(textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, float(lod) + 1.0), ref_lod).rgb);
+		hvec3 indirect_sample_a = hvec3(sample_sky_radiance(vec3(ref_vec), float(lod), ref_lod).rgb);
+		hvec3 indirect_sample_b = hvec3(sample_sky_radiance(vec3(ref_vec), float(lod) + 1.0, ref_lod).rgb);
 		indirect_specular_light = mix(indirect_sample_a, indirect_sample_b, blend);
 #else // USE_RADIANCE_OCTMAP_ARRAY
 		float lod = sqrt(roughness) * MAX_ROUGHNESS_LOD;
-		vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-		indirect_specular_light = hvec3(textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ref_uv, lod).rgb);
+		indirect_specular_light = hvec3(sample_sky_radiance(vec3(ref_vec), 0.0, lod).rgb);
 #endif //USE_RADIANCE_OCTMAP_ARRAY
-		indirect_specular_light *= REFLECTION_MULTIPLIER;
+		if (scene_data.sky_capture_data.x == 0.0) { indirect_specular_light *= REFLECTION_MULTIPLIER; }
 		indirect_specular_light *= half(scene_data.IBL_exposure_normalization);
 		indirect_specular_light *= horizon * horizon;
 		indirect_specular_light *= half(scene_data.ambient_light_color_energy.a);
@@ -1634,14 +1665,12 @@ void main() {
 			vec3 ambient_dir = scene_data.radiance_inverse_xform * indirect_normal;
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
 			float ambient_lod = vec3_to_oct_lod(dFdx(ambient_dir), dFdy(ambient_dir), scene_data_block.data.radiance_pixel_size);
-			vec2 ambient_uv = vec3_to_oct_with_border(ambient_dir, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-			hvec3 octmap_ambient = hvec3(textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ambient_uv, MAX_ROUGHNESS_LOD), ambient_lod).rgb);
+			hvec3 octmap_ambient = hvec3(sample_sky_radiance(ambient_dir, MAX_ROUGHNESS_LOD, ambient_lod).rgb);
 #else
 			float roughness_lod = MAX_ROUGHNESS_LOD;
-			vec2 ambient_uv = vec3_to_oct_with_border(ambient_dir, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-			hvec3 octmap_ambient = hvec3(textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ambient_uv, roughness_lod).rgb);
+			hvec3 octmap_ambient = hvec3(sample_sky_radiance(ambient_dir, 0.0, roughness_lod).rgb);
 #endif //USE_RADIANCE_OCTMAP_ARRAY
-			octmap_ambient *= REFLECTION_MULTIPLIER;
+			if (scene_data.sky_capture_data.x == 0.0) { octmap_ambient *= REFLECTION_MULTIPLIER; }
 			octmap_ambient *= half(scene_data.IBL_exposure_normalization);
 			ambient_light = mix(ambient_light, octmap_ambient * half(scene_data.ambient_light_color_energy.a), half(scene_data.ambient_color_sky_mix));
 		}
@@ -1667,13 +1696,11 @@ void main() {
 		half blend = half(modf(roughness_lod, lod));
 
 		float ref_lod = vec3_to_oct_lod(dFdx(vec3(cc_radiance_ref_vec)), dFdy(vec3(cc_radiance_ref_vec)), scene_data_block.data.radiance_pixel_size);
-		vec2 ref_uv = vec3_to_oct_with_border(cc_radiance_ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-		hvec3 clearcoat_sample_a = hvec3(textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, lod), ref_lod).rgb);
-		hvec3 clearcoat_sample_b = hvec3(textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, lod + 1), ref_lod).rgb);
+		hvec3 clearcoat_sample_a = hvec3(sample_sky_radiance(vec3(cc_radiance_ref_vec), lod, ref_lod).rgb);
+		hvec3 clearcoat_sample_b = hvec3(sample_sky_radiance(vec3(cc_radiance_ref_vec), lod + 1, ref_lod).rgb);
 		hvec3 clearcoat_light = mix(clearcoat_sample_a, clearcoat_sample_b, blend);
 #else
-		vec2 ref_uv = vec3_to_oct_with_border(cc_radiance_ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
-		hvec3 clearcoat_light = hvec3(textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ref_uv, roughness_lod).rgb);
+		hvec3 clearcoat_light = hvec3(sample_sky_radiance(vec3(cc_radiance_ref_vec), 0.0, roughness_lod).rgb);
 
 #endif //USE_RADIANCE_OCTMAP_ARRAY
 		cc_specular_light += clearcoat_light * half(scene_data.IBL_exposure_normalization) * half(scene_data.ambient_light_color_energy.a);
@@ -1742,7 +1769,7 @@ void main() {
 				lm_light_l1p1 = hvec3((textureLod(sampler2DArray(lightmap_textures[ofs], SAMPLER_LINEAR_CLAMP), uvw + vec3(0.0, 0.0, 3.0), 0.0).rgb - vec3(0.5)) * 2.0);
 			}
 
-			hvec3 n = hvec3(normalize(lightmaps.data[ofs].normal_xform * indirect_normal));
+			hvec3 n = hvec3(normalize(mat3(lightmaps.data[ofs].normal_xform_and_specular_intensity) * indirect_normal));
 			half exposure_normalization = half(lightmaps.data[ofs].exposure_normalization);
 
 			ambient_light += lm_light_l0 * exposure_normalization;
@@ -2334,8 +2361,13 @@ void main() {
 #endif // MODE_UNSHADED
 
 #ifndef FOG_DISABLED
-	diffuse_buffer.rgb = mix(diffuse_buffer.rgb, fog.rgb, fog.a);
-	specular_buffer.rgb = mix(specular_buffer.rgb, vec3(0.0), fog.a);
+	if (use_native_height_fog) {
+		diffuse_buffer.rgb = diffuse_buffer.rgb * native_height_fog.a + native_height_fog.rgb * scene_data.emissive_exposure_normalization;
+		specular_buffer.rgb *= native_height_fog.a;
+	} else {
+		diffuse_buffer.rgb = mix(diffuse_buffer.rgb, fog.rgb, fog.a);
+		specular_buffer.rgb = mix(specular_buffer.rgb, vec3(0.0), fog.a);
+	}
 #endif // !FOG_DISABLED
 
 #else //MODE_MULTIPLE_RENDER_TARGETS
@@ -2348,7 +2380,9 @@ void main() {
 
 #ifndef FOG_DISABLED
 	// Draw "fixed" fog before volumetric fog to ensure volumetric fog can appear in front of the sky.
-	out_color.rgb = mix(out_color.rgb, fog.rgb, fog.a);
+	if (!use_native_height_fog) {
+		out_color.rgb = mix(out_color.rgb, fog.rgb, fog.a);
+	}
 #endif // !FOG_DISABLED
 
 	// On mobile we use a UNORM buffer with 10bpp which results in a range from 0.0 - 1.0 resulting in HDR breaking
@@ -2358,7 +2392,37 @@ void main() {
 	out_color.rgb *= premul_alpha;
 #endif
 
-	frag_color = out_color;
+#ifndef FOG_DISABLED
+ if (use_native_height_fog) {
+  vec3 fog_L = native_height_fog.rgb * scene_data.emissive_exposure_normalization / sc_luminance_multiplier();
+#ifdef HEIGHT_FOG_BLEND_MUL
+  out_color.rgb = hvec3(mix(vec3(1.0), vec3(out_color.rgb), native_height_fog.a));
+#else
+  out_color.rgb *= half(native_height_fog.a);
+#if !defined(HEIGHT_FOG_BLEND_ADD_SUB)
+#ifdef HEIGHT_FOG_BLEND_PREMULTIPLIED
+  out_color.rgb += hvec3(fog_L * float(alpha));
+#else
+  out_color.rgb += hvec3(fog_L);
+#endif
+#endif
+#endif
+  float air_debug=scene_data.aerial_perspective.z>0.0?scene_data.aerial_perspective.z:scene_data.height_fog.options.y;
+  if (air_debug == 1.0) {
+   out_color.rgb = hvec3(vec3(native_height_fog.a) / sc_luminance_multiplier());
+  } else if (air_debug == 2.0) {
+   out_color.rgb = hvec3(native_height_fog.rgb / sc_luminance_multiplier());
+  }
+ }
+#endif
+
+#ifdef DEFER_OPAQUE_FOG
+ fog_eligibility = 0.0;
+#ifdef DEFER_NATIVE_FOG
+ fog_eligibility = 1.0;
+#endif
+#endif
+ frag_color = out_color;
 
 	if (sc_use_material_debanding()) {
 		// From https://alex.vlachos.com/graphics/Alex_Vlachos_Advanced_VR_Rendering_GDC2015.pdf

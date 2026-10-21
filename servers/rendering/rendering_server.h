@@ -625,6 +625,15 @@ public:
 	virtual void sky_set_radiance_size(RID p_sky, int p_radiance_size) = 0;
 	virtual void sky_set_mode(RID p_sky, RSE::SkyMode p_mode) = 0;
 	virtual void sky_set_material(RID p_sky, RID p_material) = 0;
+	virtual void sky_request_capture(RID p_sky, RID p_material, int64_t p_generation, const Vector3 &p_origin, double p_capture_time, const Color &p_fallback, RID p_environment) = 0;
+	virtual Dictionary sky_get_capture_status(RID p_sky) const = 0;
+	virtual void sky_cancel_capture(RID p_sky) = 0;
+	virtual void sky_set_physical_source(RID p_sky, const Dictionary &p_source) = 0;
+	virtual Dictionary sky_get_physical_source_status(RID p_sky) const = 0;
+	virtual Dictionary get_physical_sky_capabilities() const = 0;
+	virtual String get_sky_view_shader_source() const = 0;
+
+
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) = 0;
 
 	/* COMPOSITOR EFFECTS API */
@@ -683,6 +692,16 @@ public:
 	virtual void environment_set_sdfgi_frames_to_converge(RSE::EnvironmentSDFGIFramesToConverge p_frames) = 0;
 
 	virtual void environment_set_sdfgi_frames_to_update_light(RSE::EnvironmentSDFGIFramesToUpdateLight p_update) = 0;
+
+	virtual void environment_set_height_fog_state(RID p_env, const Dictionary &p_state) = 0;
+	virtual Dictionary environment_get_height_fog_state(RID p_env) const = 0;
+	virtual Dictionary environment_get_height_fog_status(RID p_env) const = 0;
+	virtual Dictionary get_height_fog_capabilities() const = 0;
+	virtual void environment_set_aerial_perspective_state(RID p_env, const Dictionary &p_state) = 0;
+	virtual Dictionary environment_get_aerial_perspective_state(RID p_env) const = 0;
+	virtual Dictionary environment_get_aerial_perspective_status(RID p_env) const = 0;
+	virtual Dictionary get_aerial_perspective_capabilities() const = 0;
+	virtual String get_atmosphere_shader_library() const = 0;
 
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL) = 0;
 	virtual void environment_set_fog_depth(RID p_env, float p_curve, float p_begin, float p_end) = 0;

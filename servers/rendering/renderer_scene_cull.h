@@ -1189,6 +1189,13 @@ public:
 	PASS2(sky_set_radiance_size, RID, int)
 	PASS2(sky_set_mode, RID, RSE::SkyMode)
 	PASS2(sky_set_material, RID, RID)
+	PASS7(sky_request_capture, RID, RID, int64_t, const Vector3 &, double, const Color &, RID)
+	PASS1RC(Dictionary, sky_get_capture_status, RID)
+	PASS2(sky_set_physical_source, RID, const Dictionary &)
+	PASS1RC(Dictionary, sky_get_physical_source_status, RID)
+	PASS0RC(Dictionary, get_physical_sky_capabilities)
+	PASS0RC(String, get_sky_view_shader_source)
+	PASS1(sky_cancel_capture, RID)
 	PASS4R(Ref<Image>, sky_bake_panorama, RID, float, bool, const Size2i &)
 
 	// Compositor effect
@@ -1251,6 +1258,16 @@ public:
 	PASS3RC(float, environment_get_white, RID, bool, float)
 
 	// Fog
+	PASS2(environment_set_height_fog_state, RID, const Dictionary &)
+	PASS1RC(Dictionary, environment_get_height_fog_state, RID)
+	PASS1RC(Dictionary, environment_get_height_fog_status, RID)
+	PASS0RC(Dictionary, get_height_fog_capabilities)
+	PASS2(environment_set_aerial_perspective_state, RID, const Dictionary &)
+	PASS1RC(Dictionary, environment_get_aerial_perspective_state, RID)
+	PASS1RC(Dictionary, environment_get_aerial_perspective_status, RID)
+	PASS0RC(Dictionary, get_aerial_perspective_capabilities)
+	PASS0RC(String, get_atmosphere_shader_library)
+
 	PASS11(environment_set_fog, RID, bool, const Color &, float, float, float, float, float, float, float, RSE::EnvironmentFogMode)
 
 	PASS1RC(bool, environment_get_fog_enabled, RID)
