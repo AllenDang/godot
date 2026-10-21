@@ -1520,7 +1520,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			} else {
 				PackedInt32Array fixed;
 				fixed.push_back(kind == 4 ? -1 : 0);
-				fixed.push_back(kind == 4 ? 0 : 0);
+				fixed.push_back(0);
 				bad["fixed"] = fixed;
 			}
 			const auto id = Probe::body_identity(body.rid());
@@ -2490,10 +2490,10 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			CHECK(errors.has("write"));
 			CHECK(errors.has("["));
 			before.unchanged();
-			Array near;
-			near.push_back(Transform3D(Basis(), Vector3(1.0e38f, 0, 0)));
+			Array near_pose;
+			near_pose.push_back(Transform3D(Basis(), Vector3(1.0e38f, 0, 0)));
 			errors.clear();
-			REQUIRE(server->soft_body_set_extra_property(write_body.rid(), "skin/pose", near));
+			REQUIRE(server->soft_body_set_extra_property(write_body.rid(), "skin/pose", near_pose));
 			CHECK(errors.count() == 0);
 			REQUIRE(Probe::invoke_pre_step(write_body.rid()));
 			CHECK(Probe::world_position(write_body.rid(), 0).x == doctest::Approx(double(2.0e38f) + double(1.0e38f)).epsilon(1e-5));
@@ -2502,21 +2502,21 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		// matrix. Only source vertex 0 is skinned, so world targets remain bounded
 		// while the scratch matrix conversion straddles the overflow boundary.
 		{
-			MeshBodyScope near(server.ptr(), space.rid());
+			MeshBodyScope near_body(server.ptr(), space.rid());
 			Dictionary near_skin = fixture_skin(1, 1);
 			near_skin["max_distance"] = 0.0;
-			REQUIRE(server->soft_body_set_extra_property(near.rid(), "skin/config", near_skin));
+			REQUIRE(server->soft_body_set_extra_property(near_body.rid(), "skin/config", near_skin));
 			Array pose;
 			pose.push_back(Transform3D(Basis(Vector3(2e38f, 2e38f, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)), Vector3()));
-			REQUIRE(server->soft_body_set_extra_property(near.rid(), "skin/pose", pose));
-			REQUIRE(Probe::set_body_frame(near.rid(), Transform3D(Basis(Vector3(0, 0, 1), Math::PI / 4), Vector3(3, 4, 5))));
+			REQUIRE(server->soft_body_set_extra_property(near_body.rid(), "skin/pose", pose));
+			REQUIRE(Probe::set_body_frame(near_body.rid(), Transform3D(Basis(Vector3(0, 0, 1), Math::PI / 4), Vector3(3, 4, 5))));
 			ErrorCapture errors;
 			space.step();
 			CHECK(errors.count() == 0);
-			CHECK(Probe::in_space(near.rid()));
-			CHECK(Probe::all_finite(near.rid()));
-			CHECK(Probe::build_counts(near.rid()).skin_init == 1);
-			CHECK(Probe::build_counts(near.rid()).solver_steps == 1);
+			CHECK(Probe::in_space(near_body.rid()));
+			CHECK(Probe::all_finite(near_body.rid()));
+			CHECK(Probe::build_counts(near_body.rid()).skin_init == 1);
+			CHECK(Probe::build_counts(near_body.rid()).solver_steps == 1);
 		}
 	}
 
@@ -3204,7 +3204,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 					before.unchanged();
 				}
 			}
-			for (int64_t fixed : { INT64_MIN, int64_t(-1), int64_t(5), int64_t(1) << 32, INT64_MAX }) {
+			for (int64_t fixed : { int64_t(INT64_MIN), int64_t(-1), int64_t(5), int64_t(1) << 32, int64_t(INT64_MAX) }) {
 				Dictionary config = rod_config(4);
 				config["fixed"] = fixed;
 				RemainingSnapshot before(server.ptr(), body);
@@ -4349,9 +4349,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				arrays[RSE::ARRAY_VERTEX] = altered;
 				RenderingServer::get_singleton()->mesh_clear(fault.mesh_rid());
 				RenderingServer::get_singleton()->mesh_add_surface_from_arrays(fault.mesh_rid(), RSE::PRIMITIVE_TRIANGLES, arrays);
-				Array far;
-				far.push_back(Transform3D(Basis(Vector3(2.5e38f, 2.5e38f, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)), Vector3()));
-				REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/pose", far));
+				Array far_pose;
+				far_pose.push_back(Transform3D(Basis(Vector3(2.5e38f, 2.5e38f, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)), Vector3()));
+				REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/pose", far_pose));
 				REQUIRE(Probe::set_body_frame(fault.rid(), Transform3D(Basis(Vector3(0, 0, 1), Math::PI / 4), Vector3(3, 4, 5))));
 				const auto before = Probe::build_counts(fault.rid()), healthy = Probe::build_counts(left.rid());
 				ErrorCapture errors;
@@ -4375,7 +4375,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 				bad.push_back(true);
 				CHECK_FALSE(server->soft_body_set_extra_property(fault.rid(), "skin/pose", bad));
 				CHECK(errors.has("SBREM-TYPE"));
-				CHECK(Array(server->soft_body_get_extra_property(fault.rid(), "skin/pose")) == far);
+				CHECK(Array(server->soft_body_get_extra_property(fault.rid(), "skin/pose")) == far_pose);
 				Array latest;
 				latest.push_back(Transform3D(Basis(), Vector3(0, 3, 0)));
 				REQUIRE(server->soft_body_set_extra_property(fault.rid(), "skin/pose", latest));
@@ -4444,9 +4444,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 			if (initialized) {
 				space.step();
 			}
-			Array far;
-			far.push_back(Transform3D(Basis(Vector3(2.5e38f, 2.5e38f, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)), Vector3()));
-			REQUIRE(server->soft_body_set_extra_property(fault, "skin/pose", far));
+			Array far_pose;
+			far_pose.push_back(Transform3D(Basis(Vector3(2.5e38f, 2.5e38f, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)), Vector3()));
+			REQUIRE(server->soft_body_set_extra_property(fault, "skin/pose", far_pose));
 			REQUIRE(Probe::set_body_frame(fault, Transform3D(Basis(Vector3(0, 0, 1), Math::PI / 4), Vector3(3, 4, 5))));
 			ErrorCapture errors;
 			space.step();
@@ -4560,7 +4560,7 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 
 	TEST_CASE("remaining R11 bounded allocation") {
 		String error;
-		for (uint64_t count : { uint64_t(65536), uint64_t(65537), UINT64_MAX }) {
+		for (uint64_t count : { uint64_t(65536), uint64_t(65537), uint64_t(UINT64_MAX) }) {
 			CAPTURE(count);
 			CHECK(SoftBodyCapValidation::resource_size(count, 1, 65536, 4, &error, "skin/config.vertices") == (count == 65536));
 			if (count != 65536) {
