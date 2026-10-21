@@ -1,9 +1,40 @@
+/**************************************************************************/
+/*  shadow_instance_tree.cpp                                              */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
 #include "shadow_instance_tree.h"
 
 #include "core/io/json.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "core/os/thread.h"
+
 #include <cmath> // hierarchical LOD hook
 
 // BEGIN hierarchical LOD environment
@@ -44,8 +75,7 @@ bool trace_enabled() {
 	return enabled;
 }
 uint32_t minimum_instances() {
-	static const uint32_t count = trace_enabled() && OS::get_singleton()->has_environment("ANGE_SHADOW_TREE_MIN_INSTANCES") ?
-			MAX(1, OS::get_singleton()->get_environment("ANGE_SHADOW_TREE_MIN_INSTANCES").to_int()) : 1024;
+	static const uint32_t count = trace_enabled() && OS::get_singleton()->has_environment("ANGE_SHADOW_TREE_MIN_INSTANCES") ? MAX(1, OS::get_singleton()->get_environment("ANGE_SHADOW_TREE_MIN_INSTANCES").to_int()) : 1024;
 	return count;
 }
 void trace_event(const char *p_event, const void *p_tree, uint64_t p_revision, uint64_t p_job_revision, uint32_t p_count, uint64_t p_usec = 0, bool p_worker = false, uint64_t p_owner_usec = 0) {
@@ -126,7 +156,9 @@ struct ShadowInstanceTree::BuildJob {
 void ShadowInstanceTree::rebuild() {
 	// Only the frame preparation call may publish a density selection. Ordinary
 	// shadow/LOD queries later in the frame observe that same published snapshot.
-	if (density != 1 && !density_preparing) { return; }
+	if (density != 1 && !density_preparing) {
+		return;
+	}
 	if (async_job) {
 		valid = false;
 		if (!async_job->complete()) {
@@ -262,23 +294,37 @@ bool ShadowInstanceTree::update_in_place(uint32_t p_index, const Transform3D &p_
 	revision++;
 	transforms.write[p_index] = p_transform;
 	boxes.write[p_index] = box;
-	if (lod_enabled()) { lod_scales.write[p_index] = lod_basis_scale(p_transform.basis); } // hierarchical LOD hook
+	if (lod_enabled()) {
+		lod_scales.write[p_index] = lod_basis_scale(p_transform.basis);
+	} // hierarchical LOD hook
 	const Node node = nodes[leaf];
 	AABB leaf_bounds = boxes[order[node.from]];
-	float min_scale = 0, max_scale = 0; if (lod_enabled()) { min_scale = max_scale = lod_scales[order[node.from]]; } // hierarchical LOD hook
+	float min_scale = 0, max_scale = 0;
+	if (lod_enabled()) {
+		min_scale = max_scale = lod_scales[order[node.from]];
+	} // hierarchical LOD hook
 	for (uint32_t slot = node.from + 1; slot < node.from + node.count; slot++) {
 		leaf_bounds.merge_with(boxes[order[slot]]);
-		if (lod_enabled()) { min_scale = MIN(min_scale, lod_scales[order[slot]]); max_scale = MAX(max_scale, lod_scales[order[slot]]); } // hierarchical LOD hook
+		if (lod_enabled()) {
+			min_scale = MIN(min_scale, lod_scales[order[slot]]);
+			max_scale = MAX(max_scale, lod_scales[order[slot]]);
+		} // hierarchical LOD hook
 	}
 	nodes.write[leaf].bounds = leaf_bounds;
-	if (lod_enabled()) { nodes.write[leaf].min_lod_scale = min_scale; nodes.write[leaf].max_lod_scale = max_scale; } // hierarchical LOD hook
+	if (lod_enabled()) {
+		nodes.write[leaf].min_lod_scale = min_scale;
+		nodes.write[leaf].max_lod_scale = max_scale;
+	} // hierarchical LOD hook
 	const bool mutant = trace_enabled() && OS::get_singleton()->get_environment("ANGE_SHADOW_TREE_PARENT_MUTANT") == "1";
 	if (!mutant) {
 		for (int parent = update_parents[leaf]; parent >= 0; parent = update_parents[parent]) {
 			const Node ancestor = nodes[parent];
 			const AABB combined = nodes[ancestor.left].bounds.merge(nodes[ancestor.right].bounds);
 			nodes.write[parent].bounds = combined;
-			if (lod_enabled()) { nodes.write[parent].min_lod_scale = MIN(nodes[ancestor.left].min_lod_scale, nodes[ancestor.right].min_lod_scale); nodes.write[parent].max_lod_scale = MAX(nodes[ancestor.left].max_lod_scale, nodes[ancestor.right].max_lod_scale); } // hierarchical LOD hook
+			if (lod_enabled()) {
+				nodes.write[parent].min_lod_scale = MIN(nodes[ancestor.left].min_lod_scale, nodes[ancestor.right].min_lod_scale);
+				nodes.write[parent].max_lod_scale = MAX(nodes[ancestor.left].max_lod_scale, nodes[ancestor.right].max_lod_scale);
+			} // hierarchical LOD hook
 		}
 	}
 	conservative_aggregate = nodes[0].bounds;

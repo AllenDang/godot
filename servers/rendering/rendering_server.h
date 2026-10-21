@@ -637,7 +637,6 @@ public:
 	virtual Dictionary get_physical_sky_capabilities() const = 0;
 	virtual String get_sky_view_shader_source() const = 0;
 
-
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) = 0;
 
 	/* COMPOSITOR EFFECTS API */

@@ -1,8 +1,38 @@
+/**************************************************************************/
+/*  shadow_instance_culling.cpp                                           */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
 #include "shadow_instance_culling.h"
 
-#include "core/os/os.h"
 #include "core/io/json.h"
 #include "core/object/callable_mp.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
 using namespace RendererRD;
@@ -18,52 +48,66 @@ static bool shadow_cull_trace_held() {
 // measured here. Diagnostic clock calls themselves add overhead.
 namespace {
 struct ShadowCullCpuProfile {
- uint64_t frame = UINT64_MAX;
- uint64_t usec[7] = {};
- uint32_t calls[7] = {};
- bool enabled = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_CPU_PHASES") == "1";
- void begin_frame() {
-  uint64_t next = RD::get_singleton()->get_frames_drawn();
-  if (next == frame) { return; }
-  if (frame != UINT64_MAX) {
-   Dictionary report;
-   report["frame"] = int64_t(frame);
-   static const char *names[] = { "merge_tree", "query", "control_upload", "gather_record", "bindings_push", "compute_record", "draw_result" };
-   for (int i = 0; i < 7; i++) {
-    report[String(names[i]) + "_us"] = int64_t(usec[i]);
-    report[String(names[i]) + "_calls"] = int64_t(calls[i]);
-   }
-   print_line("SHADOW_CULL_CPU_PHASES " + JSON::stringify(report));
-  }
-  frame = next;
-  for (int i = 0; i < 7; i++) { usec[i] = 0; calls[i] = 0; }
- }
+	uint64_t frame = UINT64_MAX;
+	uint64_t usec[7] = {};
+	uint32_t calls[7] = {};
+	bool enabled = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_CPU_PHASES") == "1";
+	void begin_frame() {
+		uint64_t next = RD::get_singleton()->get_frames_drawn();
+		if (next == frame) {
+			return;
+		}
+		if (frame != UINT64_MAX) {
+			Dictionary report;
+			report["frame"] = int64_t(frame);
+			static const char *names[] = { "merge_tree", "query", "control_upload", "gather_record", "bindings_push", "compute_record", "draw_result" };
+			for (int i = 0; i < 7; i++) {
+				report[String(names[i]) + "_us"] = int64_t(usec[i]);
+				report[String(names[i]) + "_calls"] = int64_t(calls[i]);
+			}
+			print_line("SHADOW_CULL_CPU_PHASES " + JSON::stringify(report));
+		}
+		frame = next;
+		for (int i = 0; i < 7; i++) {
+			usec[i] = 0;
+			calls[i] = 0;
+		}
+	}
 };
 ShadowCullCpuProfile &shadow_cull_cpu_profile() {
- static ShadowCullCpuProfile profile;
- return profile;
+	static ShadowCullCpuProfile profile;
+	return profile;
 }
 struct ShadowCullCpuTimer {
- uint64_t started = 0;
- int stage;
- explicit ShadowCullCpuTimer(int p_stage) : stage(p_stage) {
-  auto &profile = shadow_cull_cpu_profile();
-  if (profile.enabled) { profile.begin_frame(); started = OS::get_singleton()->get_ticks_usec(); }
- }
- void stop() {
-  if (!started) { return; }
-  auto &profile = shadow_cull_cpu_profile();
-  profile.usec[stage] += OS::get_singleton()->get_ticks_usec() - started;
-  profile.calls[stage]++;
-  started = 0;
- }
- void next(int p_stage) {
-  if (!started) { return; }
-  stop(); stage = p_stage; started = OS::get_singleton()->get_ticks_usec();
- }
- ~ShadowCullCpuTimer() { stop(); }
+	uint64_t started = 0;
+	int stage;
+	explicit ShadowCullCpuTimer(int p_stage) : stage(p_stage) {
+		auto &profile = shadow_cull_cpu_profile();
+		if (profile.enabled) {
+			profile.begin_frame();
+			started = OS::get_singleton()->get_ticks_usec();
+		}
+	}
+	void stop() {
+		if (!started) {
+			return;
+		}
+		auto &profile = shadow_cull_cpu_profile();
+		profile.usec[stage] += OS::get_singleton()->get_ticks_usec() - started;
+		profile.calls[stage]++;
+		started = 0;
+	}
+	void next(int p_stage) {
+		if (!started) {
+			return;
+		}
+		stop();
+		stage = p_stage;
+		started = OS::get_singleton()->get_ticks_usec();
+	}
+	~ShadowCullCpuTimer() { stop(); }
 };
-}
+} //namespace
 
 // Async callbacks own their shared Dictionary, not a pointer into the renderer
 // or its recyclable resource pool. Safe even if the scene is released meanwhile.
@@ -71,7 +115,9 @@ static void shadow_cull_trace_readback(const Vector<uint8_t> &p_bytes, Dictionar
 	if (p_part == 0) {
 		const uint32_t *words = reinterpret_cast<const uint32_t *>(p_bytes.ptr());
 		Array counts;
-		for (int i = 0; i < p_bytes.size() / 20; i++) { counts.push_back(int64_t(words[i * 5 + 1])); }
+		for (int i = 0; i < p_bytes.size() / 20; i++) {
+			counts.push_back(int64_t(words[i * 5 + 1]));
+		}
 		p_report["draw_counts"] = counts;
 	} else if (p_part == 1) {
 		p_report["output_bytes"] = p_bytes;
@@ -79,11 +125,15 @@ static void shadow_cull_trace_readback(const Vector<uint8_t> &p_bytes, Dictionar
 	} else {
 		const float *values = reinterpret_cast<const float *>(p_bytes.ptr());
 		Array records;
-		for (int i = 0; i < p_bytes.size() / 4; i++) { records.push_back(values[i]); }
+		for (int i = 0; i < p_bytes.size() / 4; i++) {
+			records.push_back(values[i]);
+		}
 		p_report["records"] = records;
 		const uint32_t *words = reinterpret_cast<const uint32_t *>(p_bytes.ptr());
 		Array record_words;
-		for (int i = 0; i < p_bytes.size() / 4; i++) { record_words.push_back(int64_t(words[i])); }
+		for (int i = 0; i < p_bytes.size() / 4; i++) {
+			record_words.push_back(int64_t(words[i]));
+		}
 		p_report["source_record_words"] = record_words;
 	}
 	if (p_report.has("draw_counts") && p_report.has("output_bytes") && p_report.has("records")) {
@@ -94,20 +144,28 @@ static void shadow_cull_trace_readback(const Vector<uint8_t> &p_bytes, Dictionar
 		uint32_t capacity = p_report["input"];
 		uint32_t count = counts[0];
 		Array actual;
-		for (uint32_t i = 0; i < MIN(count, capacity); i++) { actual.push_back(int64_t(words[remap_base + i])); }
+		for (uint32_t i = 0; i < MIN(count, capacity); i++) {
+			actual.push_back(int64_t(words[remap_base + i]));
+		}
 		p_report["actual_ids"] = actual;
 		Array selected_record_words;
 		uint32_t record_stride = uint32_t(p_report["stride"]) * 4;
 		for (uint32_t i = 0; i < MIN(count, capacity); i++) {
 			uint32_t id = words[remap_base + i];
-			if (id >= capacity) { continue; } // The independent oracle rejects invalid IDs.
-			for (uint32_t word = 0; word < record_stride; word++) { selected_record_words.push_back(int64_t(words[id * record_stride + word])); }
+			if (id >= capacity) {
+				continue;
+			} // The independent oracle rejects invalid IDs.
+			for (uint32_t word = 0; word < record_stride; word++) {
+				selected_record_words.push_back(int64_t(words[id * record_stride + word]));
+			}
 		}
 		p_report["selected_record_words"] = selected_record_words;
 		if (uint32_t(p_report.get("original_id_base", 0)) != 0) {
 			Array local_ids;
 			uint32_t base = p_report["original_id_base"];
-			for (uint32_t i = 0; i < MIN(count, capacity); i++) { local_ids.push_back(int64_t(words[base + i])); }
+			for (uint32_t i = 0; i < MIN(count, capacity); i++) {
+				local_ids.push_back(int64_t(words[base + i]));
+			}
 			p_report["actual_local_ids"] = local_ids;
 		}
 		if (p_report.has("lod_buckets")) {
@@ -122,7 +180,9 @@ static void shadow_cull_trace_readback(const Vector<uint8_t> &p_bytes, Dictionar
 					uint32_t id = words[base + slot];
 					ids.push_back(int64_t(id));
 					if (id < capacity) {
-						for (uint32_t word = 0; word < record_stride; word++) { records.push_back(int64_t(words[id * record_stride + word])); }
+						for (uint32_t word = 0; word < record_stride; word++) {
+							records.push_back(int64_t(words[id * record_stride + word]));
+						}
 					}
 				}
 				bucket["actual_ids"] = ids;
@@ -134,13 +194,14 @@ static void shadow_cull_trace_readback(const Vector<uint8_t> &p_bytes, Dictionar
 	}
 }
 
-
 // Diagnostic only: correlate tiny repeat-image changes with native pipeline
 // specialization. Counts describe selected valid pipelines, not GPU duration.
 void ShadowInstanceCulling::trace_merged_submission(const Draw &p_draw) {
 	static const bool enabled = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE") == "1";
 	static uint32_t count = 0;
-	if (!enabled || p_draw.merged_sources < 2 || shadow_cull_trace_held() || count++ >= 4096) { return; }
+	if (!enabled || p_draw.merged_sources < 2 || shadow_cull_trace_held() || count++ >= 4096) {
+		return;
+	}
 	Dictionary report;
 	report["frame"] = int64_t(RD::get_singleton()->get_frames_drawn());
 	report["sources"] = int64_t(p_draw.merged_sources);
@@ -151,7 +212,9 @@ void ShadowInstanceCulling::trace_merged_submission(const Draw &p_draw) {
 void ShadowInstanceCulling::trace_lod_submission(const LODDraw &p_draw) {
 	static const bool enabled = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE") == "1";
 	static uint32_t count = 0;
-	if (!enabled || shadow_cull_trace_held() || count++ >= 4096) { return; }
+	if (!enabled || shadow_cull_trace_held() || count++ >= 4096) {
+		return;
+	}
 	Dictionary row;
 	row["frame"] = int64_t(RD::get_singleton()->get_frames_drawn());
 	row["command_buffer"] = int64_t(p_draw.draw.commands.get_id());
@@ -164,7 +227,9 @@ void ShadowInstanceCulling::trace_lod_submission(const LODDraw &p_draw) {
 
 void ShadowInstanceCulling::trace_pipeline(bool p_shadow, bool p_uber) {
 	static const bool enabled = OS::get_singleton()->get_environment("ANGE_MOBILE_PIPELINE_TRACE") == "1";
-	if (!enabled) { return; }
+	if (!enabled) {
+		return;
+	}
 	static uint64_t last_frame = UINT64_MAX;
 	static uint32_t counts[4] = {};
 	static uint32_t lines = 0;
@@ -173,11 +238,15 @@ void ShadowInstanceCulling::trace_pipeline(bool p_shadow, bool p_uber) {
 		if (last_frame != UINT64_MAX && lines++ < 1024) {
 			Dictionary report;
 			report["frame"] = int64_t(last_frame);
-			report["color_specialized"] = counts[0]; report["color_uber"] = counts[1];
-			report["shadow_specialized"] = counts[2]; report["shadow_uber"] = counts[3];
+			report["color_specialized"] = counts[0];
+			report["color_uber"] = counts[1];
+			report["shadow_specialized"] = counts[2];
+			report["shadow_uber"] = counts[3];
 			print_line("MOBILE_PIPELINE_TRACE " + JSON::stringify(report));
 		}
-		for (uint32_t &count : counts) { count = 0; }
+		for (uint32_t &count : counts) {
+			count = 0;
+		}
 		last_frame = current;
 	}
 	counts[(p_shadow ? 2 : 0) + (p_uber ? 1 : 0)]++;
@@ -426,7 +495,9 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 	plane_data.resize_initialized(4 * (caster_planes.size() + 1));
 	plane_data.write[0] = caster_planes.size();
 	for (int i = 0; i < caster_planes.size(); i++) {
-		for (int axis = 0; axis < 3; axis++) { plane_data.write[(i + 1) * 4 + axis] = caster_planes[i].normal[axis]; }
+		for (int axis = 0; axis < 3; axis++) {
+			plane_data.write[(i + 1) * 4 + axis] = caster_planes[i].normal[axis];
+		}
 		plane_data.write[(i + 1) * 4 + 3] = caster_planes[i].d;
 	}
 	uint32_t plane_size = plane_data.size() * sizeof(float);
@@ -435,7 +506,9 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 		job.output_bytes = output_size;
 		job.command_bytes = control_size;
 		job.output = rd->storage_buffer_create(job.output_bytes);
-		if (p_sources) { job.gathered = rd->storage_buffer_create(job.output_bytes); }
+		if (p_sources) {
+			job.gathered = rd->storage_buffer_create(job.output_bytes);
+		}
 		job.commands = rd->storage_buffer_create(job.command_bytes, Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 	}
 	if (job.output.is_null() || job.commands.is_null() || (p_sources && job.gathered.is_null())) {
@@ -475,7 +548,10 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 		static const bool fail_after_gather = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_MERGE_FAIL_AFTER_GATHER") == "1";
 		if (fail_after_gather) {
 			static bool reported = false;
-			if (!reported) { print_line("SHADOW_INSTANCE_MERGE_INJECTED_FAILURE after_gather"); reported = true; }
+			if (!reported) {
+				print_line("SHADOW_INSTANCE_MERGE_INJECTED_FAILURE after_gather");
+				reported = true;
+			}
 			return draws;
 		}
 	}
@@ -543,7 +619,11 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 		report["input"] = int64_t(p_instances);
 		if (p_tree.uses_density_membership()) {
 			Array selected;
-			for (uint32_t id = 0; id < p_instances; id++) { if (p_tree.density_allows(id)) { selected.push_back(int64_t(id)); } }
+			for (uint32_t id = 0; id < p_instances; id++) {
+				if (p_tree.density_allows(id)) {
+					selected.push_back(int64_t(id));
+				}
+			}
 			report["density_ids"] = selected;
 		}
 		report["allocated"] = int64_t(p_tree.get_transform_count());
@@ -554,7 +634,9 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 		for (uint32_t i = 0; i < p_tree.get_transform_count(); i++) {
 			const Transform3D &transform = p_tree.get_transform(i);
 			for (int row = 0; row < 3; row++) {
-				for (int column = 0; column < 3; column++) { hierarchy_records.push_back(transform.basis[row][column]); }
+				for (int column = 0; column < 3; column++) {
+					hierarchy_records.push_back(transform.basis[row][column]);
+				}
 				hierarchy_records.push_back(transform.origin[row]);
 			}
 		}
@@ -573,13 +655,19 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 				Dictionary snapshot;
 				AABB fresh = slice.tree->get_local_bounds();
 				Array fresh_bounds;
-				for (int axis = 0; axis < 3; axis++) { fresh_bounds.push_back(fresh.position[axis]); }
-				for (int axis = 0; axis < 3; axis++) { fresh_bounds.push_back(fresh.size[axis]); }
+				for (int axis = 0; axis < 3; axis++) {
+					fresh_bounds.push_back(fresh.position[axis]);
+				}
+				for (int axis = 0; axis < 3; axis++) {
+					fresh_bounds.push_back(fresh.size[axis]);
+				}
 				Array fresh_records;
 				for (uint32_t i = 0; i < slice.count; i++) {
 					const Transform3D &transform = slice.tree->get_transform(i);
 					for (int row = 0; row < 3; row++) {
-						for (int col = 0; col < 3; col++) { fresh_records.push_back(transform.basis.rows[row][col]); }
+						for (int col = 0; col < 3; col++) {
+							fresh_records.push_back(transform.basis.rows[row][col]);
+						}
 						fresh_records.push_back(transform.origin[row]);
 					}
 				}
@@ -598,11 +686,15 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 		}
 		if (p_original_ids) {
 			Array local_ids;
-			for (uint32_t id : *p_original_ids) { local_ids.push_back(int64_t(id)); }
+			for (uint32_t id : *p_original_ids) {
+				local_ids.push_back(int64_t(id));
+			}
 			report["source_local_ids"] = local_ids;
 		}
 		Array geometry_counts;
-		for (uint32_t count : p_draw_counts) { geometry_counts.push_back(int64_t(count)); }
+		for (uint32_t count : p_draw_counts) {
+			geometry_counts.push_back(int64_t(count));
+		}
 		report["geometry_counts"] = geometry_counts;
 		if (p_lods) {
 			Array buckets;
@@ -612,7 +704,9 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 				bucket["lod"] = p_lods->buckets[i].lod;
 				bucket["remap_base"] = int64_t(push.options[0] + lod_offsets[i]);
 				Array ids;
-				for (uint32_t id : p_lods->buckets[i].instances) { ids.push_back(int64_t(id)); }
+				for (uint32_t id : p_lods->buckets[i].instances) {
+					ids.push_back(int64_t(id));
+				}
 				bucket["ids"] = ids;
 				buckets.push_back(bucket);
 			}
@@ -621,17 +715,27 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 			report["lod_control_bytes"] = int64_t(control_size);
 		}
 		Array tight_planes;
-		for (int i = 4; i < plane_data.size(); i++) { tight_planes.push_back(plane_data[i]); }
+		for (int i = 4; i < plane_data.size(); i++) {
+			tight_planes.push_back(plane_data[i]);
+		}
 		report["caster_planes"] = tight_planes;
 		Array matrix;
-		for (float value : push.projection) { matrix.push_back(value); }
+		for (float value : push.projection) {
+			matrix.push_back(value);
+		}
 		report["projection"] = matrix;
 		Array box;
-		for (int i = 0; i < 3; i++) { box.push_back(bounds.position[i]); }
-		for (int i = 0; i < 3; i++) { box.push_back(bounds.size[i]); }
+		for (int i = 0; i < 3; i++) {
+			box.push_back(bounds.position[i]);
+		}
+		for (int i = 0; i < 3; i++) {
+			box.push_back(bounds.size[i]);
+		}
 		report["bounds"] = box;
 		Array coarse;
-		for (uint32_t i = 0; i < candidate_count; i++) { coarse.push_back(int64_t(candidates[i])); }
+		for (uint32_t i = 0; i < candidate_count; i++) {
+			coarse.push_back(int64_t(candidates[i]));
+		}
 		report["candidates"] = coarse;
 		rd->buffer_get_data_async(job.commands, callable_mp_static(shadow_cull_trace_readback).bind(report, 0), 0, command_size);
 		rd->buffer_get_data_async(job.output, callable_mp_static(shadow_cull_trace_readback).bind(report, 1));
@@ -658,7 +762,9 @@ Vector<ShadowInstanceCulling::Draw> ShadowInstanceCulling::prepare(RID p_source,
 ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const Vector<SourceSlice> &p_sources, RID p_scene_shader, const Projection &p_projection, uint32_t p_vec4_stride, const Vector<uint32_t> &p_draw_counts, bool p_pancake, const Vector<Plane> &p_caster_planes) {
 	ShadowCullCpuTimer cpu_timer(0);
 	MergeResult result;
-	if (p_sources.size() < 2 || p_draw_counts.is_empty()) { return result; }
+	if (p_sources.size() < 2 || p_draw_counts.is_empty()) {
+		return result;
+	}
 	static const bool enabled = OS::get_singleton()->get_environment("ANGE_SHADOW_MERGE_CACHE") != "0";
 	static const bool trace = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE") == "1";
 	static const bool ignore_revisions = trace && OS::get_singleton()->get_environment("ANGE_SHADOW_MERGE_CACHE_MUTANT_REVISION") == "1";
@@ -668,7 +774,9 @@ ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const V
 	bool density_filtered = false;
 	uint32_t hash = HASH_MURMUR3_SEED;
 	for (const SourceSlice &slice : p_sources) {
-		if (!slice.tree || !slice.tree->active() || slice.buffer.is_null() || slice.count == 0 || slice.count > slice.tree->get_transform_count() || uint64_t(instance_count) + slice.count > 65536) { return result; }
+		if (!slice.tree || !slice.tree->active() || slice.buffer.is_null() || slice.count == 0 || slice.count > slice.tree->get_transform_count() || uint64_t(instance_count) + slice.count > 65536) {
+			return result;
+		}
 		density_filtered |= slice.tree->has_density_selection();
 		keys.push_back({ slice.buffer, slice.tree->get_revision(), slice.count, slice.offset });
 		instance_count += slice.count;
@@ -676,12 +784,16 @@ ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const V
 		hash = hash_murmur3_one_32(slice.count, hash);
 		hash = hash_murmur3_one_32(slice.offset, hash);
 	}
-	if (force_collision) { hash = 7; }
+	if (force_collision) {
+		hash = 7;
+	}
 	const uint64_t current_frame = RD::get_singleton()->get_frames_drawn();
 	if (enabled && merge_cache_prune_frame != current_frame) {
 		Vector<uint32_t> expired;
 		for (const KeyValue<uint32_t, CachedMerge> &entry : merge_cache) {
-			if (current_frame > entry.value.last_used_frame && current_frame - entry.value.last_used_frame > 2) { expired.push_back(entry.key); }
+			if (current_frame > entry.value.last_used_frame && current_frame - entry.value.last_used_frame > 2) {
+				expired.push_back(entry.key);
+			}
 		}
 		for (uint32_t key : expired) {
 			merge_cache_instances -= merge_cache[key].original_ids.size();
@@ -696,7 +808,10 @@ ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const V
 		for (int i = 0; i < keys.size(); i++) {
 			const MergeSourceKey &a = cached->sources[i];
 			const MergeSourceKey &b = keys[i];
-			if (a.buffer != b.buffer || a.count != b.count || a.offset != b.offset || (!ignore_revisions && a.revision != b.revision)) { hit = false; break; }
+			if (a.buffer != b.buffer || a.count != b.count || a.offset != b.offset || (!ignore_revisions && a.revision != b.revision)) {
+				hit = false;
+				break;
+			}
 		}
 	}
 	if (!hit) {
@@ -709,7 +824,10 @@ ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const V
 				uint64_t oldest_frame = UINT64_MAX;
 				uint32_t oldest_key = 0;
 				for (const KeyValue<uint32_t, CachedMerge> &entry : merge_cache) {
-					if (entry.value.last_used_frame < oldest_frame) { oldest_frame = entry.value.last_used_frame; oldest_key = entry.key; }
+					if (entry.value.last_used_frame < oldest_frame) {
+						oldest_frame = entry.value.last_used_frame;
+						oldest_key = entry.key;
+					}
 				}
 				merge_cache_instances -= merge_cache[oldest_key].original_ids.size();
 				merge_cache.erase(oldest_key);
@@ -717,11 +835,15 @@ ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const V
 			merge_cache.insert(hash, CachedMerge());
 			cached = merge_cache.getptr(hash);
 			merge_cache_instances += instance_count;
-		} else { cached = &uncached; }
+		} else {
+			cached = &uncached;
+		}
 		cached->sources = keys;
 		Vector<Transform3D> transforms;
 		Vector<uint8_t> membership;
-		if (density_filtered) { membership.resize(instance_count); }
+		if (density_filtered) {
+			membership.resize(instance_count);
+		}
 		transforms.resize(instance_count);
 		cached->original_ids.resize(instance_count);
 		AABB bounds;
@@ -729,19 +851,25 @@ ShadowInstanceCulling::MergeResult ShadowInstanceCulling::prepare_merged(const V
 		for (const SourceSlice &slice : p_sources) {
 			bounds = at == 0 ? slice.tree->get_local_bounds() : bounds.merge(slice.tree->get_local_bounds());
 			for (uint32_t i = 0; i < slice.count; i++) {
-				if (density_filtered) { membership.write[at] = slice.tree->density_allows(i) ? 1 : 0; }
+				if (density_filtered) {
+					membership.write[at] = slice.tree->density_allows(i) ? 1 : 0;
+				}
 				transforms.write[at] = slice.tree->get_transform(i);
 				cached->original_ids.write[at++] = i;
 			}
 		}
 		cached->tree.set_bounds(bounds);
 		cached->tree.set_transforms(transforms);
-		if (density_filtered) { cached->tree.set_density_membership(membership); }
+		if (density_filtered) {
+			cached->tree.set_density_membership(membership);
+		}
 	}
 	cached->last_used_frame = current_frame;
 	cpu_timer.stop();
 	result.draws = prepare(RID(), p_scene_shader, p_projection, cached->tree, instance_count, 0, p_vec4_stride, p_draw_counts, p_pancake, p_caster_planes, &p_sources, &cached->original_ids, hit);
-	if (result.draws.size() != p_draw_counts.size()) { return result; }
+	if (result.draws.size() != p_draw_counts.size()) {
+		return result;
+	}
 	bool rejected = true;
 	bool ready = true;
 	for (const Draw &draw : result.draws) {

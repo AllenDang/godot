@@ -139,7 +139,9 @@ public:
 
 	virtual void multimesh_set_custom_aabb(RID p_multimesh, const AABB &p_aabb);
 	virtual void multimesh_set_shadow_culling_aabb(RID p_multimesh, const AABB &p_aabb) {
-		if (p_aabb != AABB()) { WARN_PRINT_ONCE("Shadow instance culling requires the Mobile RenderingDevice renderer."); }
+		if (p_aabb != AABB()) {
+			WARN_PRINT_ONCE("Shadow instance culling requires the Mobile RenderingDevice renderer.");
+		}
 	}
 	virtual AABB multimesh_get_custom_aabb(RID p_multimesh) const;
 

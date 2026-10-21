@@ -1,9 +1,40 @@
+/**************************************************************************/
+/*  shadow_instance_tree.h                                                */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
 #pragma once
 
-#include "instance_density_policy.h"
 #include "core/math/projection.h"
 #include "core/math/transform_3d.h"
 #include "core/templates/vector.h"
+#include "servers/rendering/renderer_rd/storage_rd/instance_density_policy.h"
+
 #include <algorithm>
 #include <memory>
 
@@ -48,7 +79,9 @@ class ShadowInstanceTree {
 	uint64_t density_frame = UINT64_MAX;
 	bool density_preparing = false;
 	void rebuild_density() {
-		if (density_external || density == 1) { return; }
+		if (density_external || density == 1) {
+			return;
+		}
 		density_ids.clear();
 		density_membership.resize(density_source_count);
 		density_membership.fill(0);
@@ -73,10 +106,15 @@ class ShadowInstanceTree {
 		node.from = p_from;
 		node.count = p_count;
 		node.bounds = boxes[order[p_from]];
-		if (with_lod) { node.min_lod_scale = node.max_lod_scale = lod_scales[order[p_from]]; } // hierarchical LOD hook
+		if (with_lod) {
+			node.min_lod_scale = node.max_lod_scale = lod_scales[order[p_from]];
+		} // hierarchical LOD hook
 		for (uint32_t i = 1; i < p_count; i++) {
 			node.bounds.merge_with(boxes[order[p_from + i]]);
-			if (with_lod) { node.min_lod_scale = MIN(node.min_lod_scale, lod_scales[order[p_from + i]]); node.max_lod_scale = MAX(node.max_lod_scale, lod_scales[order[p_from + i]]); } // hierarchical LOD hook
+			if (with_lod) {
+				node.min_lod_scale = MIN(node.min_lod_scale, lod_scales[order[p_from + i]]);
+				node.max_lod_scale = MAX(node.max_lod_scale, lod_scales[order[p_from + i]]);
+			} // hierarchical LOD hook
 		}
 		int index = nodes.size();
 		nodes.push_back(node);
@@ -110,7 +148,9 @@ class ShadowInstanceTree {
 		}
 		boxes.resize(transforms.size());
 		const bool with_lod = lod_enabled(); // hierarchical LOD hook
-		if (with_lod) { lod_scales.resize(transforms.size()); } // hierarchical LOD hook
+		if (with_lod) {
+			lod_scales.resize(transforms.size());
+		} // hierarchical LOD hook
 		order.resize(transforms.size());
 		for (int i = 0; i < transforms.size(); i++) {
 			if (!transforms[i].is_finite()) {
@@ -121,7 +161,9 @@ class ShadowInstanceTree {
 				return;
 			}
 			order.write[i] = i;
-			if (with_lod) { lod_scales.write[i] = lod_basis_scale(transforms[i].basis); } // hierarchical LOD hook
+			if (with_lod) {
+				lod_scales.write[i] = lod_basis_scale(transforms[i].basis);
+			} // hierarchical LOD hook
 		}
 		build_node(0, transforms.size());
 		valid = true;
@@ -131,7 +173,9 @@ class ShadowInstanceTree {
 public:
 	// BEGIN density publication interface
 	void set_density(float p_density, int32_t p_seed, uint32_t p_count) {
-		if (density == p_density && density_seed == p_seed && density_source_count == p_count) { return; }
+		if (density == p_density && density_seed == p_seed && density_source_count == p_count) {
+			return;
+		}
 		density = p_density;
 		density_seed = p_seed;
 		density_source_count = p_count;
@@ -143,7 +187,9 @@ public:
 		revision++;
 	}
 	void prepare_density_frame(uint64_t p_frame) {
-		if (density_frame == p_frame) { return; }
+		if (density_frame == p_frame) {
+			return;
+		}
 		density_frame = p_frame;
 		density_preparing = true;
 		rebuild();
@@ -182,7 +228,11 @@ public:
 	uint64_t get_revision() const { return revision; }
 	void reset() {
 		revision++;
-		density_ready = false; density_ids.clear(); density_membership.clear(); density_external = false; density_frame = UINT64_MAX; // density hook
+		density_ready = false;
+		density_ids.clear();
+		density_membership.clear();
+		density_external = false;
+		density_frame = UINT64_MAX; // density hook
 		local_bounds = AABB();
 		transforms.clear();
 		lod_scales.clear(); // hierarchical LOD hook
@@ -232,12 +282,23 @@ public:
 			dirty = true;
 		}
 	}
-	bool active() { rebuild(); return valid && !dirty; }
+	bool active() {
+		rebuild();
+		return valid && !dirty;
+	}
 	uint32_t get_transform_count() const { return transforms.size(); }
 	const Transform3D &get_transform(uint32_t p_index) const { return transforms[p_index]; }
-	void set_transforms(const Vector<Transform3D> &p_transforms) { revision++; transforms = p_transforms; snapshot = true; dirty = true; }
+	void set_transforms(const Vector<Transform3D> &p_transforms) {
+		revision++;
+		transforms = p_transforms;
+		snapshot = true;
+		dirty = true;
+	}
 	const Transform3D &get_first_transform() const { return transforms[0]; }
-	AABB get_aggregate() { rebuild(); return valid ? nodes[0].bounds : AABB(); }
+	AABB get_aggregate() {
+		rebuild();
+		return valid ? nodes[0].bounds : AABB();
+	}
 
 	// An entirely contained batch cannot shed any instances. Keep its native
 	// direct draw, avoiding GPU compaction, copies and indirect vertex remapping.

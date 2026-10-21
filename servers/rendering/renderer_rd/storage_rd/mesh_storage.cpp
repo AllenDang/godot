@@ -32,7 +32,6 @@
 
 #include "core/io/json.h"
 #include "core/os/os.h"
-
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -1646,7 +1645,9 @@ void MeshStorage::_multimesh_enable_motion_vectors(MultiMesh *multimesh) {
 
 	if (density_bytes) {
 		RD::get_singleton()->buffer_copy(multimesh->buffer, new_buffer, buffer_size, new_buffer_size, density_bytes);
-		if (multimesh->density_remap_base) { multimesh->density_remap_base = new_buffer_size / sizeof(float); }
+		if (multimesh->density_remap_base) {
+			multimesh->density_remap_base = new_buffer_size / sizeof(float);
+		}
 	}
 	if (multimesh->buffer.is_valid()) {
 		RD::get_singleton()->free_rid(multimesh->buffer);
@@ -2312,7 +2313,9 @@ void MeshStorage::multimesh_set_shadow_culling_aabb(RID p_multimesh, const AABB 
 	if (!RenderingServer::get_singleton()->is_shadow_instance_culling_supported() || mm->indirect || mm->xform_format != RSE::MULTIMESH_TRANSFORM_3D) {
 		mm->shadow_culling.reset();
 		mm->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_AABB);
-		if (p_aabb != AABB()) { WARN_PRINT_ONCE("Shadow instance culling requires CPU-owned 3D MultiMesh and Mobile RD."); }
+		if (p_aabb != AABB()) {
+			WARN_PRINT_ONCE("Shadow instance culling requires CPU-owned 3D MultiMesh and Mobile RD.");
+		}
 		return;
 	}
 	if (p_aabb == AABB()) {
@@ -2361,7 +2364,9 @@ MeshStorage::DensityDraw MeshStorage::multimesh_prepare_density(RID p_multimesh)
 		if (mm->shadow_culling.has_density_selection()) {
 			const Vector<uint32_t> &ids = mm->shadow_culling.get_density_ids();
 			mm->density_draw_count = ids.is_empty() ? 0 : uint32_t(std::lower_bound(ids.ptr(), ids.ptr() + ids.size(), visible) - ids.ptr());
-		} else { mm->density_draw_count = visible; }
+		} else {
+			mm->density_draw_count = visible;
+		}
 		return { mm->density_draw_count, mm->density_remap_base };
 	}
 	mm->density_prepared_frame = frame;
@@ -2383,7 +2388,11 @@ MeshStorage::DensityDraw MeshStorage::multimesh_prepare_density(RID p_multimesh)
 		report["current_offset"] = int64_t(mm->motion_vectors_current_offset);
 		report["previous_offset"] = int64_t(mm->motion_vectors_previous_offset);
 		Array selected;
-		for (uint32_t id = 0; id < visible; id++) { if (mm->shadow_culling.density_allows(id)) { selected.push_back(int64_t(id)); } }
+		for (uint32_t id = 0; id < visible; id++) {
+			if (mm->shadow_culling.density_allows(id)) {
+				selected.push_back(int64_t(id));
+			}
+		}
 		report["ids"] = selected;
 		print_line("INSTANCE_DENSITY_SELECTION " + JSON::stringify(report));
 	}
@@ -2392,7 +2401,9 @@ MeshStorage::DensityDraw MeshStorage::multimesh_prepare_density(RID p_multimesh)
 	}
 	const Vector<uint32_t> &ids = mm->shadow_culling.get_density_ids();
 	mm->density_draw_count = ids.is_empty() ? 0 : uint32_t(std::lower_bound(ids.ptr(), ids.ptr() + ids.size(), visible) - ids.ptr());
-	if (ids.is_empty()) { return { 0, 0 }; }
+	if (ids.is_empty()) {
+		return { 0, 0 };
+	}
 	const uint32_t record_bytes = mm->instances * mm->stride_cache * sizeof(float) * (mm->motion_vectors_enabled ? 2 : 1);
 	if (!mm->density_buffer_tail) {
 		const uint32_t id_bytes = ((mm->instances + 3u) & ~3u) * sizeof(uint32_t);
@@ -2463,7 +2474,7 @@ ShadowInstanceTree *MeshStorage::multimesh_get_shadow_culling(RID p_multimesh, b
 			if (trace) {
 				Dictionary report;
 				report["source"] = from_cpu ? "cpu_cache" : "cpu_upload";
-			report["gpu_readbacks"] = 0;
+				report["gpu_readbacks"] = 0;
 				report["instances"] = mm->instances;
 				report["usec"] = int64_t(OS::get_singleton()->get_ticks_usec() - started);
 				report["rid"] = int64_t(p_multimesh.get_id());

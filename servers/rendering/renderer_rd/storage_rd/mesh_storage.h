@@ -30,13 +30,12 @@
 
 #pragma once
 
-#include "shadow_instance_tree.h"
-
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_rd/shaders/skeleton.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/shadow_instance_tree.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/mesh_storage.h"
 #include "servers/rendering/storage/utilities.h"
@@ -236,7 +235,9 @@ private:
 		uint64_t density_prepared_frame = UINT64_MAX;
 		uint32_t density_draw_count = 0;
 		uint32_t density_remap_base = 0;
-		enum ShadowBoundsMode { SHADOW_BOUNDS_AUTO, SHADOW_BOUNDS_EXPLICIT, SHADOW_BOUNDS_DISABLED };
+		enum ShadowBoundsMode { SHADOW_BOUNDS_AUTO,
+			SHADOW_BOUNDS_EXPLICIT,
+			SHADOW_BOUNDS_DISABLED };
 		ShadowBoundsMode shadow_bounds_mode = SHADOW_BOUNDS_AUTO;
 		bool shadow_buffer_exposed = false;
 		Vector<Transform3D> shadow_auto_transforms;
@@ -482,7 +483,9 @@ public:
 
 	_FORCE_INLINE_ uint32_t mesh_surface_get_shadow_draw_count(void *p_surface, uint32_t p_lod) const {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
-		if (p_lod > 0 && p_lod <= s->lod_count) { return s->lods[p_lod - 1].index_count; }
+		if (p_lod > 0 && p_lod <= s->lod_count) {
+			return s->lods[p_lod - 1].index_count;
+		}
 		return s->index_count ? s->index_count : s->vertex_count;
 	}
 
@@ -709,7 +712,10 @@ public:
 
 	void multimesh_set_shadow_culling_aabb(RID p_multimesh, const AABB &p_aabb) override;
 	ShadowInstanceTree *multimesh_get_shadow_culling(RID p_multimesh, bool p_allow_auto);
-	struct DensityDraw { uint32_t count; uint32_t remap_base; };
+	struct DensityDraw {
+		uint32_t count;
+		uint32_t remap_base;
+	};
 	DensityDraw multimesh_prepare_density(RID p_multimesh);
 	virtual void _multimesh_set_custom_aabb(RID p_multimesh, const AABB &p_aabb) override;
 	virtual AABB _multimesh_get_custom_aabb(RID p_multimesh) const override;

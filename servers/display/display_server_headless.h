@@ -132,12 +132,16 @@ public:
 
 	void window_set_size(const Size2i p_size, DisplayServerEnums::WindowID p_window = DisplayServerEnums::MAIN_WINDOW_ID) override {
 #if defined(TOOLS_ENABLED) && defined(RD_ENABLED)
-		if (rendering_device) { offscreen_size = p_size; }
+		if (rendering_device) {
+			offscreen_size = p_size;
+		}
 #endif
 	}
 	Size2i window_get_size(DisplayServerEnums::WindowID p_window = DisplayServerEnums::MAIN_WINDOW_ID) const override {
 #if defined(TOOLS_ENABLED) && defined(RD_ENABLED)
-		if (rendering_device) { return offscreen_size; }
+		if (rendering_device) {
+			return offscreen_size;
+		}
 #endif
 		return Size2i();
 	}

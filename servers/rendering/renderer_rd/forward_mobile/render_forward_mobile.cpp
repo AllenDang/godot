@@ -39,8 +39,8 @@
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
-#include "servers/rendering/renderer_rd/storage_rd/shadow_hierarchical_lod.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/shadow_hierarchical_lod.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
@@ -89,7 +89,6 @@ static bool shadow_instance_merge_cpu_first_enabled() {
 	}
 	return enabled;
 }
-
 
 using namespace RendererSceneRenderImplementation;
 
@@ -996,7 +995,6 @@ void RenderForwardMobile::_setup_lightmaps(const RenderDataRD *p_render_data, co
 		scene_state.lightmap_ids[i] = p_lightmaps[i];
 		scene_state.lightmap_has_sh[i] = light_storage->lightmap_uses_spherical_harmonics(lightmap);
 
-
 		scene_state.lightmaps_used++;
 	}
 	if (scene_state.lightmaps_used > 0) {
@@ -1026,7 +1024,9 @@ void RenderForwardMobile::_pre_opaque_render(RenderDataRD *p_render_data) {
 					break;
 				}
 			}
-			if (!receiver_scissor) { break; }
+			if (!receiver_scissor) {
+				break;
+			}
 		}
 	}
 	if (scissor_enabled && !receiver_scissor && OS::get_singleton()->get_environment("ANGE_SHADOW_CSM_SCISSOR_TRACE") == "1") {
@@ -1971,25 +1971,25 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 	} else {
 		//render shadow
 		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, p_clear_region, p_open_pass, p_close_pass, p_render_info, p_main_cam_transform, p_caster_planes);
-	if (p_receiver_rect) {
-		// The shader's rotated unit-disk PCF uses atlas pixels. Keep the hardware
-		// bilinear footprint and round outwards; never alter viewport/projection.
-		float blur = Math::abs(light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_BLUR));
-		float kernel_guard = blur * MAX(1.0f, directional_shadow_quality_radius_get()) + 2.0f;
-		float normal_bias = Math::abs(light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS) * light_storage->light_instance_get_directional_shadow_texel_size(p_light, p_pass));
-		float depth_bias = Math::abs(light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_BIAS) * .01f * light_storage->light_instance_get_shadow_bias_scale(p_light, p_pass) * blur * MAX(1.0f, directional_shadow_quality_radius_get()));
-		// Conservative component bound for the shader's half-precision BIAS_FUNC:
-		// |n - l dot(l,n)| <= 8*N per component, and a unit basis row has L1 <=sqrt3.
-		// 16*N +2*B also contains rounding and the nominal depth-only displacement.
-		float world_guard = 16.0f * normal_bias + 2.0f * depth_bias;
-		Vector2 guard = light_storage->light_instance_get_shadow_uv_scale(p_light, p_pass) * world_guard * Vector2(atlas_rect.size) + Vector2(kernel_guard, kernel_guard);
-		Vector2 low = Vector2(atlas_rect.position) + p_receiver_rect->position * Vector2(atlas_rect.size) - guard;
-		Vector2 high = Vector2(atlas_rect.position) + p_receiver_rect->get_end() * Vector2(atlas_rect.size) + guard;
-		int extent = light_storage->directional_shadow_get_size();
-		Point2i begin(CLAMP(Math::floor(low.x), 0.0f, float(extent)), CLAMP(Math::floor(low.y), 0.0f, float(extent)));
-		Point2i end(CLAMP(Math::ceil(high.x), 0.0f, float(extent)), CLAMP(Math::ceil(high.y), 0.0f, float(extent)));
-		scene_state.shadow_passes[scene_state.shadow_passes.size() - 1].receiver_sample_rect = Rect2i(begin, end - begin);
-	}
+		if (p_receiver_rect) {
+			// The shader's rotated unit-disk PCF uses atlas pixels. Keep the hardware
+			// bilinear footprint and round outwards; never alter viewport/projection.
+			float blur = Math::abs(light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_BLUR));
+			float kernel_guard = blur * MAX(1.0f, directional_shadow_quality_radius_get()) + 2.0f;
+			float normal_bias = Math::abs(light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS) * light_storage->light_instance_get_directional_shadow_texel_size(p_light, p_pass));
+			float depth_bias = Math::abs(light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_BIAS) * .01f * light_storage->light_instance_get_shadow_bias_scale(p_light, p_pass) * blur * MAX(1.0f, directional_shadow_quality_radius_get()));
+			// Conservative component bound for the shader's half-precision BIAS_FUNC:
+			// |n - l dot(l,n)| <= 8*N per component, and a unit basis row has L1 <=sqrt3.
+			// 16*N +2*B also contains rounding and the nominal depth-only displacement.
+			float world_guard = 16.0f * normal_bias + 2.0f * depth_bias;
+			Vector2 guard = light_storage->light_instance_get_shadow_uv_scale(p_light, p_pass) * world_guard * Vector2(atlas_rect.size) + Vector2(kernel_guard, kernel_guard);
+			Vector2 low = Vector2(atlas_rect.position) + p_receiver_rect->position * Vector2(atlas_rect.size) - guard;
+			Vector2 high = Vector2(atlas_rect.position) + p_receiver_rect->get_end() * Vector2(atlas_rect.size) + guard;
+			int extent = light_storage->directional_shadow_get_size();
+			Point2i begin(CLAMP(Math::floor(low.x), 0.0f, float(extent)), CLAMP(Math::floor(low.y), 0.0f, float(extent)));
+			Point2i end(CLAMP(Math::ceil(high.x), 0.0f, float(extent)), CLAMP(Math::ceil(high.y), 0.0f, float(extent)));
+			scene_state.shadow_passes[scene_state.shadow_passes.size() - 1].receiver_sample_rect = Rect2i(begin, end - begin);
+		}
 	}
 }
 
@@ -2076,7 +2076,9 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 	// Each native CSM pass owns its compact instance list. All surfaces of one
 	// geometry share one dispatch; source transforms and main-view draws stay intact.
 	shadow_pass.cull_draws.resize(render_list_size);
-	if (ShadowInstanceTree::lod_enabled()) { shadow_pass.lod_draws.resize(render_list_size); }
+	if (ShadowInstanceTree::lod_enabled()) {
+		shadow_pass.lod_draws.resize(render_list_size);
+	}
 	if (!p_use_dp && p_projection.is_orthogonal() && p_transform.is_finite() && !Math::is_zero_approx(p_transform.basis.determinant())) {
 		RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 		HashMap<GeometryInstanceForwardMobile *, Vector<uint32_t>> groups;
@@ -2146,8 +2148,13 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 			mesh_storage->_multimesh_get_motion_vectors_offsets(owner->data->base, current_offset, previous_offset);
 			uint32_t stride = 3 + uint32_t(mesh_storage->multimesh_uses_colors(owner->data->base)) + uint32_t(mesh_storage->multimesh_uses_custom_data(owner->data->base));
 			Prepared item;
-			item.owner = owner; item.tree = tree; item.indices = indices; item.counts = counts;
-			item.planes = local_caster_planes; item.projection = model_to_clip; item.stride = stride;
+			item.owner = owner;
+			item.tree = tree;
+			item.indices = indices;
+			item.counts = counts;
+			item.planes = local_caster_planes;
+			item.projection = model_to_clip;
+			item.stride = stride;
 			item.source = { mesh_storage->_multimesh_get_buffer_rd_rid(owner->data->base), tree, owner->instance_count, current_offset };
 			if (ShadowInstanceTree::lod_enabled() && scene_data.screen_mesh_lod_threshold > 0 && tree->active()) {
 				bool has_lods = false;
@@ -2221,7 +2228,9 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 								for (size_t range = 0; range < ranges.size(); range += 2) {
 									for (uint32_t sorted = ranges[range]; sorted <= ranges[range + 1]; sorted++) {
 										uint32_t id = tree->lod_original_id(sorted);
-										if (id < item.source.count) { bucket.instances.push_back(id); }
+										if (id < item.source.count) {
+											bucket.instances.push_back(id);
+										}
 									}
 								}
 								if (!bucket.instances.is_empty()) {
@@ -2261,7 +2270,9 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 						WARN_PRINT_ONCE("SHADOW_INSTANCE_CPU_FIRST_MUTANT direct_for_skip");
 					}
 					if (cpu_draws.size() == item.indices.size()) {
-						for (int i = 0; i < cpu_draws.size(); i++) { shadow_pass.cull_draws.write[item.indices[i]] = cpu_draws[i]; }
+						for (int i = 0; i < cpu_draws.size(); i++) {
+							shadow_pass.cull_draws.write[item.indices[i]] = cpu_draws[i];
+						}
 					}
 					continue;
 				}
@@ -2282,25 +2293,36 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 		Vector<uint8_t> handled;
 		handled.resize_initialized(prepared.size());
 		auto compatible = [&](const Prepared &a, const Prepared &b) {
-			if (a.indices.size() != b.indices.size() || a.stride != b.stride || a.owner->mirror != b.owner->mirror || a.owner->get_transform() != b.owner->get_transform() || a.tree->get_local_bounds() != b.tree->get_local_bounds()) { return false; }
+			if (a.indices.size() != b.indices.size() || a.stride != b.stride || a.owner->mirror != b.owner->mirror || a.owner->get_transform() != b.owner->get_transform() || a.tree->get_local_bounds() != b.tree->get_local_bounds()) {
+				return false;
+			}
 			for (int n = 0; n < a.indices.size(); n++) {
 				uint32_t ai = render_list_from + a.indices[n], bi = render_list_from + b.indices[n];
 				GeometryInstanceSurfaceDataCache *sa = render_list[RENDER_LIST_SECONDARY].elements[ai], *sb = render_list[RENDER_LIST_SECONDARY].elements[bi];
-				if (sa->surface_shadow != sb->surface_shadow || sa->shader_shadow != sb->shader_shadow || sa->material_uniform_set_shadow != sb->material_uniform_set_shadow || sa->flags != sb->flags || sa->primitive != sb->primitive || render_list[RENDER_LIST_SECONDARY].element_info[ai].lod_index != render_list[RENDER_LIST_SECONDARY].element_info[bi].lod_index || memcmp(&scene_state.shadow_instance_keys[ai], &scene_state.shadow_instance_keys[bi], sizeof(SceneState::InstanceData)) != 0) { return false; }
+				if (sa->surface_shadow != sb->surface_shadow || sa->shader_shadow != sb->shader_shadow || sa->material_uniform_set_shadow != sb->material_uniform_set_shadow || sa->flags != sb->flags || sa->primitive != sb->primitive || render_list[RENDER_LIST_SECONDARY].element_info[ai].lod_index != render_list[RENDER_LIST_SECONDARY].element_info[bi].lod_index || memcmp(&scene_state.shadow_instance_keys[ai], &scene_state.shadow_instance_keys[bi], sizeof(SceneState::InstanceData)) != 0) {
+					return false;
+				}
 			}
 			return true;
 		};
 		for (int a = 0; a < prepared.size(); a++) {
-			if (handled[a]) { continue; }
+			if (handled[a]) {
+				continue;
+			}
 			const Prepared &item = prepared[a];
 			Vector<uint32_t> members;
 			Vector<RendererRD::ShadowInstanceCulling::SourceSlice> sources;
 			uint64_t total = item.source.count;
-			members.push_back(a); sources.push_back(item.source);
+			members.push_back(a);
+			sources.push_back(item.source);
 			if (shadow_instance_merge_enabled()) {
 				for (uint32_t b : buckets[item.hash]) {
-					if (b <= uint32_t(a) || handled[b] || total + prepared[b].source.count > 65536 || !compatible(item, prepared[b])) { continue; }
-					members.push_back(b); sources.push_back(prepared[b].source); total += prepared[b].source.count;
+					if (b <= uint32_t(a) || handled[b] || total + prepared[b].source.count > 65536 || !compatible(item, prepared[b])) {
+						continue;
+					}
+					members.push_back(b);
+					sources.push_back(prepared[b].source);
+					total += prepared[b].source.count;
 				}
 			}
 			if (members.size() > 1) {
@@ -2324,11 +2346,12 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 			}
 			Vector<RendererRD::ShadowInstanceCulling::Draw> draws = shadow_instance_culling.prepare(item.source.buffer, scene_shader.default_shader_rd, item.projection, *item.tree, item.source.count, item.source.offset, item.stride, item.counts, p_use_pancake, item.planes);
 			if (draws.size() == item.indices.size()) {
-				for (int i = 0; i < draws.size(); i++) { shadow_pass.cull_draws.write[item.indices[i]] = draws[i]; }
+				for (int i = 0; i < draws.size(); i++) {
+					shadow_pass.cull_draws.write[item.indices[i]] = draws[i];
+				}
 			}
 		}
 	}
-
 
 	{
 		//regular forward for now
@@ -2381,9 +2404,13 @@ void RenderForwardMobile::_render_shadow_end() {
 			// cascade's tile, including across a nonzero atlas viewport offset.
 			Rect2i footprint;
 			for (const SceneState::ShadowPass &receiver : scene_state.shadow_passes) {
-				if (receiver.framebuffer != shadow_pass.framebuffer || !receiver.receiver_sample_rect.has_area()) { continue; }
+				if (receiver.framebuffer != shadow_pass.framebuffer || !receiver.receiver_sample_rect.has_area()) {
+					continue;
+				}
 				Rect2i part = receiver.receiver_sample_rect.intersection(shadow_pass.rect);
-				if (part.has_area()) { footprint = footprint.has_area() ? footprint.merge(part) : part; }
+				if (part.has_area()) {
+					footprint = footprint.has_area() ? footprint.merge(part) : part;
+				}
 			}
 			if (footprint.has_area()) {
 				render_list_parameters.shadow_scissor = Rect2i(footprint.position - shadow_pass.rect.position, footprint.size);
@@ -2616,12 +2643,12 @@ void RenderForwardMobile::_update_render_base_uniform_set() {
 			u.binding = 18;
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			for (RID texture : light_storage->get_baked_depth_textures()) {
-					// Forward+ depth/shadow setup can precede this view's light update.
-					if (!RD::get_singleton()->texture_is_valid(texture)) {
-						texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_DEPTH);
-					}
-					u.append_id(texture);
+				// Forward+ depth/shadow setup can precede this view's light update.
+				if (!RD::get_singleton()->texture_is_valid(texture)) {
+					texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_DEPTH);
 				}
+				u.append_id(texture);
+			}
 			uniforms.push_back(u);
 		}
 
@@ -2630,12 +2657,12 @@ void RenderForwardMobile::_update_render_base_uniform_set() {
 			u.binding = 19;
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			for (RID texture : light_storage->get_baked_visibility_textures()) {
-					// Forward+ depth/shadow setup can precede this view's light update.
-					if (!RD::get_singleton()->texture_is_valid(texture)) {
-						texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
-					}
-					u.append_id(texture);
+				// Forward+ depth/shadow setup can precede this view's light update.
+				if (!RD::get_singleton()->texture_is_valid(texture)) {
+					texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 				}
+				u.append_id(texture);
+			}
 			uniforms.push_back(u);
 		}
 
@@ -2911,7 +2938,6 @@ void RenderForwardMobile::_fill_instance_data(RenderListType p_render_list, uint
 			scene_state.shadow_instance_keys.write[i + p_offset] = key;
 		}
 
-
 		RenderElementInfo &element_info = rl->element_info[p_offset + i];
 
 		// Sets lod_index and uses_lightmap at once.
@@ -2970,7 +2996,6 @@ void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const 
 				inst->transforms_uniform_set = mesh_storage->multimesh_get_3d_uniform_set(inst->data->base, scene_shader.default_shader_rd, TRANSFORMS_UNIFORM_SET);
 			}
 		}
-
 
 		Vector3 center = inst->transform.origin;
 		if (p_render_data->scene_data->cam_orthogonal) {
@@ -3237,336 +3262,337 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 			}
 		}
 		for (int lod_draw_index = 0; lod_draw_index < (lod_draws ? lod_draws->size() : 1); lod_draw_index++) {
-		RenderElementInfo element_info = p_params->element_info[i];
-		const RendererRD::ShadowInstanceCulling::Draw *selected_lod_draw = nullptr;
-		if (lod_draws) {
-			element_info.lod_index = (*lod_draws)[lod_draw_index].lod;
-			selected_lod_draw = &(*lod_draws)[lod_draw_index].draw;
-		}
-
-		if constexpr (p_pass_mode == PASS_MODE_SHADOW) {
-			if (selected_lod_draw || p_params->shadow_cull_draws) {
-				const RendererRD::ShadowInstanceCulling::Draw &draw = selected_lod_draw ? *selected_lod_draw : p_params->shadow_cull_draws[i];
-				RendererRD::ShadowInstanceCulling::trace_cpu_draw(draw, inst->instance_count);
-				if (draw.skip()) {
-					continue;
-				}
-			}
-		}
-
-		SceneShaderForwardMobile::ShaderSpecialization pipeline_specialization = p_params->base_specialization;
-		pipeline_specialization.multimesh = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH);
-		pipeline_specialization.multimesh_format_2d = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D);
-		pipeline_specialization.multimesh_has_color = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR);
-		pipeline_specialization.multimesh_has_custom_data = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_HAS_CUSTOM_DATA);
-
-		SceneState::PushConstant push_constant;
-		push_constant.base_index = i + p_params->element_offset;
-
-		if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL) {
-			push_constant.uv_offset = Math::make_half_float(p_params->uv_offset.y) << 16;
-			push_constant.uv_offset |= Math::make_half_float(p_params->uv_offset.x);
-		} else {
-			push_constant.uv_offset = 0;
-		}
-
-		if (shadow_pass) {
-			material_uniform_set = surf->material_uniform_set_shadow;
-			shader = surf->shader_shadow;
-			mesh_surface = surf->surface_shadow;
-
-		} else {
-			pipeline_specialization.use_light_projector = inst->use_projector;
-			pipeline_specialization.use_light_soft_shadows = inst->use_soft_shadow;
-			pipeline_specialization.omni_lights = SceneShaderForwardMobile::shader_count_for(inst->omni_light_count);
-			pipeline_specialization.spot_lights = SceneShaderForwardMobile::shader_count_for(inst->spot_light_count);
-			pipeline_specialization.area_lights = SceneShaderForwardMobile::shader_count_for(inst->area_light_count);
-			pipeline_specialization.reflection_probes = SceneShaderForwardMobile::shader_count_for(inst->reflection_probe_count);
-			pipeline_specialization.decals = inst->decals_count > 0;
-
-#ifdef DEBUG_ENABLED
-			if (unlikely(get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_LIGHTING)) {
-				material_uniform_set = scene_shader.default_material_uniform_set;
-				shader = scene_shader.default_material_shader_ptr;
-			} else if (unlikely(get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW)) {
-				material_uniform_set = scene_shader.overdraw_material_uniform_set;
-				shader = scene_shader.overdraw_material_shader_ptr;
-			} else if (unlikely(get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_PSSM_SPLITS)) {
-				material_uniform_set = scene_shader.debug_shadow_splits_material_uniform_set;
-				shader = scene_shader.debug_shadow_splits_material_shader_ptr;
-			} else {
-#endif
-				material_uniform_set = surf->material_uniform_set;
-				shader = surf->shader;
-				surf->material->set_as_used();
-#ifdef DEBUG_ENABLED
-			}
-#endif
-			mesh_surface = surf->surface;
-		}
-
-		if (!mesh_surface) {
-			continue;
-		}
-
-		//request a redraw if one of the shaders uses TIME
-		if (shader->uses_time) {
-			should_request_redraw = true;
-		}
-
-		//find cull variant
-		SceneShaderForwardMobile::ShaderData::CullVariant cull_variant;
-
-		if (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || ((p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) && surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS)) {
-			cull_variant = SceneShaderForwardMobile::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
-		} else {
-			bool mirror = surf->owner->mirror;
-			if (p_params->reverse_cull) {
-				mirror = !mirror;
-			}
-			cull_variant = mirror ? SceneShaderForwardMobile::ShaderData::CULL_VARIANT_REVERSED : SceneShaderForwardMobile::ShaderData::CULL_VARIANT_NORMAL;
-		}
-
-		pipeline_key.primitive_type = surf->primitive;
-		RID xforms_uniform_set = surf->owner->transforms_uniform_set;
-		push_constant.shadow_instance_remap_base = omit_main_density ? 0 : inst->density_remap_base;
-		push_constant.shadow_instance_original_id_base = 0;
-		const RendererRD::ShadowInstanceCulling::Draw *culled_draw = selected_lod_draw;
-		if (!culled_draw && p_pass_mode == PASS_MODE_SHADOW && p_params->shadow_cull_draws && p_params->shadow_cull_draws[i].commands.is_valid()) {
-			culled_draw = &p_params->shadow_cull_draws[i];
-		}
-		if (culled_draw) {
-			xforms_uniform_set = culled_draw->transforms;
-			push_constant.shadow_instance_remap_base = culled_draw->remap_base;
-			push_constant.shadow_instance_original_id_base = culled_draw->original_id_base;
-		}
-
-
-		switch (p_pass_mode) {
-			case PASS_MODE_COLOR:
-			case PASS_MODE_COLOR_TRANSPARENT: {
-				if (element_info.uses_lightmap) {
-					pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS;
-				} else {
-					pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS;
-				}
-				if (p_params->defer_opaque_fog) {
-					bool lightmap = pipeline_key.version == SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS || pipeline_key.version == SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW;
-					pipeline_key.version = p_params->view_count > 1 ? (lightmap ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_FOG_MASK_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_FOG_MASK_MULTIVIEW) : (lightmap ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_FOG_MASK : SceneShaderForwardMobile::SHADER_VERSION_COLOR_FOG_MASK);
-				}
-			} break;
-			case PASS_MODE_SHADOW: {
-				pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_SHADOW_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_SHADOW_PASS;
-			} break;
-			case PASS_MODE_SHADOW_DP: {
-				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for shadow DP pass");
-				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_SHADOW_PASS_DP;
-			} break;
-			case PASS_MODE_DEPTH_MATERIAL: {
-				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for material pass");
-				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL;
-			} break;
-			case PASS_MODE_MOTION_VECTORS: {
-				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS_MULTIVIEW;
-			}
-		}
-
-		pipeline_key.framebuffer_format_id = framebuffer_format;
-		pipeline_key.wireframe = p_params->force_wireframe;
-		pipeline_key.render_pass = p_params->subpass;
-		pipeline_key.ubershader = 0;
-
-		bool emulate_point_size = shader->uses_point_size && scene_shader.emulate_point_size;
-
-		const RD::PolygonCullMode cull_mode = shader->get_cull_mode_from_cull_variant(cull_variant);
-		RD::VertexFormatID vertex_format = -1;
-		RID pipeline_rd;
-		RID vertex_array_rd;
-		RID index_array_rd;
-		uint32_t ubershader_iterations = (disable_ubershaders ? 1 : 2);
-		bool pipeline_valid = false;
-		while (pipeline_key.ubershader < ubershader_iterations) {
-			// Skeleton and blend shape.
-			uint64_t input_mask = shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.ubershader);
-			if (surf->owner->mesh_instance.is_valid()) {
-				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, p_pass_mode == PASS_MODE_MOTION_VECTORS, emulate_point_size, vertex_array_rd, vertex_format);
-			} else {
-				mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, p_pass_mode == PASS_MODE_MOTION_VECTORS, emulate_point_size, vertex_array_rd, vertex_format);
+			RenderElementInfo element_info = p_params->element_info[i];
+			const RendererRD::ShadowInstanceCulling::Draw *selected_lod_draw = nullptr;
+			if (lod_draws) {
+				element_info.lod_index = (*lod_draws)[lod_draw_index].lod;
+				selected_lod_draw = &(*lod_draws)[lod_draw_index].draw;
 			}
 
-			pipeline_key.vertex_format_id = vertex_format;
-
-			if (pipeline_key.ubershader) {
-				pipeline_key.shader_specialization = {};
-				pipeline_key.cull_mode = RD::POLYGON_CULL_DISABLED;
-			} else {
-				pipeline_key.shader_specialization = pipeline_specialization;
-				pipeline_key.cull_mode = cull_mode;
-			}
-
-			pipeline_hash = pipeline_key.hash();
-
-			if (shader != prev_shader || pipeline_hash != prev_pipeline_hash) {
-				RSE::PipelineSource pipeline_source = pipeline_key.ubershader ? RSE::PIPELINE_SOURCE_DRAW : RSE::PIPELINE_SOURCE_SPECIALIZATION;
-				pipeline_rd = shader->pipeline_hash_map.get_pipeline(pipeline_key, pipeline_hash, pipeline_key.ubershader == (ubershader_iterations - 1), pipeline_source);
-
-				if (pipeline_rd.is_valid()) {
-					pipeline_valid = true;
-					prev_shader = shader;
-					prev_pipeline_hash = pipeline_hash;
-					break;
-				} else {
-					if (pipeline_key.ubershader == 1) {
-						// If ubershader failed to compile, retry specialized shader and wait for it to finish compilation.
-						// This prevents pop-in at the cost of shader compilation stutters.
-						pipeline_key.ubershader = 0;
-						ubershader_iterations = 1;
-					} else {
-						pipeline_key.ubershader++;
+			if constexpr (p_pass_mode == PASS_MODE_SHADOW) {
+				if (selected_lod_draw || p_params->shadow_cull_draws) {
+					const RendererRD::ShadowInstanceCulling::Draw &draw = selected_lod_draw ? *selected_lod_draw : p_params->shadow_cull_draws[i];
+					RendererRD::ShadowInstanceCulling::trace_cpu_draw(draw, inst->instance_count);
+					if (draw.skip()) {
+						continue;
 					}
 				}
+			}
+
+			SceneShaderForwardMobile::ShaderSpecialization pipeline_specialization = p_params->base_specialization;
+			pipeline_specialization.multimesh = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH);
+			pipeline_specialization.multimesh_format_2d = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D);
+			pipeline_specialization.multimesh_has_color = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR);
+			pipeline_specialization.multimesh_has_custom_data = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_HAS_CUSTOM_DATA);
+
+			SceneState::PushConstant push_constant;
+			push_constant.base_index = i + p_params->element_offset;
+
+			if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL) {
+				push_constant.uv_offset = Math::make_half_float(p_params->uv_offset.y) << 16;
+				push_constant.uv_offset |= Math::make_half_float(p_params->uv_offset.x);
 			} else {
-				// The same pipeline is bound already.
-				pipeline_valid = true;
-				break;
+				push_constant.uv_offset = 0;
 			}
-		}
 
-		if (pipeline_valid) {
-			RendererRD::ShadowInstanceCulling::trace_pipeline(shadow_pass, pipeline_key.ubershader != 0);
-			if (!emulate_point_size) {
-				index_array_rd = mesh_storage->mesh_surface_get_index_array(mesh_surface, element_info.lod_index);
+			if (shadow_pass) {
+				material_uniform_set = surf->material_uniform_set_shadow;
+				shader = surf->shader_shadow;
+				mesh_surface = surf->surface_shadow;
+
 			} else {
-				index_array_rd = RID();
-			}
+				pipeline_specialization.use_light_projector = inst->use_projector;
+				pipeline_specialization.use_light_soft_shadows = inst->use_soft_shadow;
+				pipeline_specialization.omni_lights = SceneShaderForwardMobile::shader_count_for(inst->omni_light_count);
+				pipeline_specialization.spot_lights = SceneShaderForwardMobile::shader_count_for(inst->spot_light_count);
+				pipeline_specialization.area_lights = SceneShaderForwardMobile::shader_count_for(inst->area_light_count);
+				pipeline_specialization.reflection_probes = SceneShaderForwardMobile::shader_count_for(inst->reflection_probe_count);
+				pipeline_specialization.decals = inst->decals_count > 0;
 
-			if (prev_vertex_array_rd != vertex_array_rd) {
-				RD::get_singleton()->draw_list_bind_vertex_array(draw_list, vertex_array_rd);
-				prev_vertex_array_rd = vertex_array_rd;
-			}
-
-			if (prev_index_array_rd != index_array_rd) {
-				if (index_array_rd.is_valid()) {
-					RD::get_singleton()->draw_list_bind_index_array(draw_list, index_array_rd);
+#ifdef DEBUG_ENABLED
+				if (unlikely(get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_LIGHTING)) {
+					material_uniform_set = scene_shader.default_material_uniform_set;
+					shader = scene_shader.default_material_shader_ptr;
+				} else if (unlikely(get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW)) {
+					material_uniform_set = scene_shader.overdraw_material_uniform_set;
+					shader = scene_shader.overdraw_material_shader_ptr;
+				} else if (unlikely(get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_PSSM_SPLITS)) {
+					material_uniform_set = scene_shader.debug_shadow_splits_material_uniform_set;
+					shader = scene_shader.debug_shadow_splits_material_shader_ptr;
+				} else {
+#endif
+					material_uniform_set = surf->material_uniform_set;
+					shader = surf->shader;
+					surf->material->set_as_used();
+#ifdef DEBUG_ENABLED
 				}
-				prev_index_array_rd = index_array_rd;
+#endif
+				mesh_surface = surf->surface;
 			}
 
-			if (!pipeline_rd.is_null()) {
-				RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, pipeline_rd);
+			if (!mesh_surface) {
+				continue;
 			}
 
-			if (xforms_uniform_set.is_valid() && prev_xforms_uniform_set != xforms_uniform_set) {
-				RD::get_singleton()->draw_list_bind_uniform_set(draw_list, xforms_uniform_set, TRANSFORMS_UNIFORM_SET);
-				prev_xforms_uniform_set = xforms_uniform_set;
+			//request a redraw if one of the shaders uses TIME
+			if (shader->uses_time) {
+				should_request_redraw = true;
 			}
 
-			if (material_uniform_set != prev_material_uniform_set) {
-				// Update uniform set.
-				if (material_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(material_uniform_set)) { // Material may not have a uniform set.
-					RD::get_singleton()->draw_list_bind_uniform_set(draw_list, material_uniform_set, MATERIAL_UNIFORM_SET);
-				}
+			//find cull variant
+			SceneShaderForwardMobile::ShaderData::CullVariant cull_variant;
 
-				prev_material_uniform_set = material_uniform_set;
-			}
-
-			if (surf->owner->base_flags & INSTANCE_DATA_FLAG_PARTICLES) {
-				particles_storage->particles_get_instance_buffer_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
-			} else if (surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) {
-				mesh_storage->_multimesh_get_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
+			if (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || ((p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) && surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS)) {
+				cull_variant = SceneShaderForwardMobile::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
 			} else {
-				push_constant.multimesh_motion_vectors_current_offset = 0;
-				push_constant.multimesh_motion_vectors_previous_offset = 0;
+				bool mirror = surf->owner->mirror;
+				if (p_params->reverse_cull) {
+					mirror = !mirror;
+				}
+				cull_variant = mirror ? SceneShaderForwardMobile::ShaderData::CULL_VARIANT_REVERSED : SceneShaderForwardMobile::ShaderData::CULL_VARIANT_NORMAL;
 			}
 
+			pipeline_key.primitive_type = surf->primitive;
+			RID xforms_uniform_set = surf->owner->transforms_uniform_set;
+			push_constant.shadow_instance_remap_base = omit_main_density ? 0 : inst->density_remap_base;
+			push_constant.shadow_instance_original_id_base = 0;
+			const RendererRD::ShadowInstanceCulling::Draw *culled_draw = selected_lod_draw;
+			if (!culled_draw && p_pass_mode == PASS_MODE_SHADOW && p_params->shadow_cull_draws && p_params->shadow_cull_draws[i].commands.is_valid()) {
+				culled_draw = &p_params->shadow_cull_draws[i];
+			}
 			if (culled_draw) {
-				push_constant.multimesh_motion_vectors_current_offset = 0;
-				push_constant.multimesh_motion_vectors_previous_offset = 0;
+				xforms_uniform_set = culled_draw->transforms;
+				push_constant.shadow_instance_remap_base = culled_draw->remap_base;
+				push_constant.shadow_instance_original_id_base = culled_draw->original_id_base;
 			}
 
-			size_t push_constant_size = 0;
-			if (pipeline_key.ubershader) {
-				push_constant_size = sizeof(SceneState::PushConstant);
-				push_constant.ubershader.specialization = pipeline_specialization;
-				push_constant.ubershader.constants = {};
-				push_constant.ubershader.constants.cull_mode = cull_mode;
-			} else {
-				push_constant_size = sizeof(SceneState::PushConstant) - sizeof(SceneState::PushConstantUbershader);
-			}
-
-			RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
-
-			static const bool density_trace = OS::get_singleton()->get_environment("ANGE_SHADOW_TREE_TRACE") == "1";
-			if (density_trace && (inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && !(inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES) && OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE_HOLD") != "1") {
-				Dictionary report;
-				report["frame"] = int64_t(RSG::rasterizer->get_frame_number());
-				report["rid"] = int64_t(inst->data->base.get_id());
-				report["pass"] = int(p_pass_mode);
-				report["allocated_draw_prefix"] = int64_t(inst->instance_count);
-				report["density_draw_count"] = int64_t(density_count);
-				report["remap_base"] = int64_t(push_constant.shadow_instance_remap_base);
-				report["gpu_culled"] = culled_draw != nullptr;
-				print_line("INSTANCE_DENSITY_DRAW " + JSON::stringify(report));
-			}
-			uint32_t instance_count = MIN(surf->owner->instance_count, density_count);
-			instance_count = MAX(instance_count, 1u);
-			if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) {
-				instance_count /= surf->owner->trail_steps;
-			}
-
-			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
-
-			if (emulate_point_size) {
-				if (indirect) {
-					WARN_PRINT("Indirect draws are not supported when emulating point size.");
-				}
-				RD::get_singleton()->draw_list_draw(draw_list, false, mesh_storage->mesh_surface_get_vertex_count(mesh_surface), instance_count * 6);
-				if (render_statistics_frame.is_valid()) {
-					render_statistics_frame->add_draw(shadow_pass, RSE::PRIMITIVE_TRIANGLES, instance_count * 6, mesh_storage->mesh_surface_get_vertex_count(mesh_surface));
-				}
-			} else if (culled_draw) {
-				RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), culled_draw->commands, culled_draw->command_offset, 1, 0);
-				if (render_statistics_frame.is_valid()) {
-					render_statistics_frame->add_draw(shadow_pass, surf->primitive, 0, 0, culled_draw->commands, culled_draw->command_offset);
-				}
-				RendererRD::ShadowInstanceCulling::trace_merged_submission(*culled_draw);
-				if (lod_draws) { RendererRD::ShadowInstanceCulling::trace_lod_submission((*lod_draws)[lod_draw_index]); }
-			} else if (indirect) {
-				RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), mesh_storage->_multimesh_get_command_buffer_rd_rid(surf->owner->data->base), surf->surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE, 1, 0);
-				if (render_statistics_frame.is_valid()) {
-					render_statistics_frame->add_draw(shadow_pass, surf->primitive, 0, 0, mesh_storage->_multimesh_get_command_buffer_rd_rid(surf->owner->data->base), surf->surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE);
-				}
-			} else {
-				RD::get_singleton()->draw_list_draw(draw_list, index_array_rd.is_valid(), instance_count);
-				if (render_statistics_frame.is_valid()) {
-					render_statistics_frame->add_draw(shadow_pass, surf->primitive, mesh_storage->mesh_surface_get_shadow_draw_count(mesh_surface, element_info.lod_index), instance_count);
-				}
-			}
-			if constexpr (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
-				static const bool draw_census = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE") == "1";
-				if (draw_census && OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE_HOLD") != "1") {
-					Dictionary report;
-					report["frame"] = int64_t(RD::get_singleton()->get_frames_drawn());
-					report["element"] = int64_t(i + p_params->element_offset);
-					report["pass_start"] = int64_t(p_params->element_offset);
-					report["owner"] = int64_t(reinterpret_cast<uintptr_t>(surf->owner));
-					report["base"] = int64_t(surf->owner->data->base.get_id());
-					report["surface"] = int64_t(surf->surface_index);
-					report["lod"] = int64_t(element_info.lod_index);
-					report["density_remap_base"] = int64_t(surf->owner->density_remap_base);
-					report["lod_draw"] = lod_draw_index;
-					report["primitive"] = int(surf->primitive);
-					report["geometry_count"] = int64_t(mesh_storage->mesh_surface_get_shadow_draw_count(mesh_surface, element_info.lod_index));
-					report["instances"] = int64_t(instance_count);
-					report["kind"] = emulate_point_size ? "point_emulation" : (culled_draw ? "culled_indirect" : (indirect ? "native_indirect" : "direct"));
-					if (culled_draw) {
-						report["command_buffer"] = int64_t(culled_draw->commands.get_id());
-						report["command_offset"] = int64_t(culled_draw->command_offset);
+			switch (p_pass_mode) {
+				case PASS_MODE_COLOR:
+				case PASS_MODE_COLOR_TRANSPARENT: {
+					if (element_info.uses_lightmap) {
+						pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS;
+					} else {
+						pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS;
 					}
-					print_line("SHADOW_DRAW_CENSUS " + JSON::stringify(report));
+					if (p_params->defer_opaque_fog) {
+						bool lightmap = pipeline_key.version == SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS || pipeline_key.version == SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW;
+						pipeline_key.version = p_params->view_count > 1 ? (lightmap ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_FOG_MASK_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_FOG_MASK_MULTIVIEW) : (lightmap ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_FOG_MASK : SceneShaderForwardMobile::SHADER_VERSION_COLOR_FOG_MASK);
+					}
+				} break;
+				case PASS_MODE_SHADOW: {
+					pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_SHADOW_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_SHADOW_PASS;
+				} break;
+				case PASS_MODE_SHADOW_DP: {
+					ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for shadow DP pass");
+					pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_SHADOW_PASS_DP;
+				} break;
+				case PASS_MODE_DEPTH_MATERIAL: {
+					ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for material pass");
+					pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL;
+				} break;
+				case PASS_MODE_MOTION_VECTORS: {
+					pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS_MULTIVIEW;
 				}
 			}
-		}
+
+			pipeline_key.framebuffer_format_id = framebuffer_format;
+			pipeline_key.wireframe = p_params->force_wireframe;
+			pipeline_key.render_pass = p_params->subpass;
+			pipeline_key.ubershader = 0;
+
+			bool emulate_point_size = shader->uses_point_size && scene_shader.emulate_point_size;
+
+			const RD::PolygonCullMode cull_mode = shader->get_cull_mode_from_cull_variant(cull_variant);
+			RD::VertexFormatID vertex_format = -1;
+			RID pipeline_rd;
+			RID vertex_array_rd;
+			RID index_array_rd;
+			uint32_t ubershader_iterations = (disable_ubershaders ? 1 : 2);
+			bool pipeline_valid = false;
+			while (pipeline_key.ubershader < ubershader_iterations) {
+				// Skeleton and blend shape.
+				uint64_t input_mask = shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.ubershader);
+				if (surf->owner->mesh_instance.is_valid()) {
+					mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, p_pass_mode == PASS_MODE_MOTION_VECTORS, emulate_point_size, vertex_array_rd, vertex_format);
+				} else {
+					mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, p_pass_mode == PASS_MODE_MOTION_VECTORS, emulate_point_size, vertex_array_rd, vertex_format);
+				}
+
+				pipeline_key.vertex_format_id = vertex_format;
+
+				if (pipeline_key.ubershader) {
+					pipeline_key.shader_specialization = {};
+					pipeline_key.cull_mode = RD::POLYGON_CULL_DISABLED;
+				} else {
+					pipeline_key.shader_specialization = pipeline_specialization;
+					pipeline_key.cull_mode = cull_mode;
+				}
+
+				pipeline_hash = pipeline_key.hash();
+
+				if (shader != prev_shader || pipeline_hash != prev_pipeline_hash) {
+					RSE::PipelineSource pipeline_source = pipeline_key.ubershader ? RSE::PIPELINE_SOURCE_DRAW : RSE::PIPELINE_SOURCE_SPECIALIZATION;
+					pipeline_rd = shader->pipeline_hash_map.get_pipeline(pipeline_key, pipeline_hash, pipeline_key.ubershader == (ubershader_iterations - 1), pipeline_source);
+
+					if (pipeline_rd.is_valid()) {
+						pipeline_valid = true;
+						prev_shader = shader;
+						prev_pipeline_hash = pipeline_hash;
+						break;
+					} else {
+						if (pipeline_key.ubershader == 1) {
+							// If ubershader failed to compile, retry specialized shader and wait for it to finish compilation.
+							// This prevents pop-in at the cost of shader compilation stutters.
+							pipeline_key.ubershader = 0;
+							ubershader_iterations = 1;
+						} else {
+							pipeline_key.ubershader++;
+						}
+					}
+				} else {
+					// The same pipeline is bound already.
+					pipeline_valid = true;
+					break;
+				}
+			}
+
+			if (pipeline_valid) {
+				RendererRD::ShadowInstanceCulling::trace_pipeline(shadow_pass, pipeline_key.ubershader != 0);
+				if (!emulate_point_size) {
+					index_array_rd = mesh_storage->mesh_surface_get_index_array(mesh_surface, element_info.lod_index);
+				} else {
+					index_array_rd = RID();
+				}
+
+				if (prev_vertex_array_rd != vertex_array_rd) {
+					RD::get_singleton()->draw_list_bind_vertex_array(draw_list, vertex_array_rd);
+					prev_vertex_array_rd = vertex_array_rd;
+				}
+
+				if (prev_index_array_rd != index_array_rd) {
+					if (index_array_rd.is_valid()) {
+						RD::get_singleton()->draw_list_bind_index_array(draw_list, index_array_rd);
+					}
+					prev_index_array_rd = index_array_rd;
+				}
+
+				if (!pipeline_rd.is_null()) {
+					RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, pipeline_rd);
+				}
+
+				if (xforms_uniform_set.is_valid() && prev_xforms_uniform_set != xforms_uniform_set) {
+					RD::get_singleton()->draw_list_bind_uniform_set(draw_list, xforms_uniform_set, TRANSFORMS_UNIFORM_SET);
+					prev_xforms_uniform_set = xforms_uniform_set;
+				}
+
+				if (material_uniform_set != prev_material_uniform_set) {
+					// Update uniform set.
+					if (material_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(material_uniform_set)) { // Material may not have a uniform set.
+						RD::get_singleton()->draw_list_bind_uniform_set(draw_list, material_uniform_set, MATERIAL_UNIFORM_SET);
+					}
+
+					prev_material_uniform_set = material_uniform_set;
+				}
+
+				if (surf->owner->base_flags & INSTANCE_DATA_FLAG_PARTICLES) {
+					particles_storage->particles_get_instance_buffer_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
+				} else if (surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) {
+					mesh_storage->_multimesh_get_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
+				} else {
+					push_constant.multimesh_motion_vectors_current_offset = 0;
+					push_constant.multimesh_motion_vectors_previous_offset = 0;
+				}
+
+				if (culled_draw) {
+					push_constant.multimesh_motion_vectors_current_offset = 0;
+					push_constant.multimesh_motion_vectors_previous_offset = 0;
+				}
+
+				size_t push_constant_size = 0;
+				if (pipeline_key.ubershader) {
+					push_constant_size = sizeof(SceneState::PushConstant);
+					push_constant.ubershader.specialization = pipeline_specialization;
+					push_constant.ubershader.constants = {};
+					push_constant.ubershader.constants.cull_mode = cull_mode;
+				} else {
+					push_constant_size = sizeof(SceneState::PushConstant) - sizeof(SceneState::PushConstantUbershader);
+				}
+
+				RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
+
+				static const bool density_trace = OS::get_singleton()->get_environment("ANGE_SHADOW_TREE_TRACE") == "1";
+				if (density_trace && (inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && !(inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES) && OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE_HOLD") != "1") {
+					Dictionary report;
+					report["frame"] = int64_t(RSG::rasterizer->get_frame_number());
+					report["rid"] = int64_t(inst->data->base.get_id());
+					report["pass"] = int(p_pass_mode);
+					report["allocated_draw_prefix"] = int64_t(inst->instance_count);
+					report["density_draw_count"] = int64_t(density_count);
+					report["remap_base"] = int64_t(push_constant.shadow_instance_remap_base);
+					report["gpu_culled"] = culled_draw != nullptr;
+					print_line("INSTANCE_DENSITY_DRAW " + JSON::stringify(report));
+				}
+				uint32_t instance_count = MIN(surf->owner->instance_count, density_count);
+				instance_count = MAX(instance_count, 1u);
+				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) {
+					instance_count /= surf->owner->trail_steps;
+				}
+
+				bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
+
+				if (emulate_point_size) {
+					if (indirect) {
+						WARN_PRINT("Indirect draws are not supported when emulating point size.");
+					}
+					RD::get_singleton()->draw_list_draw(draw_list, false, mesh_storage->mesh_surface_get_vertex_count(mesh_surface), instance_count * 6);
+					if (render_statistics_frame.is_valid()) {
+						render_statistics_frame->add_draw(shadow_pass, RSE::PRIMITIVE_TRIANGLES, instance_count * 6, mesh_storage->mesh_surface_get_vertex_count(mesh_surface));
+					}
+				} else if (culled_draw) {
+					RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), culled_draw->commands, culled_draw->command_offset, 1, 0);
+					if (render_statistics_frame.is_valid()) {
+						render_statistics_frame->add_draw(shadow_pass, surf->primitive, 0, 0, culled_draw->commands, culled_draw->command_offset);
+					}
+					RendererRD::ShadowInstanceCulling::trace_merged_submission(*culled_draw);
+					if (lod_draws) {
+						RendererRD::ShadowInstanceCulling::trace_lod_submission((*lod_draws)[lod_draw_index]);
+					}
+				} else if (indirect) {
+					RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), mesh_storage->_multimesh_get_command_buffer_rd_rid(surf->owner->data->base), surf->surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE, 1, 0);
+					if (render_statistics_frame.is_valid()) {
+						render_statistics_frame->add_draw(shadow_pass, surf->primitive, 0, 0, mesh_storage->_multimesh_get_command_buffer_rd_rid(surf->owner->data->base), surf->surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE);
+					}
+				} else {
+					RD::get_singleton()->draw_list_draw(draw_list, index_array_rd.is_valid(), instance_count);
+					if (render_statistics_frame.is_valid()) {
+						render_statistics_frame->add_draw(shadow_pass, surf->primitive, mesh_storage->mesh_surface_get_shadow_draw_count(mesh_surface, element_info.lod_index), instance_count);
+					}
+				}
+				if constexpr (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
+					static const bool draw_census = OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE") == "1";
+					if (draw_census && OS::get_singleton()->get_environment("ANGE_SHADOW_CULL_TRACE_HOLD") != "1") {
+						Dictionary report;
+						report["frame"] = int64_t(RD::get_singleton()->get_frames_drawn());
+						report["element"] = int64_t(i + p_params->element_offset);
+						report["pass_start"] = int64_t(p_params->element_offset);
+						report["owner"] = int64_t(reinterpret_cast<uintptr_t>(surf->owner));
+						report["base"] = int64_t(surf->owner->data->base.get_id());
+						report["surface"] = int64_t(surf->surface_index);
+						report["lod"] = int64_t(element_info.lod_index);
+						report["density_remap_base"] = int64_t(surf->owner->density_remap_base);
+						report["lod_draw"] = lod_draw_index;
+						report["primitive"] = int(surf->primitive);
+						report["geometry_count"] = int64_t(mesh_storage->mesh_surface_get_shadow_draw_count(mesh_surface, element_info.lod_index));
+						report["instances"] = int64_t(instance_count);
+						report["kind"] = emulate_point_size ? "point_emulation" : (culled_draw ? "culled_indirect" : (indirect ? "native_indirect" : "direct"));
+						if (culled_draw) {
+							report["command_buffer"] = int64_t(culled_draw->commands.get_id());
+							report["command_offset"] = int64_t(culled_draw->command_offset);
+						}
+						print_line("SHADOW_DRAW_CENSUS " + JSON::stringify(report));
+					}
+				}
+			}
 		} // Per-surface LOD commands reuse the current material/pipeline state.
 	}
 
