@@ -58,6 +58,7 @@ jobs:
               use_asan=yes
               use_ubsan=yes
               linker=mold
+              linkflags=-Wl,--gc-sections,-Map=bin/godot-double.map
             bin: ./bin/godot.linuxbsd.editor.dev.double.x86_64.san
             proj-test: true
             free-space: true
@@ -184,6 +185,7 @@ jobs:
         uses: rui314/setup-mold@v1
 
       - name: Compilation
+        id: compilation
         uses: ./.github/actions/godot-build
         with:
           scons-flags: ${{ env.SCONS_FLAGS }} ${{ matrix.scons-flags }} accesskit=${{ steps.accesskit-sdk.outputs.ACCESSKIT_ENABLED }}
@@ -205,9 +207,18 @@ jobs:
           godot-cpp-branch: ${{ env.GODOT_CPP_BRANCH }}
 
       - name: Save Godot build cache
+        if: ${{ !cancelled() && (success() || (matrix.cache-name == 'linux-editor-double-sanitizers' && steps.compilation.outcome == 'failure')) }}
         uses: ./.github/actions/godot-cache-save
         with:
           cache-name: ${{ matrix.cache-name }}
+        continue-on-error: true
+
+      - name: Upload double-sanitizer link map
+        if: ${{ !cancelled() && matrix.cache-name == 'linux-editor-double-sanitizers' }}
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: linux-editor-double-link-map
+          path: bin/godot-double.map
         continue-on-error: true
 
       - name: Generate C# glue
@@ -239,6 +250,14 @@ jobs:
           ${{ matrix.bin }} --version
           ${{ matrix.bin }} --help
           ${{ matrix.bin }} --headless --test --force-colors
+
+      - name: Soft-body regression with extended fixture
+        if: matrix.cache-name == 'linux-editor-double-sanitizers'
+        env:
+          ASAN_OPTIONS: ${{ env.ASAN_OPTIONS }}:halt_on_error=1
+          UBSAN_OPTIONS: ${{ env.UBSAN_OPTIONS }}:halt_on_error=1:print_stacktrace=1
+        run: |
+          ${{ matrix.bin }} --headless --test '--test-suite=[JoltSoftBody*]' --no-skip --order-by=rand --rand-seed=158
 
       - name: .NET source generators tests
         if: matrix.build-mono
