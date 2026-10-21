@@ -340,6 +340,8 @@ layout(set = 0, binding = 15) uniform texture2D ltc_lut1;
 layout(set = 0, binding = 16) uniform texture2D ltc_lut2;
 
 layout(set = 0, binding = 17) uniform texture2D area_light_atlas;
+layout(set = 0, binding = 18) uniform texture2D baked_directional_depth[8];
+layout(set = 0, binding = 19) uniform texture2D baked_directional_visibility[8];
 
 /* Set 1: Render Pass (changes per render pass) */
 

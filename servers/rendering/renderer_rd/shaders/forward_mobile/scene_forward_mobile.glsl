@@ -948,6 +948,7 @@ vec4 textureArray_bicubic(texture2DArray tex, vec3 uv, vec2 texture_size) {
 	return (g0(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p0, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p1, uv.z)))) +
 			(g1(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p2, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p3, uv.z))));
 }
+
 #endif //USE_LIGHTMAP
 
 #ifdef USE_MULTIVIEW
@@ -1040,6 +1041,7 @@ layout(location = 1) out float fog_eligibility;
 #endif
 
 #include "../scene_forward_lights_inc.glsl"
+#include "../baked_directional_shadow_inc.glsl"
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && !defined(USE_VERTEX_LIGHTING)
 
@@ -2103,12 +2105,26 @@ void main() {
 					}
 #endif
 
-#ifdef USE_VERTEX_LIGHTING
-					diffuse_light *= mix(half(1.0), shadow, half(diffuse_light_interp.a));
-					direct_specular_light *= mix(half(1.0), shadow, half(specular_light_interp.a));
-#endif
+
 #undef BIAS_FUNC
 				}
+
+#ifdef USE_LIGHTMAP
+				if (shadowmask_mode == LIGHTMAP_SHADOWMASK_MODE_NONE)
+#endif
+				{
+					half baked_shadow = half(sample_baked_directional_shadow(i, vertex, instances.data[draw_call.instance_index].layer_mask));
+#ifdef USE_VERTEX_LIGHTING
+					// Preserve existing realtime/LightmapGI vertex attenuation exactly.
+					baked_shadow = mix(half(1.0), baked_shadow, half(directional_lights.data[i].shadow_opacity));
+#endif
+					shadow = min(shadow, baked_shadow);
+				}
+#ifdef USE_VERTEX_LIGHTING
+				half vertex_shadow = shadow;
+				diffuse_light *= mix(half(1.0), vertex_shadow, half(diffuse_light_interp.a));
+				direct_specular_light *= mix(half(1.0), vertex_shadow, half(specular_light_interp.a));
+#endif
 
 				shadows[i] = shadow;
 			}

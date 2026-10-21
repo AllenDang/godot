@@ -2523,6 +2523,8 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("light_set_param", "light", "param", "value"), &RenderingServer::light_set_param);
 	ClassDB::bind_method(D_METHOD("light_set_shadow", "light", "enabled"), &RenderingServer::light_set_shadow);
 	ClassDB::bind_method(D_METHOD("light_set_projector", "light", "texture"), &RenderingServer::light_set_projector);
+	ClassDB::bind_method(D_METHOD("light_directional_set_baked_shadow", "light", "image", "world_to_light", "projection", "coverage", "options"), &RenderingServer::light_directional_set_baked_shadow);
+	ClassDB::bind_method(D_METHOD("light_directional_set_baked_visibility", "light", "texture", "receiver_mask"), &RenderingServer::light_directional_set_baked_visibility);
 	ClassDB::bind_method(D_METHOD("light_set_negative", "light", "enable"), &RenderingServer::light_set_negative);
 	ClassDB::bind_method(D_METHOD("light_set_cull_mask", "light", "mask"), &RenderingServer::light_set_cull_mask);
 	ClassDB::bind_method(D_METHOD("light_set_distance_fade", "decal", "enabled", "begin", "shadow", "length"), &RenderingServer::light_set_distance_fade);
