@@ -32,6 +32,8 @@
 
 #include "core/config/engine.h"
 #include "core/math/math_funcs.h"
+#include "core/templates/hash_set.h"
+#include "core/templates/span.h"
 
 #include <algorithm>
 #include <array>

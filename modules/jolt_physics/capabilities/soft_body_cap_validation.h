@@ -33,9 +33,7 @@
 #include "soft_body_cap_state.h"
 
 #include "core/math/transform_3d.h"
-#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
-#include "core/templates/span.h"
 #include "core/variant/dictionary.h"
 
 namespace SoftBodyCapValidation {

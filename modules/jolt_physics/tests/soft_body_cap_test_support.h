@@ -34,11 +34,8 @@
 
 #include "core/config/project_settings.h"
 #include "core/object/callable_mp.h"
-#include "core/object/class_db.h"
 #include "core/variant/typed_array.h"
 #include "servers/physics_3d/physics_server_3d.h"
-#include "servers/physics_3d/physics_server_3d_dummy.h"
-#include "servers/physics_3d/physics_server_3d_extension.h"
 #include "servers/rendering/rendering_server.h"
 #include "tests/test_macros.h"
 

@@ -32,6 +32,10 @@
 
 #include "soft_body_cap_test_support.h"
 
+#include "core/object/class_db.h"
+#include "servers/physics_3d/physics_server_3d_dummy.h"
+#include "servers/physics_3d/physics_server_3d_extension.h"
+
 #include <cmath>
 
 namespace TestJoltSoftBodyCap {

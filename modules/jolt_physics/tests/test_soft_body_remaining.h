@@ -35,7 +35,9 @@
 
 #include "core/io/file_access.h"
 #include "core/io/json.h"
+#include "core/templates/hash_set.h"
 #include "servers/physics_3d/physics_server_3d.h"
+#include "servers/physics_3d/physics_server_3d_dummy.h"
 #include "servers/physics_3d/physics_server_3d_wrap_mt.h"
 #include "tests/test_utils.h"
 

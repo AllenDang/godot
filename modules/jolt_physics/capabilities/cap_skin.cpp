@@ -33,6 +33,8 @@
 #include "soft_body_cap_validation.h"
 #include "soft_body_capability.h"
 
+#include "core/templates/hash_set.h"
+
 #include <Jolt/Physics/SoftBody/SoftBodyMotionProperties.h>
 
 #include <cfloat>
