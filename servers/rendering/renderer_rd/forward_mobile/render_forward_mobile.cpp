@@ -1271,7 +1271,33 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 		bool fog_requested = rb_data.is_valid() && (!copy_canvas || !is_multiview) && ce_has_pre_transparent && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_POST_OPAQUE_FOG, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT);
 		RID next_radiance = p_render_data->environment.is_valid() ? sky.sky_get_next_radiance_texture_rd(environment_get_sky(p_render_data->environment), false) : RID();
 		bool defer_fog = rb_data.is_valid() && mobile_fog.prepare(p_render_data, fog_requested, radiance_texture, next_radiance, aerial_perspective.get_texture(0), aerial_perspective.get_texture(1), is_using_radiance_octmap_array(), get_roughness_layers(), 1.0f / inverse_luminance_multiplier);
-		RID opaque_framebuffer = defer_fog ? mobile_fog.get_framebuffer(rb, resolve_depth_buffer) : framebuffer;
+		// AO reads MSAA depth directly. Resolve opaque color only when a
+		// pre-transparent effect needs it; fog composition resolves the final
+		// color before transparent screen-texture copies and post-processing.
+		bool resolve_opaque_color = use_msaa && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_COLOR, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT);
+		RID opaque_framebuffer = defer_fog ? mobile_fog.get_framebuffer(rb, resolve_depth_buffer, resolve_opaque_color) : framebuffer;
+		if (defer_fog) {
+			const RD::FramebufferFormatID fog_format = RD::get_singleton()->framebuffer_get_format(opaque_framebuffer);
+			bool added_format = false;
+			{
+				MutexLock lock(fog_pipeline_formats_mutex);
+				bool found_format = false;
+				for (const Pair<RD::FramebufferFormatID, uint32_t> &format : fog_pipeline_framebuffer_formats) {
+					if (format.first == fog_format) {
+						found_format = true;
+						break;
+					}
+				}
+				if (!found_format) {
+					fog_pipeline_framebuffer_formats.push_back({ fog_format, p_render_data->scene_data->view_count });
+					added_format = true;
+				}
+			}
+			if (added_format) {
+				fog_pipeline_formats_dirty = true;
+				_update_dirty_geometry_pipelines();
+			}
+		}
 
 		// Set clear colors.
 		Vector<Color> c;
@@ -3501,6 +3527,29 @@ void RenderForwardMobile::_mesh_compile_pipelines_for_surface(const SurfacePipel
 		}
 	}
 
+	if (p_surface.uses_opaque) {
+		// Resource loaders can compile meshes while the render thread learns a
+		// new format. Keep this COW snapshot stable without locking compilation.
+		Vector<Pair<RD::FramebufferFormatID, uint32_t>> fog_formats;
+		{
+			MutexLock lock(fog_pipeline_formats_mutex);
+			fog_formats = fog_pipeline_framebuffer_formats;
+		}
+		for (const Pair<RD::FramebufferFormatID, uint32_t> &fog_format : fog_formats) {
+			const bool multiview = fog_format.second > 1;
+			if (multiview && !multiview_enabled) {
+				continue;
+			}
+			pipeline_key.framebuffer_format_id = fog_format.first;
+			pipeline_key.version = multiview ? SceneShaderForwardMobile::SHADER_VERSION_COLOR_FOG_MASK_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_FOG_MASK;
+			_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+			if (p_global.use_lightmaps && p_surface.can_use_lightmap) {
+				pipeline_key.version = multiview ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_FOG_MASK_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_FOG_MASK;
+				_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+			}
+		}
+	}
+
 	if (p_global.use_reflection_probes) {
 		pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS;
 		pipeline_key.framebuffer_format_id = _get_reflection_probe_color_framebuffer_format_for_pipeline(octmap_use_storage);
@@ -3560,7 +3609,7 @@ void RenderForwardMobile::_update_dirty_geometry_instances() {
 }
 
 void RenderForwardMobile::_update_dirty_geometry_pipelines() {
-	if (global_pipeline_data_required.key != global_pipeline_data_compiled.key) {
+	if (global_pipeline_data_required.key != global_pipeline_data_compiled.key || fog_pipeline_formats_dirty) {
 		// Go through the entire list of surfaces and compile pipelines for everything again.
 		SelfList<GeometryInstanceSurfaceDataCache> *list = geometry_surface_compilation_all_list.first();
 		while (list != nullptr) {
@@ -3576,6 +3625,7 @@ void RenderForwardMobile::_update_dirty_geometry_pipelines() {
 		}
 
 		global_pipeline_data_compiled.key = global_pipeline_data_required.key;
+		fog_pipeline_formats_dirty = false;
 	} else {
 		// Compile pipelines only for the dirty list.
 		if (!geometry_surface_compilation_dirty_list.first()) {

@@ -706,6 +706,12 @@ public:
 	GlobalPipelineData global_pipeline_data_compiled = {};
 	GlobalPipelineData global_pipeline_data_required = {};
 
+	// MobileFog owns these exact framebuffer layouts. Warm their opaque masks
+	// through the same mesh/surface path before a new receiver becomes visible.
+	Mutex fog_pipeline_formats_mutex;
+	Vector<Pair<RD::FramebufferFormatID, uint32_t>> fog_pipeline_framebuffer_formats;
+	bool fog_pipeline_formats_dirty = false;
+
 	typedef Pair<SceneShaderForwardMobile::ShaderData *, SceneShaderForwardMobile::ShaderData::PipelineKey> ShaderPipelinePair;
 
 	void _update_global_pipeline_data_requirements_from_project();
