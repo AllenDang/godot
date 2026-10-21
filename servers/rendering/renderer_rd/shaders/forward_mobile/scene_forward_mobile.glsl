@@ -1397,7 +1397,9 @@ void main() {
 	alpha = half(1.0);
 #endif
 
-#ifdef ALPHA_ANTIALIASING_EDGE_USED
+// Material capture stores opacity for ray tracing, not MSAA sample coverage.
+// Preserve the native scissor/hash result instead of widening it in UV space.
+#if defined(ALPHA_ANTIALIASING_EDGE_USED) && !defined(MODE_RENDER_MATERIAL)
 // If alpha scissor is used, we must further the edge threshold, otherwise we won't get any edge feather
 #ifdef ALPHA_SCISSOR_USED
 	alpha_antialiasing_edge = clamp(alpha_scissor_threshold + alpha_antialiasing_edge, half(0.0), half(1.0));

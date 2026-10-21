@@ -395,12 +395,15 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 
 	RD::PipelineColorBlendState blend_state;
 	if (uses_alpha || uses_blend_alpha) {
-		// These flags should only go through if we have some form of MSAA.
-		if (alpha_antialiasing_mode == ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE) {
-			multisample_state.enable_alpha_to_coverage = true;
-		} else if (alpha_antialiasing_mode == ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE_AND_TO_ONE) {
-			multisample_state.enable_alpha_to_coverage = true;
-			multisample_state.enable_alpha_to_one = true;
+		// Material capture must write zero opacity texels as well. Alpha-to-
+		// coverage would suppress those writes and retain UV padding samples.
+		if (p_pipeline_key.version != SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL) {
+			if (alpha_antialiasing_mode == ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE) {
+				multisample_state.enable_alpha_to_coverage = true;
+			} else if (alpha_antialiasing_mode == ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE_AND_TO_ONE) {
+				multisample_state.enable_alpha_to_coverage = true;
+				multisample_state.enable_alpha_to_one = true;
+			}
 		}
 
 		if (p_pipeline_key.version == SHADER_VERSION_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS_MULTIVIEW) {
