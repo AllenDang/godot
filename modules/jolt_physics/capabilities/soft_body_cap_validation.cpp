@@ -30,6 +30,8 @@
 
 #include "soft_body_cap_validation.h"
 
+#include "../misc/jolt_type_conversions.h"
+
 #include "core/config/engine.h"
 #include "core/math/math_funcs.h"
 #include "core/templates/hash_set.h"
@@ -53,11 +55,11 @@ bool fail(String *r_error, const char *p_code, const String &p_field, const Stri
 
 bool finite_float(double p_value, float &r_value, String *r_error, const String &p_field, bool p_positive) {
 	if (!std::isfinite(p_value) || std::abs(p_value) > FLT_MAX) {
-		return fail(r_error, "SBREM-VALUE", p_field, vformat("%s is not finite float32", p_value));
+		return fail(r_error, "SBREM-VALUE", p_field, vformat("%s is not finite float32", String::num_scientific(p_value)));
 	}
 	r_value = (float)p_value;
 	if (p_positive && !(r_value > 0.0f)) {
-		return fail(r_error, "SBREM-VALUE", p_field, vformat("%s must remain positive in float32", p_value));
+		return fail(r_error, "SBREM-VALUE", p_field, vformat("%s must remain positive in float32", String::num_scientific(p_value)));
 	}
 	return true;
 }
@@ -99,7 +101,7 @@ bool matrix(const Variant &p_value, String *r_error, const String &p_field) {
 	}
 	const Basis &b = transform.basis;
 	const double det = double(b[0][0]) * (double(b[1][1]) * b[2][2] - double(b[1][2]) * b[2][1]) - double(b[0][1]) * (double(b[1][0]) * b[2][2] - double(b[1][2]) * b[2][0]) + double(b[0][2]) * (double(b[1][0]) * b[2][1] - double(b[1][1]) * b[2][0]);
-	return determinant(det) || fail(r_error, "SBREM-VALUE", p_field, vformat("determinant %s requires abs(det) > 1e-12", det));
+	return determinant(det) || fail(r_error, "SBREM-VALUE", p_field, vformat("determinant %s requires abs(det) > 1e-12", String::num_scientific(det)));
 }
 
 Variant snapshot(const Variant &p_value) {
@@ -156,7 +158,7 @@ bool check_numeric(double p_value, const Field &p_field, String *r_error, const 
 		return false;
 	}
 	if (p_value < p_field.minimum || p_value > p_field.maximum) {
-		return fail(r_error, "SBREM-VALUE", p_path, vformat("%s outside [%s, %s]", p_value, p_field.minimum, p_field.maximum));
+		return fail(r_error, "SBREM-VALUE", p_path, vformat("%s outside [%s, %s]", String::num_scientific(p_value), String::num_scientific(p_field.minimum), String::num_scientific(p_field.maximum)));
 	}
 	return true;
 }
@@ -315,13 +317,13 @@ bool schema(const JoltSoftBodyCapState &p_state, const String &p_key, String *r_
 			}
 			const float weight = weights[index];
 			if (!Math::is_finite(weight) || weight < 0 || (terminated && weight != 0)) {
-				return fail(r_error, "SBREM-VALUE", p_key + vformat(".joint_weights[%d]", index), vformat("invalid weight %s or nonzero after terminator", weight));
+				return fail(r_error, "SBREM-VALUE", p_key + vformat(".joint_weights[%d]", index), vformat("invalid weight %s or nonzero after terminator", String::num_scientific(weight)));
 			}
 			terminated |= weight == 0;
 			sum += weight;
 		}
 		if (std::abs(sum - 1.0) > 1.0e-5) {
-			return fail(r_error, "SBREM-VALUE", p_key + vformat(".joint_weights[%d..%d]", i * 4, i * 4 + 3), vformat("sum %s differs from 1 by more than 1e-5", sum));
+			return fail(r_error, "SBREM-VALUE", p_key + vformat(".joint_weights[%d..%d]", i * 4, i * 4 + 3), vformat("sum %s differs from 1 by more than 1e-5", String::num_scientific(sum)));
 		}
 	}
 	for (int i = 0; i < binds.size(); ++i) {
@@ -352,7 +354,7 @@ bool column(const Dictionary &p_config, const String &p_field, double p_default,
 		}
 		if (owners.has(physics)) {
 			if (r_values[physics] != number) {
-				return fail(r_error, "SBREM-ALIAS", p_field, vformat("source vertices %d and %d disagree (%s vs %s)", owners[physics], source, r_values[physics], number));
+				return fail(r_error, "SBREM-ALIAS", p_field, vformat("source vertices %d and %d disagree (%s vs %s)", owners[physics], source, String::num_scientific(r_values[physics]), String::num_scientific(number)));
 			}
 		} else {
 			owners[physics] = source;
@@ -437,7 +439,7 @@ bool volume_topology(const Dictionary &p_config, PackedInt32Array &r_tetrahedra,
 			return fail(r_error, "SBREM-VALUE", vformat("volume/config.tetrahedra[%d]", offset), "derived determinant or length is nonfinite");
 		}
 		if (!volume_determinant_valid(det, max_edge_sq)) {
-			return fail(r_error, "SBREM-TOPOLOGY", vformat("volume/config.tetrahedra[%d]", offset), vformat("abs(det) %s must exceed %s", std::abs(det), threshold));
+			return fail(r_error, "SBREM-TOPOLOGY", vformat("volume/config.tetrahedra[%d]", offset), vformat("abs(det) %s must exceed %s", String::num_scientific(std::abs(det)), String::num_scientific(threshold)));
 		}
 		float converted;
 		if (!finite_float(std::abs(det), converted, r_error, vformat("volume/config.tetrahedra[%d].determinant", offset))) {
@@ -514,12 +516,14 @@ bool skin_targets(const JoltSoftBodyCapState &p_state, const Array &p_pose, cons
 	if (!p_frame.is_finite()) {
 		return fail(r_error, code, "skin/pose." + p_stage, "body COM frame is nonfinite");
 	}
-	const Transform3D inverse_frame = p_frame.affine_inverse();
-	LocalVector<Transform3D> transforms;
+	const auto inverse_frame = to_jolt_r(p_frame.affine_inverse());
+	// Jolt skin matrices and targets remain float32 in double-precision worlds.
+	// Validate their actual arithmetic before committing a config or pose write.
+	LocalVector<JPH::Mat44> transforms;
 	for (int joint = 0; joint < p_pose.size(); ++joint) {
-		const Transform3D local = inverse_frame * Transform3D(p_pose[joint]);
-		const Transform3D combined = local * Transform3D(p_state.skin_inv_bind[joint]);
-		if (!local.is_finite() || !combined.is_finite()) {
+		const JPH::Mat44 local = (inverse_frame * to_jolt_r(Transform3D(p_pose[joint]))).ToMat44();
+		const JPH::Mat44 combined = local * to_jolt(Transform3D(p_state.skin_inv_bind[joint]));
+		if (!to_godot(local).is_finite() || !to_godot(combined).is_finite()) {
 			return fail(r_error, code, vformat("skin/pose.%s.joint[%d]", p_stage, joint), "COM-local matrix or inverse-bind product is nonfinite");
 		}
 		transforms.push_back(combined);
@@ -531,15 +535,15 @@ bool skin_targets(const JoltSoftBodyCapState &p_state, const Array &p_pose, cons
 		if (tuple < 0) {
 			continue;
 		}
-		Vector3 target;
+		JPH::Vec3 target = JPH::Vec3::sZero();
 		for (int slot = 0; slot < 4; ++slot) {
 			const int entry = 4 * tuple + slot;
 			if (weights[entry] == 0) {
 				break;
 			}
-			const Vector3 transformed = transforms[indices[entry]].xform(p_state.skin_bind_points[vertex]);
+			const JPH::Vec3 transformed = transforms[indices[entry]] * to_jolt(p_state.skin_bind_points[vertex]);
 			target += transformed * weights[entry];
-			if (!transformed.is_finite() || !target.is_finite()) {
+			if (!to_godot(transformed).is_finite() || !to_godot(target).is_finite()) {
 				return fail(r_error, code, vformat("skin/pose.%s.vertex[%d].joint[%d]", p_stage, vertex, indices[entry]), "weighted target is nonfinite");
 			}
 		}
@@ -562,7 +566,7 @@ bool mesh_family(const JoltSoftBodyCapState &p_state) {
 
 bool typed(const JoltSoftBodyCapState &p_state, float p_mass, int p_precision, float p_stiffness, bool p_mesh, int p_vertices, float &r_inverse_mass, float &r_base, String *r_error) {
 	if (!Math::is_finite(p_mass) || p_mass <= 0 || p_precision < 1 || !Math::is_finite(p_stiffness) || p_stiffness < 0 || p_stiffness > 1 || (p_mesh && p_stiffness == 0)) {
-		return fail(r_error, "SBREM-CONTEXT", "typed", vformat("mass %s, precision %d, stiffness %s, mesh %s", p_mass, p_precision, p_stiffness, p_mesh));
+		return fail(r_error, "SBREM-CONTEXT", "typed", vformat("mass %s, precision %d, stiffness %s, mesh %s", String::num_scientific(p_mass), p_precision, String::num_scientific(p_stiffness), p_mesh));
 	}
 	r_inverse_mass = 0;
 	r_base = 0;
@@ -578,7 +582,7 @@ bool typed(const JoltSoftBodyCapState &p_state, float p_mass, int p_precision, f
 		const double dt = 1.0 / hz / p_precision;
 		const double base = dt * dt * (1.0 / p_stiffness - 1.0) * (2.0 * p_vertices / p_mass);
 		if (hz <= 0 || base < 0 || !finite_float(base, r_base, &error, "compliance")) {
-			return fail(r_error, "SBREM-CONTEXT", "typed.compliance", vformat("physics_hz %s: %s", hz, error));
+			return fail(r_error, "SBREM-CONTEXT", "typed.compliance", vformat("physics_hz %s: %s", String::num_scientific(hz), error));
 		}
 	}
 	return true;

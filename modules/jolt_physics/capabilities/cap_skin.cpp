@@ -196,7 +196,7 @@ bool pre_step(const JoltSoftBodyCapState &p_state, JPH::Body &r_body, float, JPH
 	LocalVector<JPH::Mat44> local;
 	const auto inverse_com = com.InversedRotationTranslation();
 	for (int joint = 0; joint < pose.size(); ++joint) {
-		local.push_back(inverse_com * to_jolt(Transform3D(pose[joint])));
+		local.push_back((inverse_com * to_jolt_r(Transform3D(pose[joint]))).ToMat44());
 		if (!to_godot(local[joint]).is_finite()) {
 			return fail(r_error, "SBREM-POSE", vformat("skin/pose.pre_step.joint[%d]", joint), "Jolt COM-local matrix is nonfinite");
 		}

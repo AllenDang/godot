@@ -3701,7 +3701,9 @@ TEST_SUITE("[JoltSoftBodyRemaining]") {
 		first.step(30);
 		PackedVector3Array deformed;
 		for (int i = 0; i < 4; ++i) {
-			deformed.push_back(server->soft_body_get_point_global_position(body.rid(), i));
+			const Vector3 position = server->soft_body_get_point_global_position(body.rid(), i);
+			// Renderer vertex buffers are float32 even in double-precision builds.
+			deformed.push_back(Vector3(float(position.x), float(position.y), float(position.z)));
 		}
 		REQUIRE(deformed[0].length() > 1e-3f);
 		// Dummy rendering ignores vertex-region uploads. Replace the same RID's
