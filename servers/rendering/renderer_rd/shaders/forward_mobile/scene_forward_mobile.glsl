@@ -10,6 +10,22 @@
 /* Include our forward mobile UBOs definitions etc. */
 #include "scene_forward_mobile_inc.glsl"
 
+uint instance_record_index() {
+	if (draw_call.shadow_instance_remap_base != 0u) {
+		uint word_index = draw_call.shadow_instance_remap_base + uint(INSTANCE_INDEX);
+		return floatBitsToUint(transforms.data[word_index >> 2u][word_index & 3u]);
+	}
+	return uint(INSTANCE_INDEX);
+}
+
+uint original_instance_index() {
+	if (draw_call.shadow_instance_original_id_base != 0u) {
+		uint word_index = draw_call.shadow_instance_original_id_base + uint(INSTANCE_INDEX);
+		return floatBitsToUint(transforms.data[word_index >> 2u][word_index & 3u]);
+	}
+	return instance_record_index();
+}
+
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 
@@ -350,7 +366,7 @@ void vertex_shader(in vec3 vertex,
 
 #else
 		uint stride = multimesh_stride();
-		uint offset = stride * (INSTANCE_INDEX + multimesh_offset);
+		uint offset = stride * (instance_record_index() + multimesh_offset);
 
 		if (sc_multimesh_format_2d()) {
 			matrix = mat4(transforms.data[offset + 0], transforms.data[offset + 1], vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));

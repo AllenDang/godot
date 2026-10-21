@@ -265,6 +265,8 @@ public:
 	virtual AABB multimesh_get_aabb(RID p_multimesh) const = 0;
 
 	virtual void multimesh_set_custom_aabb(RID p_mesh, const AABB &p_aabb) = 0;
+	virtual void multimesh_set_shadow_culling_aabb(RID p_multimesh, const AABB &p_aabb) = 0;
+	bool is_shadow_instance_culling_supported() const;
 	virtual AABB multimesh_get_custom_aabb(RID p_mesh) const = 0;
 
 	virtual Transform3D multimesh_instance_get_transform(RID p_multimesh, int p_index) const = 0;
