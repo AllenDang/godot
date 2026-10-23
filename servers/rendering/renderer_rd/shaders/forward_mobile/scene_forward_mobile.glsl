@@ -10,6 +10,22 @@
 /* Include our forward mobile UBOs definitions etc. */
 #include "scene_forward_mobile_inc.glsl"
 
+uint instance_record_index() {
+	if (draw_call.shadow_instance_remap_base != 0u) {
+		uint word_index = draw_call.shadow_instance_remap_base + uint(INSTANCE_INDEX);
+		return floatBitsToUint(transforms.data[word_index >> 2u][word_index & 3u]);
+	}
+	return uint(INSTANCE_INDEX);
+}
+
+uint original_instance_index() {
+	if (draw_call.shadow_instance_original_id_base != 0u) {
+		uint word_index = draw_call.shadow_instance_original_id_base + uint(INSTANCE_INDEX);
+		return floatBitsToUint(transforms.data[word_index >> 2u][word_index & 3u]);
+	}
+	return instance_record_index();
+}
+
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 
@@ -350,7 +366,7 @@ void vertex_shader(in vec3 vertex,
 
 #else
 		uint stride = multimesh_stride();
-		uint offset = stride * (INSTANCE_INDEX + multimesh_offset);
+		uint offset = stride * (instance_record_index() + multimesh_offset);
 
 		if (sc_multimesh_format_2d()) {
 			matrix = mat4(transforms.data[offset + 0], transforms.data[offset + 1], vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));
@@ -844,7 +860,6 @@ void main() {
 /* Include our forward mobile UBOs definitions etc. */
 #include "scene_forward_mobile_inc.glsl"
 
-
 /* Varyings */
 
 // All interpolators are intentionally kept at full precision as storageInputOutput16 is not
@@ -948,6 +963,7 @@ vec4 textureArray_bicubic(texture2DArray tex, vec3 uv, vec2 texture_size) {
 	return (g0(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p0, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p1, uv.z)))) +
 			(g1(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p2, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p3, uv.z))));
 }
+
 #endif //USE_LIGHTMAP
 
 #ifdef USE_MULTIVIEW
@@ -1039,6 +1055,7 @@ layout(location = 1) out float fog_eligibility;
 #define SPECULAR_SCHLICK_GGX
 #endif
 
+#include "../baked_directional_shadow_inc.glsl"
 #include "../scene_forward_lights_inc.glsl"
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && !defined(USE_VERTEX_LIGHTING)
@@ -1048,7 +1065,6 @@ layout(location = 1) out float fog_eligibility;
 /*
 	Only supporting normal fog here.
 */
-
 
 #include "../environment/mobile_fog_transport_inc.glsl"
 
@@ -1397,7 +1413,9 @@ void main() {
 	alpha = half(1.0);
 #endif
 
-#ifdef ALPHA_ANTIALIASING_EDGE_USED
+// Material capture stores opacity for ray tracing, not MSAA sample coverage.
+// Preserve the native scissor/hash result instead of widening it in UV space.
+#if defined(ALPHA_ANTIALIASING_EDGE_USED) && !defined(MODE_RENDER_MATERIAL)
 // If alpha scissor is used, we must further the edge threshold, otherwise we won't get any edge feather
 #ifdef ALPHA_SCISSOR_USED
 	alpha_antialiasing_edge = clamp(alpha_scissor_threshold + alpha_antialiasing_edge, half(0.0), half(1.0));
@@ -1486,17 +1504,19 @@ void main() {
 
 #endif //!CUSTOM_FOG_USED
 
- if(native_ap_enabled()) {
-  vec4 ap=native_ap_process(vertex);
-  if(!use_native_height_fog) {
-   // Preserve the native depth/custom fog layer, when present. Its source
-   // is already exposed; the shared tail expects canonical scene radiance.
-   native_height_fog=vec4(vec3(fog.rgb)*float(fog.a)/max(scene_data.emissive_exposure_normalization,1e-8),1.0-float(fog.a));
-  }
-  native_height_fog=vec4(native_height_fog.rgb+native_height_fog.a*ap.rgb,native_height_fog.a*clamp(ap.a,0.0,1.0));
-  if(scene_data.aerial_perspective.z>0.0) native_height_fog=ap;
-  use_native_height_fog=true;
- }
+	if (native_ap_enabled()) {
+		vec4 ap = native_ap_process(vertex);
+		if (!use_native_height_fog) {
+			// Preserve the native depth/custom fog layer, when present. Its source
+			// is already exposed; the shared tail expects canonical scene radiance.
+			native_height_fog = vec4(vec3(fog.rgb) * float(fog.a) / max(scene_data.emissive_exposure_normalization, 1e-8), 1.0 - float(fog.a));
+		}
+		native_height_fog = vec4(native_height_fog.rgb + native_height_fog.a * ap.rgb, native_height_fog.a * clamp(ap.a, 0.0, 1.0));
+		if (scene_data.aerial_perspective.z > 0.0) {
+			native_height_fog = ap;
+		}
+		use_native_height_fog = true;
+	}
 
 #endif // deferred native fog
 #endif //!FOG_DISABLED
@@ -1646,7 +1666,9 @@ void main() {
 		float lod = sqrt(roughness) * MAX_ROUGHNESS_LOD;
 		indirect_specular_light = hvec3(sample_sky_radiance(vec3(ref_vec), 0.0, lod).rgb);
 #endif //USE_RADIANCE_OCTMAP_ARRAY
-		if (scene_data.sky_capture_data.x == 0.0) { indirect_specular_light *= REFLECTION_MULTIPLIER; }
+		if (scene_data.sky_capture_data.x == 0.0) {
+			indirect_specular_light *= REFLECTION_MULTIPLIER;
+		}
 		indirect_specular_light *= half(scene_data.IBL_exposure_normalization);
 		indirect_specular_light *= horizon * horizon;
 		indirect_specular_light *= half(scene_data.ambient_light_color_energy.a);
@@ -1670,7 +1692,9 @@ void main() {
 			float roughness_lod = MAX_ROUGHNESS_LOD;
 			hvec3 octmap_ambient = hvec3(sample_sky_radiance(ambient_dir, 0.0, roughness_lod).rgb);
 #endif //USE_RADIANCE_OCTMAP_ARRAY
-			if (scene_data.sky_capture_data.x == 0.0) { octmap_ambient *= REFLECTION_MULTIPLIER; }
+			if (scene_data.sky_capture_data.x == 0.0) {
+				octmap_ambient *= REFLECTION_MULTIPLIER;
+			}
 			octmap_ambient *= half(scene_data.IBL_exposure_normalization);
 			ambient_light = mix(ambient_light, octmap_ambient * half(scene_data.ambient_light_color_energy.a), half(scene_data.ambient_color_sky_mix));
 		}
@@ -2101,12 +2125,25 @@ void main() {
 					}
 #endif
 
-#ifdef USE_VERTEX_LIGHTING
-					diffuse_light *= mix(half(1.0), shadow, half(diffuse_light_interp.a));
-					direct_specular_light *= mix(half(1.0), shadow, half(specular_light_interp.a));
-#endif
 #undef BIAS_FUNC
 				}
+
+#ifdef USE_LIGHTMAP
+				if (shadowmask_mode == LIGHTMAP_SHADOWMASK_MODE_NONE)
+#endif
+				{
+					half baked_shadow = half(sample_baked_directional_shadow(i, vertex, instances.data[draw_call.instance_index].layer_mask));
+#ifdef USE_VERTEX_LIGHTING
+					// Preserve existing realtime/LightmapGI vertex attenuation exactly.
+					baked_shadow = mix(half(1.0), baked_shadow, half(directional_lights.data[i].shadow_opacity));
+#endif
+					shadow = min(shadow, baked_shadow);
+				}
+#ifdef USE_VERTEX_LIGHTING
+				half vertex_shadow = shadow;
+				diffuse_light *= mix(half(1.0), vertex_shadow, half(diffuse_light_interp.a));
+				direct_specular_light *= mix(half(1.0), vertex_shadow, half(specular_light_interp.a));
+#endif
 
 				shadows[i] = shadow;
 			}
@@ -2393,36 +2430,36 @@ void main() {
 #endif
 
 #ifndef FOG_DISABLED
- if (use_native_height_fog) {
-  vec3 fog_L = native_height_fog.rgb * scene_data.emissive_exposure_normalization / sc_luminance_multiplier();
+	if (use_native_height_fog) {
+		vec3 fog_L = native_height_fog.rgb * scene_data.emissive_exposure_normalization / sc_luminance_multiplier();
 #ifdef HEIGHT_FOG_BLEND_MUL
-  out_color.rgb = hvec3(mix(vec3(1.0), vec3(out_color.rgb), native_height_fog.a));
+		out_color.rgb = hvec3(mix(vec3(1.0), vec3(out_color.rgb), native_height_fog.a));
 #else
-  out_color.rgb *= half(native_height_fog.a);
+		out_color.rgb *= half(native_height_fog.a);
 #if !defined(HEIGHT_FOG_BLEND_ADD_SUB)
 #ifdef HEIGHT_FOG_BLEND_PREMULTIPLIED
-  out_color.rgb += hvec3(fog_L * float(alpha));
+		out_color.rgb += hvec3(fog_L * float(alpha));
 #else
-  out_color.rgb += hvec3(fog_L);
+		out_color.rgb += hvec3(fog_L);
 #endif
 #endif
 #endif
-  float air_debug=scene_data.aerial_perspective.z>0.0?scene_data.aerial_perspective.z:scene_data.height_fog.options.y;
-  if (air_debug == 1.0) {
-   out_color.rgb = hvec3(vec3(native_height_fog.a) / sc_luminance_multiplier());
-  } else if (air_debug == 2.0) {
-   out_color.rgb = hvec3(native_height_fog.rgb / sc_luminance_multiplier());
-  }
- }
+		float air_debug = scene_data.aerial_perspective.z > 0.0 ? scene_data.aerial_perspective.z : scene_data.height_fog.options.y;
+		if (air_debug == 1.0) {
+			out_color.rgb = hvec3(vec3(native_height_fog.a) / sc_luminance_multiplier());
+		} else if (air_debug == 2.0) {
+			out_color.rgb = hvec3(native_height_fog.rgb / sc_luminance_multiplier());
+		}
+	}
 #endif
 
 #ifdef DEFER_OPAQUE_FOG
- fog_eligibility = 0.0;
+	fog_eligibility = 0.0;
 #ifdef DEFER_NATIVE_FOG
- fog_eligibility = 1.0;
+	fog_eligibility = 1.0;
 #endif
 #endif
- frag_color = out_color;
+	frag_color = out_color;
 
 	if (sc_use_material_debanding()) {
 		// From https://alex.vlachos.com/graphics/Alex_Vlachos_Advanced_VR_Rendering_GDC2015.pdf

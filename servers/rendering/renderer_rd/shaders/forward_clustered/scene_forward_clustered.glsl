@@ -880,7 +880,6 @@ void main() {
 
 #include "scene_forward_clustered_inc.glsl"
 
-
 /* Varyings */
 
 layout(location = 0) in vec3 vertex_interp;
@@ -978,6 +977,7 @@ vec4 textureArray_bicubic(texture2DArray tex, vec3 uv, vec2 texture_size) {
 	return (g0(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p0, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p1, uv.z)))) +
 			(g1(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p2, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p3, uv.z))));
 }
+
 #endif //USE_LIGHTMAP
 
 #ifdef USE_MULTIVIEW
@@ -1081,6 +1081,7 @@ layout(location = 2) out vec2 motion_vector;
 #define SPECULAR_SCHLICK_GGX
 #endif
 
+#include "../baked_directional_shadow_inc.glsl"
 #include "../scene_forward_lights_inc.glsl"
 
 #include "../scene_forward_gi_inc.glsl"
@@ -1100,7 +1101,6 @@ vec4 volumetric_fog_process(vec2 screen_uv, float z) {
 	return texture(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), fog_pos);
 }
 
-
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
 vec4 sample_sky_radiance(vec3 uv, float lod) {
 	vec4 old_sample = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), uv, lod);
@@ -1108,7 +1108,9 @@ vec4 sample_sky_radiance(vec3 uv, float lod) {
 vec4 sample_sky_radiance(vec2 uv, float lod) {
 	vec4 old_sample = textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), uv, lod);
 #endif
-	if (scene_data_block.data.sky_capture_data.x == 0.0) { return old_sample; }
+	if (scene_data_block.data.sky_capture_data.x == 0.0) {
+		return old_sample;
+	}
 	vec3 old_rgb = scene_data_block.data.sky_capture_data.z > 0.0 ? old_sample.rgb : scene_data_block.data.sky_capture_fallback.rgb;
 	vec3 result = old_rgb;
 	if (scene_data_block.data.sky_capture_data.y > 0.0) {
@@ -1438,7 +1440,9 @@ void fragment_shader(in SceneData scene_data) {
 	alpha = 1.0;
 #endif
 
-#ifdef ALPHA_ANTIALIASING_EDGE_USED
+// Material capture stores opacity for ray tracing, not MSAA sample coverage.
+// Preserve the native scissor/hash result instead of widening it in UV space.
+#if defined(ALPHA_ANTIALIASING_EDGE_USED) && !defined(MODE_RENDER_MATERIAL)
 // If alpha scissor is used, we must further the edge threshold, otherwise we won't get any edge feather
 #ifdef ALPHA_SCISSOR_USED
 	alpha_antialiasing_edge = clamp(alpha_scissor_threshold + alpha_antialiasing_edge, 0.0, 1.0);
@@ -2560,13 +2564,25 @@ void fragment_shader(in SceneData scene_data) {
 					}
 #endif
 
-#ifdef USE_VERTEX_LIGHTING
-					diffuse_light *= mix(1.0, shadow, diffuse_light_interp.a);
-					direct_specular_light *= mix(1.0, shadow, specular_light_interp.a);
-#endif
-
 #undef BIAS_FUNC
 				} // shadows
+
+#ifdef USE_LIGHTMAP
+				if (shadowmask_mode == LIGHTMAP_SHADOWMASK_MODE_NONE)
+#endif
+				{
+					float baked_shadow = float(sample_baked_directional_shadow(i, vertex, instances.data[instance_index].layer_mask));
+#ifdef USE_VERTEX_LIGHTING
+					// Preserve existing realtime/LightmapGI vertex attenuation exactly.
+					baked_shadow = mix(float(1.0), baked_shadow, float(directional_lights.data[i].shadow_opacity));
+#endif
+					shadow = min(shadow, baked_shadow);
+				}
+#ifdef USE_VERTEX_LIGHTING
+				float vertex_shadow = shadow;
+				diffuse_light *= mix(float(1.0), vertex_shadow, float(diffuse_light_interp.a));
+				direct_specular_light *= mix(float(1.0), vertex_shadow, float(specular_light_interp.a));
+#endif
 
 				if (i < 4) {
 					shadow0 |= uint(clamp(shadow * 255.0, 0.0, 255.0)) << (i * 8);
