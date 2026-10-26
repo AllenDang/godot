@@ -487,6 +487,8 @@ public:
 	FUNC3(light_set_param, RID, RSE::LightParam, float)
 	FUNC2(light_set_shadow, RID, bool)
 	FUNC2(light_set_projector, RID, RID)
+	FUNC6R(bool, light_directional_set_baked_shadow, RID, const Ref<Image> &, const Transform3D &, const Vector3 &, const Rect2 &, const Vector4 &)
+	FUNC3R(bool, light_directional_set_baked_visibility, RID, RID, uint32_t)
 	FUNC2(light_set_negative, RID, bool)
 	FUNC2(light_set_cull_mask, RID, uint32_t)
 	FUNC5(light_set_distance_fade, RID, bool, float, float, float)

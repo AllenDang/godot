@@ -309,6 +309,8 @@ public:
 	virtual void light_set_param(RID p_light, RSE::LightParam p_param, float p_value) = 0;
 	virtual void light_set_shadow(RID p_light, bool p_enabled) = 0;
 	virtual void light_set_projector(RID p_light, RID p_texture) = 0;
+	virtual bool light_directional_set_baked_shadow(RID p_light, const Ref<Image> &p_image, const Transform3D &p_world_to_light, const Vector3 &p_projection, const Rect2 &p_coverage, const Vector4 &p_options) = 0;
+	virtual bool light_directional_set_baked_visibility(RID p_light, RID p_texture, uint32_t p_receiver_mask) = 0;
 	virtual void light_set_negative(RID p_light, bool p_enable) = 0;
 	virtual void light_set_cull_mask(RID p_light, uint32_t p_mask) = 0;
 	virtual void light_set_distance_fade(RID p_light, bool p_enabled, float p_begin, float p_shadow, float p_length) = 0;
@@ -632,7 +634,6 @@ public:
 	virtual Dictionary sky_get_physical_source_status(RID p_sky) const = 0;
 	virtual Dictionary get_physical_sky_capabilities() const = 0;
 	virtual String get_sky_view_shader_source() const = 0;
-
 
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) = 0;
 

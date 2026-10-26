@@ -180,6 +180,7 @@ private:
 	void _pre_opaque_render(RenderDataRD *p_render_data);
 
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
+	uint64_t baked_texture_version = UINT64_MAX;
 
 	void _update_render_base_uniform_set();
 
