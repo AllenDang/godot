@@ -475,6 +475,60 @@ public:
 	Error try_blend_shape_track_interpolate(int p_track, double p_time, float *r_blend, bool p_backward = false) const;
 	float blend_shape_track_interpolate(int p_track, double p_time, bool p_backward = false) const;
 
+	// Fast internal C++ bulk key writers for sorted chronological tracks (zero binary search / per-key signal).
+	void position_track_set_keys_bulk(int p_track, const double *p_times, const Vector3 *p_values, int p_count) {
+		ERR_FAIL_INDEX(p_track, static_cast<int>(tracks.size()));
+		ERR_FAIL_COND(tracks[p_track]->type != TYPE_POSITION_3D || p_count < 0);
+		PositionTrack *tt = static_cast<PositionTrack *>(tracks[p_track]);
+		ERR_FAIL_COND(tt->compressed_track >= 0);
+		tt->positions.resize(uint32_t(p_count));
+		TKey<Vector3> *dst = tt->positions.ptr();
+		for (int i = 0; i < p_count; i++) {
+			dst[i].time = float(p_times[i]);
+			dst[i].transition = 1.0f;
+			dst[i].value = p_values[i];
+		}
+	}
+	void rotation_track_set_keys_bulk(int p_track, const double *p_times, const Quaternion *p_values, int p_count) {
+		ERR_FAIL_INDEX(p_track, static_cast<int>(tracks.size()));
+		ERR_FAIL_COND(tracks[p_track]->type != TYPE_ROTATION_3D || p_count < 0);
+		RotationTrack *rt = static_cast<RotationTrack *>(tracks[p_track]);
+		ERR_FAIL_COND(rt->compressed_track >= 0);
+		rt->rotations.resize(uint32_t(p_count));
+		TKey<Quaternion> *dst = rt->rotations.ptr();
+		for (int i = 0; i < p_count; i++) {
+			dst[i].time = float(p_times[i]);
+			dst[i].transition = 1.0f;
+			dst[i].value = p_values[i];
+		}
+	}
+	void scale_track_set_keys_bulk(int p_track, const double *p_times, const Vector3 *p_values, int p_count) {
+		ERR_FAIL_INDEX(p_track, static_cast<int>(tracks.size()));
+		ERR_FAIL_COND(tracks[p_track]->type != TYPE_SCALE_3D || p_count < 0);
+		ScaleTrack *st = static_cast<ScaleTrack *>(tracks[p_track]);
+		ERR_FAIL_COND(st->compressed_track >= 0);
+		st->scales.resize(uint32_t(p_count));
+		TKey<Vector3> *dst = st->scales.ptr();
+		for (int i = 0; i < p_count; i++) {
+			dst[i].time = float(p_times[i]);
+			dst[i].transition = 1.0f;
+			dst[i].value = p_values[i];
+		}
+	}
+	void blend_shape_track_set_keys_bulk(int p_track, const double *p_times, const float *p_values, int p_count) {
+		ERR_FAIL_INDEX(p_track, static_cast<int>(tracks.size()));
+		ERR_FAIL_COND(tracks[p_track]->type != TYPE_BLEND_SHAPE || p_count < 0);
+		BlendShapeTrack *bt = static_cast<BlendShapeTrack *>(tracks[p_track]);
+		ERR_FAIL_COND(bt->compressed_track >= 0);
+		bt->blend_shapes.resize(uint32_t(p_count));
+		TKey<float> *dst = bt->blend_shapes.ptr();
+		for (int i = 0; i < p_count; i++) {
+			dst[i].time = float(p_times[i]);
+			dst[i].transition = 1.0f;
+			dst[i].value = p_values[i];
+		}
+	}
+
 	void track_set_interpolation_type(int p_track, InterpolationType p_interp);
 	InterpolationType track_get_interpolation_type(int p_track) const;
 

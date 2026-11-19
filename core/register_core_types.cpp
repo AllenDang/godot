@@ -82,6 +82,7 @@
 #include "core/object/script_language_extension.h"
 #include "core/object/undo_redo.h"
 #include "core/object/worker_thread_pool.h"
+#include "core/os/load_thread_pool.h"
 #include "core/os/main_loop.h"
 #include "core/os/os.h"
 #include "core/os/time.h"
@@ -417,6 +418,7 @@ void unregister_core_types() {
 
 	// Destroy singletons in reverse order to ensure dependencies are not broken.
 
+	LoadThreadPool::cleanup();
 	memdelete(worker_thread_pool);
 
 	memdelete(_engine_debugger);

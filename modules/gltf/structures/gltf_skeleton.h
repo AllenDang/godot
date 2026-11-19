@@ -41,6 +41,7 @@ class GLTFSkeleton : public Resource {
 	friend class GLTFDocument;
 	friend class SkinTool;
 	friend class FBXDocument;
+	friend struct GLTFFastAccess;
 
 private:
 	// The *synthesized* skeletons joints

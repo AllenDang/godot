@@ -44,6 +44,29 @@ void init_thread_posix() {
 #include <pthread_np.h>
 #endif
 
+#include <sys/resource.h>
+#include <unistd.h>
+
+static Error set_priority(Thread::Priority p_priority) {
+	int nice_val = 0;
+	switch (p_priority) {
+		case Thread::PRIORITY_LOW:
+			nice_val = 10;
+			break;
+		case Thread::PRIORITY_NORMAL:
+			nice_val = 0;
+			break;
+		case Thread::PRIORITY_HIGH:
+			nice_val = -2;
+			break;
+	}
+	int err = setpriority(PRIO_PROCESS, 0, nice_val);
+	if (err != 0 && p_priority == Thread::PRIORITY_HIGH) {
+		return OK;
+	}
+	return err == 0 ? OK : ERR_CANT_CREATE;
+}
+
 static Error set_name(const String &p_name) {
 #ifdef PTHREAD_NO_RENAME
 	return ERR_UNAVAILABLE;
@@ -75,7 +98,7 @@ static Error set_name(const String &p_name) {
 }
 
 void init_thread_posix() {
-	Thread::_set_platform_functions({ .set_name = set_name });
+	Thread::_set_platform_functions({ .set_name = set_name, .set_priority = set_priority });
 }
 
 #endif // PLATFORM_THREAD_OVERRIDE && __APPLE__
