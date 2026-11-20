@@ -51,6 +51,11 @@ public:
 		Interpolation interpolation = INTERP_LINEAR;
 		Vector<double> times;
 		Vector<T> values;
+		// Zero-copy tight float32 BufferView spans for direct parallel animation evaluation.
+		const float *raw_times_f32 = nullptr;
+		const T *raw_values_ptr = nullptr;
+		int32_t raw_times_count = 0;
+		int32_t raw_values_count = 0;
 	};
 
 	struct NodeTrack {

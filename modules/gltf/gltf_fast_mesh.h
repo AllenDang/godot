@@ -36,6 +36,7 @@ struct GLTFFastPrimSpec {
 	int32_t joints_1 = -1;
 	int32_t weights_0 = -1;
 	int32_t weights_1 = -1;
+	bool dense_verts_verified = false;
 	LocalVector<GLTFFastMorphSpec> targets;
 };
 

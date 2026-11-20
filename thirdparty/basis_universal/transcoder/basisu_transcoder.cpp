@@ -14377,6 +14377,43 @@ namespace basist
 		}
 	}
 
+	struct uastc_trit_lut_t
+	{
+		uint8_t v[256][5];
+		constexpr uastc_trit_lut_t() : v{}
+		{
+			for (uint32_t t = 0; t < 256; ++t)
+			{
+				uint32_t a = t;
+				for (uint32_t k = 0; k < 5; ++k)
+				{
+					v[t][k] = static_cast<uint8_t>(a % 3u);
+					a /= 3u;
+				}
+			}
+		}
+	};
+
+	struct uastc_quint_lut_t
+	{
+		uint8_t v[128][3];
+		constexpr uastc_quint_lut_t() : v{}
+		{
+			for (uint32_t q = 0; q < 128; ++q)
+			{
+				uint32_t a = q;
+				for (uint32_t k = 0; k < 3; ++k)
+				{
+					v[q][k] = static_cast<uint8_t>(a % 5u);
+					a /= 5u;
+				}
+			}
+		}
+	};
+
+	static constexpr uastc_trit_lut_t g_uastc_trit_unpack_lut{};
+	static constexpr uastc_quint_lut_t g_uastc_quint_unpack_lut{};
+
 	bool unpack_uastc(const uastc_block& blk, unpacked_uastc_block& unpacked, bool blue_contract_check, bool read_hints)
 	{
 		//memset(&unpacked, 0, sizeof(unpacked));
@@ -14602,32 +14639,32 @@ namespace basist
 			tq_values[i] = (uint32_t)read_bits1_to_9_fst(blk.m_bytes, bit_ofs, num_bits);
 		} // i
 
-		uint32_t accum = 0;
-		uint32_t accum_remaining = 0;
-		uint32_t next_tq_index = 0;
-
-		for (uint32_t i = 0; i < total_values; i++)
+		if (ep_trits)
 		{
-			uint32_t value = (uint32_t)read_bits1_to_9_fst(blk.m_bytes, bit_ofs, ep_bits);
-
-			if (total_tqs)
+			uint32_t g = 0, r = 0;
+			for (uint32_t i = 0; i < total_values; i++)
 			{
-				if (!accum_remaining)
-				{
-					assert(next_tq_index < total_tqs);
-					accum = tq_values[next_tq_index++];
-					accum_remaining = bundle_size;
-				}
-
-				// TODO: Optimize with tables
-				uint32_t v = accum % mul;
-				accum /= mul;
-				accum_remaining--;
-
-				value |= (v << ep_bits);
+				const uint32_t value = (uint32_t)read_bits1_to_9_fst(blk.m_bytes, bit_ofs, ep_bits) |
+					(uint32_t(g_uastc_trit_unpack_lut.v[tq_values[g] & 255u][r]) << ep_bits);
+				unpacked.m_astc.m_endpoints[i] = (uint8_t)value;
+				if (++r == 5) { r = 0; ++g; }
 			}
-
-			unpacked.m_astc.m_endpoints[i] = (uint8_t)value;
+		}
+		else if (ep_quints)
+		{
+			uint32_t g = 0, r = 0;
+			for (uint32_t i = 0; i < total_values; i++)
+			{
+				const uint32_t value = (uint32_t)read_bits1_to_9_fst(blk.m_bytes, bit_ofs, ep_bits) |
+					(uint32_t(g_uastc_quint_unpack_lut.v[tq_values[g] & 127u][r]) << ep_bits);
+				unpacked.m_astc.m_endpoints[i] = (uint8_t)value;
+				if (++r == 3) { r = 0; ++g; }
+			}
+		}
+		else
+		{
+			for (uint32_t i = 0; i < total_values; i++)
+				unpacked.m_astc.m_endpoints[i] = (uint8_t)read_bits1_to_9_fst(blk.m_bytes, bit_ofs, ep_bits);
 		}
 
 		const uint8_t* pPartition_pattern;
@@ -15109,8 +15146,289 @@ namespace basist
 		}
 	}
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+	static inline uint64_t uastc_insert_zero_bit_u64(uint64_t v, uint32_t bit_idx)
+	{
+		const uint64_t mask = (bit_idx == 0) ? 0ULL : ((1ULL << bit_idx) - 1ULL);
+		return (v & mask) | ((v & ~mask) << 1);
+	}
+#endif
+
 	bool transcode_uastc_to_astc(const uastc_block& src_blk, void* pDst)
 	{
+#if defined(__aarch64__) || defined(_M_ARM64)
+		const int mode = g_uastc_huff_modes[src_blk.m_bytes[0] & 127];
+		if (mode >= (int)TOTAL_UASTC_MODES)
+			return false;
+
+		uint32_t bit_ofs = g_uastc_mode_huff_codes[mode][1];
+		if (mode == UASTC_MODE_INDEX_SOLID_COLOR)
+		{
+			uint64_t raw0 = 0;
+			memcpy(&raw0, src_blk.m_bytes, sizeof(uint64_t));
+			const uint32_t rgba = static_cast<uint32_t>(raw0 >> bit_ofs);
+			color32 solid_c(rgba & 0xFFu, (rgba >> 8) & 0xFFu, (rgba >> 16) & 0xFFu, (rgba >> 24) & 0xFFu);
+			pack_astc_solid_block(pDst, solid_c);
+			return true;
+		}
+
+		// Modes 0..17 all have total_weights * weight_bits <= 64 bits: zero-loop RBIT hardware weight reversal!
+		if (mode != 18)
+		{
+			bit_ofs += g_uastc_mode_total_hint_bits[mode];
+			uint32_t subsets = 1;
+			uint32_t common_pattern = 0;
+			uint32_t part_seed = 0;
+			switch (mode)
+			{
+			case 2: case 4: case 9: case 16:
+				common_pattern = read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, 5);
+				if (common_pattern >= TOTAL_ASTC_BC7_COMMON_PARTITIONS2)
+					return false;
+				part_seed = g_astc_bc7_common_partitions2[common_pattern].m_astc;
+				subsets = 2;
+				break;
+			case 3:
+				common_pattern = read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, 4);
+				if (common_pattern >= TOTAL_ASTC_BC7_COMMON_PARTITIONS3)
+					return false;
+				part_seed = g_astc_bc7_common_partitions3[common_pattern].m_astc;
+				subsets = 3;
+				break;
+			case 7:
+				common_pattern = read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, 5);
+				if (common_pattern >= TOTAL_BC7_3_ASTC2_COMMON_PARTITIONS)
+					return false;
+				part_seed = g_bc7_3_astc2_common_partitions[common_pattern].m_astc2;
+				subsets = 2;
+				break;
+			default:
+				break;
+			}
+
+			uint32_t total_planes = 1;
+			int ccs = 0;
+			switch (mode)
+			{
+			case 6: case 11: case 13:
+				ccs = (int)read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, 2);
+				total_planes = 2;
+				break;
+			case 17:
+				ccs = 3;
+				total_planes = 2;
+				break;
+			default:
+				break;
+			}
+
+			const uint32_t total_comps = g_uastc_mode_comps[mode];
+			const uint32_t weight_bits = g_uastc_mode_weight_bits[mode];
+			const uint32_t total_values = total_comps * 2 * subsets;
+			const uint32_t endpoint_range = g_uastc_mode_endpoint_ranges[mode];
+			const uint32_t cem = g_uastc_mode_cem[mode];
+			const uint32_t ep_bits = g_astc_bise_range_table[endpoint_range][0];
+			const uint32_t ep_trits = g_astc_bise_range_table[endpoint_range][1];
+			const uint32_t ep_quints = g_astc_bise_range_table[endpoint_range][2];
+
+			uint32_t tq_values[8];
+			if (ep_trits)
+			{
+				const uint32_t total_tqs = (total_values + 4) / 5;
+				for (uint32_t i = 0; i < total_tqs; i++)
+				{
+					uint32_t num_bits = 8;
+					if (i == total_tqs - 1)
+					{
+						switch (total_values - (total_tqs - 1) * 5)
+						{
+						case 1: num_bits = 2; break;
+						case 2: num_bits = 4; break;
+						case 3: num_bits = 5; break;
+						case 4: num_bits = 7; break;
+						default: break;
+						}
+					}
+					tq_values[i] = read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, num_bits);
+				}
+			}
+			else if (ep_quints)
+			{
+				const uint32_t total_tqs = (total_values + 2) / 3;
+				for (uint32_t i = 0; i < total_tqs; i++)
+				{
+					uint32_t num_bits = 7;
+					if (i == total_tqs - 1)
+					{
+						switch (total_values - (total_tqs - 1) * 3)
+						{
+						case 1: num_bits = 3; break;
+						case 2: num_bits = 5; break;
+						default: break;
+						}
+					}
+					tq_values[i] = read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, num_bits);
+				}
+			}
+
+			uint8_t endpoints[18];
+			if (ep_trits)
+			{
+				uint32_t g = 0, r = 0;
+				for (uint32_t i = 0; i < total_values; i++)
+				{
+					endpoints[i] = static_cast<uint8_t>(read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, ep_bits) |
+						(uint32_t(g_uastc_trit_unpack_lut.v[tq_values[g] & 255u][r]) << ep_bits));
+					if (++r == 5) { r = 0; ++g; }
+				}
+			}
+			else if (ep_quints)
+			{
+				uint32_t g = 0, r = 0;
+				for (uint32_t i = 0; i < total_values; i++)
+				{
+					endpoints[i] = static_cast<uint8_t>(read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, ep_bits) |
+						(uint32_t(g_uastc_quint_unpack_lut.v[tq_values[g] & 127u][r]) << ep_bits));
+					if (++r == 3) { r = 0; ++g; }
+				}
+			}
+			else
+			{
+				for (uint32_t i = 0; i < total_values; i++)
+					endpoints[i] = static_cast<uint8_t>(read_bits1_to_9_fst(src_blk.m_bytes, bit_ofs, ep_bits));
+			}
+
+			// Extract <= 64-bit packed weight bitstream directly from UASTC upper qword.
+			uint64_t raw_hi = 0;
+			memcpy(&raw_hi, src_blk.m_bytes + 8, sizeof(uint64_t));
+			uint64_t wbits = raw_hi;
+			if (bit_ofs >= 64U)
+			{
+				wbits >>= (bit_ofs - 64U);
+			}
+			else
+			{
+				const uint32_t bits_needed = 64U - bit_ofs;
+				wbits = (wbits << bits_needed) | uint64_t(src_blk.m_bytes[7] >> (8U - bits_needed));
+			}
+
+			const uint8_t* pPartition_pattern = g_zero_pattern;
+			const uint8_t* pAnchors = get_anchor_indices(subsets, mode, common_pattern, pPartition_pattern);
+
+			uint64_t W = 0;
+			if (total_planes == 2)
+			{
+				W = uastc_insert_zero_bit_u64(wbits, weight_bits - 1);
+				W = uastc_insert_zero_bit_u64(W, 2 * weight_bits - 1);
+			}
+			else if (subsets == 1)
+			{
+				W = uastc_insert_zero_bit_u64(wbits, weight_bits - 1);
+			}
+			else if (subsets == 2)
+			{
+				const uint32_t hi_anchor = uint32_t(pAnchors[0]) + uint32_t(pAnchors[1]);
+				W = uastc_insert_zero_bit_u64(wbits, weight_bits - 1);
+				W = uastc_insert_zero_bit_u64(W, hi_anchor * weight_bits + (weight_bits - 1));
+			}
+			else
+			{
+				uint32_t k0 = pAnchors[0], k1 = pAnchors[1], k2 = pAnchors[2];
+				if (k0 > k1) std::swap(k0, k1);
+				if (k1 > k2) std::swap(k1, k2);
+				if (k0 > k1) std::swap(k0, k1);
+				W = uastc_insert_zero_bit_u64(wbits, k0 * weight_bits + (weight_bits - 1));
+				W = uastc_insert_zero_bit_u64(W, k1 * weight_bits + (weight_bits - 1));
+				W = uastc_insert_zero_bit_u64(W, k2 * weight_bits + (weight_bits - 1));
+			}
+
+			const uint32_t total_weights = (total_planes == 2) ? 32u : 16u;
+			const uint32_t total_wbits = total_weights * weight_bits;
+			const uint64_t valid_wmask = (total_wbits == 64u) ? ~0ULL : ((1ULL << total_wbits) - 1ULL);
+			W &= valid_wmask;
+
+			// ASTC Blue Contraction check & bitwise weight inversion.
+			if (total_comps >= 3)
+			{
+				if (subsets == 1)
+				{
+					const int s0 = g_astc_unquant[endpoint_range][endpoints[0]].m_unquant +
+						g_astc_unquant[endpoint_range][endpoints[2]].m_unquant +
+						g_astc_unquant[endpoint_range][endpoints[4]].m_unquant;
+					const int s1 = g_astc_unquant[endpoint_range][endpoints[1]].m_unquant +
+						g_astc_unquant[endpoint_range][endpoints[3]].m_unquant +
+						g_astc_unquant[endpoint_range][endpoints[5]].m_unquant;
+					if (s1 < s0)
+					{
+						for (uint32_t c = 0; c < total_comps; c++)
+							std::swap(endpoints[c * 2 + 0], endpoints[c * 2 + 1]);
+						W ^= valid_wmask;
+					}
+				}
+				else
+				{
+					bool inv_sub[3] = { false, false, false };
+					bool any_inv = false;
+					for (uint32_t s = 0; s < subsets; s++)
+					{
+						const uint32_t base = s * total_comps * 2;
+						const int s0 = g_astc_unquant[endpoint_range][endpoints[base + 0]].m_unquant +
+							g_astc_unquant[endpoint_range][endpoints[base + 2]].m_unquant +
+							g_astc_unquant[endpoint_range][endpoints[base + 4]].m_unquant;
+						const int s1 = g_astc_unquant[endpoint_range][endpoints[base + 1]].m_unquant +
+							g_astc_unquant[endpoint_range][endpoints[base + 3]].m_unquant +
+							g_astc_unquant[endpoint_range][endpoints[base + 5]].m_unquant;
+						if (s1 < s0)
+						{
+							for (uint32_t c = 0; c < total_comps; c++)
+								std::swap(endpoints[base + c * 2 + 0], endpoints[base + c * 2 + 1]);
+							inv_sub[s] = true;
+							any_inv = true;
+						}
+					}
+					if (any_inv)
+					{
+						const uint64_t elem_mask = (1ULL << weight_bits) - 1ULL;
+						uint64_t xor_mask = 0;
+						for (uint32_t i = 0; i < 16; i++)
+						{
+							if (inv_sub[pPartition_pattern[i]])
+								xor_mask |= (elem_mask << (i * weight_bits));
+						}
+						W ^= xor_mask;
+					}
+				}
+			}
+
+			// Assemble 128-bit ASTC block + 1-cycle hardware RBIT weight stream.
+			uint32_t dst32[4] = { g_uastc_mode_astc_block_mode[mode] & 0xFFFFu, 0, 0, 0 };
+			int astc_bpos = ASTC_BLOCK_MODE_BITS;
+			astc_set_bits_1_to_9(dst32, astc_bpos, subsets - 1, ASTC_PART_BITS);
+			if (subsets == 1)
+			{
+				astc_set_bits_1_to_9(dst32, astc_bpos, cem, ASTC_CEM_BITS);
+			}
+			else
+			{
+				astc_set_bits(dst32, astc_bpos, part_seed, ASTC_PARTITION_INDEX_BITS);
+				astc_set_bits_1_to_9(dst32, astc_bpos, (cem << 2) & 63, ASTC_CEM_BITS + 2);
+			}
+			if (total_planes == 2)
+			{
+				int ccs_bpos = int(128u - total_wbits - ASTC_CCS_BITS);
+				astc_set_bits_1_to_9(dst32, ccs_bpos, ccs, ASTC_CCS_BITS);
+			}
+			const int num_cem_pairs = int((1u + (cem >> 2)) * subsets);
+			astc_pack_bise(dst32, endpoints, astc_bpos, num_cem_pairs * 2, endpoint_range);
+
+			const uint64_t rev_w = __builtin_bitreverse64(W);
+			dst32[2] |= static_cast<uint32_t>(rev_w);
+			dst32[3] |= static_cast<uint32_t>(rev_w >> 32);
+			memcpy(pDst, dst32, 16);
+			return true;
+		}
+#endif
+
 		unpacked_uastc_block unpacked_src_blk;
 		if (!unpack_uastc(src_blk, unpacked_src_blk, true, false))
 			return false;

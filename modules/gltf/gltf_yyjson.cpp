@@ -17,6 +17,7 @@
 #include "core/config/engine.h"
 #include "core/crypto/crypto_core.h"
 #include "core/io/file_access.h"
+#include "core/io/file_access_mmap.h"
 #include "core/io/image.h"
 #include "core/io/marshalls.h"
 #include "core/io/resource_loader.h"
@@ -687,6 +688,69 @@ bool fast_decode_accessor_quat(const Ref<GLTFState> &p_state, int p_acc_idx, Vec
 	return true;
 }
 
+template <typename T>
+bool try_get_tight_f32_span(
+		const Ref<GLTFState> &p_state,
+		int p_acc_idx,
+		GLTFAccessor::GLTFAccessorType p_expected_type,
+		int64_t p_elem_bytes,
+		const T *&r_ptr,
+		int32_t &r_count) {
+	r_ptr = nullptr;
+	r_count = 0;
+	if (int64_t(sizeof(T)) != p_elem_bytes) {
+		return false;
+	}
+	const Vector<Ref<GLTFAccessor>> &accs = p_state->get_accessors();
+	if (p_acc_idx < 0 || p_acc_idx >= accs.size()) {
+		return false;
+	}
+	const Ref<GLTFAccessor> &acc = accs[p_acc_idx];
+	if (acc.is_null() || acc->get_sparse_count() != 0 || acc->get_buffer_view() < 0 ||
+			acc->get_accessor_type() != p_expected_type ||
+			acc->get_component_type() != GLTFAccessor::COMPONENT_TYPE_SINGLE_FLOAT) {
+		return false;
+	}
+	const Vector<Ref<GLTFBufferView>> &bvs = p_state->get_buffer_views();
+	const GLTFBufferViewIndex bvi = acc->get_buffer_view();
+	if (bvi < 0 || bvi >= bvs.size() || bvs[bvi].is_null()) {
+		return false;
+	}
+	const int64_t stride = bvs[bvi]->get_byte_stride();
+	if (stride > 0 && stride != p_elem_bytes) {
+		return false;
+	}
+	const uint8_t *vptr = nullptr;
+	int64_t vlen = 0;
+	if (!bvs[bvi]->get_view_span(p_state.ptr(), vptr, vlen)) {
+		return false;
+	}
+	const int64_t cnt = acc->get_count();
+	const int64_t off = acc->get_byte_offset();
+	if (cnt <= 0 || cnt > INT32_MAX || off < 0 || off + cnt * p_elem_bytes > vlen) {
+		return false;
+	}
+	if ((reinterpret_cast<uintptr_t>(vptr + off) & 3u) != 0u) {
+		return false;
+	}
+	r_ptr = reinterpret_cast<const T *>(vptr + off);
+	r_count = int32_t(cnt);
+	return true;
+}
+
+_FORCE_INLINE_ bool is_clean_ascii_node_name(const char *p_str, size_t p_len) {
+	if (!p_str || p_len == 0) {
+		return false;
+	}
+	for (size_t i = 0; i < p_len; i++) {
+		const uint8_t c = static_cast<uint8_t>(p_str[i]);
+		if (c < 0x20u || c >= 0x7Fu || c == '.' || c == ':' || c == '@' || c == '/' || c == '"' || c == '%') {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool fast_decode_accessor_mat4(const Ref<GLTFState> &p_state, int p_acc_idx, Vector<Transform3D> &r_out) {
 	const Vector<Ref<GLTFAccessor>> &accs = p_state->get_accessors();
 	ERR_FAIL_INDEX_V(p_acc_idx, accs.size(), false);
@@ -914,7 +978,14 @@ Error gltf_yyjson_populate_state(
 				meshopt_err.store(int(e), std::memory_order_relaxed);
 			}
 		};
-		if (meshopt_bv_indices.size() >= 2 && LoadThreadPool::get_singleton()) {
+		int64_t max_meshopt_bv_bytes = 0;
+		for (uint32_t idx = 0; idx < meshopt_bv_indices.size(); idx++) {
+			const int64_t blen = state_bvs[meshopt_bv_indices[idx]]->get_byte_length();
+			if (blen > max_meshopt_bv_bytes) {
+				max_meshopt_bv_bytes = blen;
+			}
+		}
+		if (meshopt_bv_indices.size() >= 2 && max_meshopt_bv_bytes <= (2LL << 20) && LoadThreadPool::get_singleton()) {
 			LoadThreadPool::get_singleton()->parallel_for(meshopt_bv_indices.size(), decode_one_bv);
 		} else {
 			for (uint32_t idx = 0; idx < meshopt_bv_indices.size(); idx++) {
@@ -1031,136 +1102,361 @@ Error gltf_yyjson_populate_state(
 	}
 
 	// 7. Parse nodes & hierarchy.
+	const bool want_packed_scene = p_state->get_additional_data(SNAME("_ange_want_packed_scene")).booleanize();
 	Vector<Ref<GLTFNode>> &state_nodes = GLTFFastAccess::nodes(p_state.ptr());
+	LocalVector<GLTFState::FastNodeRec> &fast_nodes = GLTFFastAccess::fast_nodes(p_state.ptr());
+	LocalVector<int32_t> &fast_children_pool = GLTFFastAccess::fast_children_pool(p_state.ptr());
 	state_nodes.clear();
+	fast_nodes.clear();
+	fast_children_pool.clear();
+
+	bool has_top_lights = false;
+	if (yyjson_val *rexts_chk = yyjson_obj_get(root, "extensions")) {
+		if (yyjson_is_obj(rexts_chk) && yyjson_obj_get(rexts_chk, "KHR_lights_punctual") != nullptr) {
+			has_top_lights = true;
+		}
+	}
+	bool use_fast_pod_nodes = want_packed_scene &&
+			p_doc->get_naming_version() >= 2 &&
+			!has_top_lights &&
+			yyjson_obj_get(root, "skins") == nullptr &&
+			yyjson_obj_get(root, "cameras") == nullptr &&
+			yyjson_obj_get(root, "animations") == nullptr;
+
 	if (yyjson_val *nodes_arr = yyjson_obj_get(root, "nodes")) {
 		ERR_FAIL_COND_V(!yyjson_is_arr(nodes_arr), ERR_PARSE_ERROR);
 		const int node_cnt = int(yyjson_arr_size(nodes_arr));
-		state_nodes.resize(node_cnt);
-		yyjson_arr_iter it = yyjson_arr_iter_with(nodes_arr);
-		int ni = 0;
-		yyjson_val *nobj = nullptr;
-		while ((nobj = yyjson_arr_iter_next(&it)) != nullptr) {
-			ERR_FAIL_COND_V(!yyjson_is_obj(nobj), ERR_PARSE_ERROR);
-			Ref<GLTFNode> node;
-			node.instantiate();
-			if (yyjson_val *nm = yyjson_obj_get(nobj, "name")) {
-				const String ns = yj_str(nm);
-				node->set_original_name(ns);
-				node->set_name(ns);
-			}
-			if (yyjson_val *cv = yyjson_obj_get(nobj, "camera")) {
-				GLTFFastAccess::node_camera(node.ptr()) = GLTFCameraIndex(yj_int(cv, -1));
-			}
-			if (yyjson_val *mv = yyjson_obj_get(nobj, "mesh")) {
-				GLTFFastAccess::node_mesh(node.ptr()) = GLTFMeshIndex(yj_int(mv, -1));
-			}
-			if (yyjson_val *sv = yyjson_obj_get(nobj, "skin")) {
-				GLTFFastAccess::node_skin(node.ptr()) = GLTFSkinIndex(yj_int(sv, -1));
-			}
-			if (yyjson_val *mat_arr = yyjson_obj_get(nobj, "matrix")) {
-				Transform3D xf;
-				ERR_FAIL_COND_V(!yj_xform(mat_arr, xf), ERR_PARSE_ERROR);
-				GLTFFastAccess::node_xform(node.ptr()) = xf;
-			} else {
-				Vector3 pos(0.0f, 0.0f, 0.0f);
-				Quaternion rot;
-				Vector3 scl(1.0f, 1.0f, 1.0f);
-				bool has_trs = false;
-				if (yyjson_val *tv = yyjson_obj_get(nobj, "translation")) {
-					ERR_FAIL_COND_V(!yj_vec3(tv, pos), ERR_PARSE_ERROR);
-					has_trs = true;
-				}
-				if (yyjson_val *rv = yyjson_obj_get(nobj, "rotation")) {
-					ERR_FAIL_COND_V(!yj_quat(rv, rot), ERR_PARSE_ERROR);
-					has_trs = true;
-				}
-				if (yyjson_val *sv = yyjson_obj_get(nobj, "scale")) {
-					ERR_FAIL_COND_V(!yj_vec3(sv, scl), ERR_PARSE_ERROR);
-					has_trs = true;
-				}
-				if (has_trs) {
-					Transform3D xf;
-					xf.basis.set_quaternion_scale(rot.normalized(), scl);
-					xf.origin = pos;
-					GLTFFastAccess::node_xform(node.ptr()) = xf;
-				}
-			}
-			GLTFFastAccess::set_node_rest_xform(node.ptr(), GLTFFastAccess::node_xform(node.ptr()));
 
-			if (yyjson_val *w_arr = yyjson_obj_get(nobj, "weights")) {
-				if (yyjson_is_arr(w_arr) && yyjson_arr_size(w_arr) > 0) {
-					Vector<float> &nw = GLTFFastAccess::node_weights(node.ptr());
-					nw.resize(int(yyjson_arr_size(w_arr)));
-					yyjson_arr_iter wit = yyjson_arr_iter_with(w_arr);
-					int wi = 0;
-					yyjson_val *wv = nullptr;
-					while ((wv = yyjson_arr_iter_next(&wit)) != nullptr) {
-						nw.write[wi++] = float(yj_num(wv, 0.0));
+		uint64_t total_fast_children = 0;
+		if (use_fast_pod_nodes && node_cnt > 0) {
+			yyjson_arr_iter pre_it = yyjson_arr_iter_with(nodes_arr);
+			yyjson_val *nobj = nullptr;
+			while ((nobj = yyjson_arr_iter_next(&pre_it)) != nullptr) {
+				if (!yyjson_is_obj(nobj)) {
+					return ERR_PARSE_ERROR;
+				}
+				if (yyjson_obj_get(nobj, "extras") != nullptr ||
+						yyjson_obj_get(nobj, "weights") != nullptr ||
+						yyjson_obj_get(nobj, "skin") != nullptr ||
+						yyjson_obj_get(nobj, "camera") != nullptr) {
+					use_fast_pod_nodes = false;
+					break;
+				}
+				if (yyjson_val *nexts = yyjson_obj_get(nobj, "extensions")) {
+					if (!yyjson_is_obj(nexts)) {
+						use_fast_pod_nodes = false;
+						break;
 					}
-				}
-			}
-
-			if (yyjson_val *nexts = yyjson_obj_get(nobj, "extensions")) {
-				if (yyjson_is_obj(nexts)) {
-					if (yyjson_val *lp = yyjson_obj_get(nexts, "KHR_lights_punctual")) {
-						if (yyjson_is_obj(lp)) {
-							if (yyjson_val *lv = yyjson_obj_get(lp, "light")) {
-								GLTFFastAccess::node_light(node.ptr()) = GLTFLightIndex(yj_int(lv, -1));
-							}
+					yyjson_obj_iter eit = yyjson_obj_iter_with(nexts);
+					yyjson_val *ekey = nullptr;
+					while ((ekey = yyjson_obj_iter_next(&eit)) != nullptr) {
+						if (!yyjson_equals_str(ekey, "KHR_node_visibility")) {
+							use_fast_pod_nodes = false;
+							break;
 						}
 					}
+					if (!use_fast_pod_nodes) {
+						break;
+					}
+				}
+				if (yyjson_val *ch_arr = yyjson_obj_get(nobj, "children")) {
+					if (!yyjson_is_arr(ch_arr)) {
+						use_fast_pod_nodes = false;
+						break;
+					}
+					total_fast_children += yyjson_arr_size(ch_arr);
+					if (total_fast_children > UINT32_MAX) {
+						use_fast_pod_nodes = false;
+						break;
+					}
+				}
+			}
+		}
+
+		if (use_fast_pod_nodes) {
+			fast_nodes.resize(uint32_t(node_cnt));
+			fast_children_pool.resize(uint32_t(total_fast_children));
+			HashSet<StringName> fast_used_snames;
+			fast_used_snames.reserve(uint32_t(node_cnt + 16));
+			fast_used_snames.insert(SNAME("Skeleton3D"));
+
+			uint32_t child_cursor = 0;
+			yyjson_arr_iter it = yyjson_arr_iter_with(nodes_arr);
+			uint32_t ni = 0;
+			yyjson_val *nobj = nullptr;
+			while ((nobj = yyjson_arr_iter_next(&it)) != nullptr) {
+				GLTFState::FastNodeRec &fnode = fast_nodes[ni++];
+				if (yyjson_val *mv = yyjson_obj_get(nobj, "mesh")) {
+					fnode.mesh = int32_t(yj_int(mv, -1));
+				}
+				if (yyjson_val *mat_arr = yyjson_obj_get(nobj, "matrix")) {
+					ERR_FAIL_COND_V(!yj_xform(mat_arr, fnode.xform), ERR_PARSE_ERROR);
+					fnode.has_non_identity_xform = (fnode.xform != Transform3D());
+				} else {
+					Vector3 pos(0.0f, 0.0f, 0.0f);
+					Quaternion rot;
+					Vector3 scl(1.0f, 1.0f, 1.0f);
+					bool has_trs = false;
+					if (yyjson_val *tv = yyjson_obj_get(nobj, "translation")) {
+						ERR_FAIL_COND_V(!yj_vec3(tv, pos), ERR_PARSE_ERROR);
+						has_trs = true;
+					}
+					if (yyjson_val *rv = yyjson_obj_get(nobj, "rotation")) {
+						ERR_FAIL_COND_V(!yj_quat(rv, rot), ERR_PARSE_ERROR);
+						has_trs = true;
+					}
+					if (yyjson_val *sv = yyjson_obj_get(nobj, "scale")) {
+						ERR_FAIL_COND_V(!yj_vec3(sv, scl), ERR_PARSE_ERROR);
+						has_trs = true;
+					}
+					if (has_trs) {
+						fnode.xform.basis.set_quaternion_scale(rot.normalized(), scl);
+						fnode.xform.origin = pos;
+						fnode.has_non_identity_xform = (fnode.xform != Transform3D());
+					}
+				}
+				if (yyjson_val *nexts = yyjson_obj_get(nobj, "extensions")) {
 					if (yyjson_val *vis = yyjson_obj_get(nexts, "KHR_node_visibility")) {
 						if (yyjson_is_obj(vis)) {
 							if (yyjson_val *vv = yyjson_obj_get(vis, "visible")) {
-								GLTFFastAccess::node_visible(node.ptr()) = yj_bool(vv, true);
+								fnode.visible = yj_bool(vv, true);
 							}
+						}
+					}
+				}
+				if (yyjson_val *ch_arr = yyjson_obj_get(nobj, "children")) {
+					const uint32_t ccnt = uint32_t(yyjson_arr_size(ch_arr));
+					fnode.first_child = child_cursor;
+					fnode.child_count = ccnt;
+					yyjson_arr_iter cit = yyjson_arr_iter_with(ch_arr);
+					yyjson_val *cv = nullptr;
+					while ((cv = yyjson_arr_iter_next(&cit)) != nullptr) {
+						fast_children_pool[child_cursor++] = int32_t(yj_int(cv, -1));
+					}
+				}
+
+				yyjson_val *nm = yyjson_obj_get(nobj, "name");
+				const char *nm_ptr = (nm && yyjson_is_str(nm)) ? yyjson_get_str(nm) : nullptr;
+				const size_t nm_len = (nm && yyjson_is_str(nm)) ? yyjson_get_len(nm) : 0;
+				if (is_clean_ascii_node_name(nm_ptr, nm_len)) {
+					StringName cand(nm_ptr);
+					if (!fast_used_snames.has(cand)) {
+						fast_used_snames.insert(cand);
+						fnode.name = cand;
+					} else {
+						const String base = String::utf8(nm_ptr, int(nm_len));
+						int suffix = 2;
+						while (true) {
+							StringName c2(base + itos(suffix));
+							if (!fast_used_snames.has(c2)) {
+								fast_used_snames.insert(c2);
+								fnode.name = c2;
+								break;
+							}
+							suffix++;
+						}
+					}
+				} else {
+					String base = nm_len > 0 ? String::utf8(nm_ptr, int(nm_len)).validate_node_name() : String();
+					if (base.is_empty()) {
+						base = (fnode.mesh >= 0) ? String("Mesh") : String("Node");
+						base = base.validate_node_name();
+					}
+					StringName cand(base);
+					if (!fast_used_snames.has(cand)) {
+						fast_used_snames.insert(cand);
+						fnode.name = cand;
+					} else {
+						int suffix = 2;
+						while (true) {
+							StringName c2(base + itos(suffix));
+							if (!fast_used_snames.has(c2)) {
+								fast_used_snames.insert(c2);
+								fnode.name = c2;
+								break;
+							}
+							suffix++;
 						}
 					}
 				}
 			}
 
-			attach_yyjson_extras_to_meta(yyjson_obj_get(nobj, "extras"), node);
+			// Link parents and verify acyclic hierarchy on contiguous POD array.
+			for (int i = 0; i < node_cnt; i++) {
+				const GLTFState::FastNodeRec &fn = fast_nodes[uint32_t(i)];
+				for (uint32_t c = 0; c < fn.child_count; c++) {
+					const int32_t child_i = fast_children_pool[fn.first_child + c];
+					ERR_FAIL_INDEX_V(child_i, node_cnt, ERR_FILE_CORRUPT);
+					ERR_CONTINUE(fast_nodes[uint32_t(child_i)].parent != -1);
+					fast_nodes[uint32_t(child_i)].parent = i;
+				}
+			}
+			for (int i = 0; i < node_cnt; i++) {
+				int h = 0;
+				int cur = fast_nodes[uint32_t(i)].parent;
+				while (cur >= 0 && h <= node_cnt) {
+					h++;
+					cur = fast_nodes[uint32_t(cur)].parent;
+				}
+				ERR_FAIL_COND_V(h > node_cnt, ERR_FILE_CORRUPT);
+			}
 
-			if (yyjson_val *ch_arr = yyjson_obj_get(nobj, "children")) {
-				if (yyjson_is_arr(ch_arr) && yyjson_arr_size(ch_arr) > 0) {
-					Vector<int> &children = GLTFFastAccess::node_children(node.ptr());
-					children.resize(int(yyjson_arr_size(ch_arr)));
-					yyjson_arr_iter cit = yyjson_arr_iter_with(ch_arr);
-					int ci = 0;
-					yyjson_val *cv = nullptr;
-					while ((cv = yyjson_arr_iter_next(&cit)) != nullptr) {
-						children.write[ci++] = int(yj_int(cv, -1));
+			// Synchronize only colliding scene/mesh names into unique_names (O(1) probes, zero 10k-string copy).
+			auto sync_fast_collision = [&](const String &p_cand) {
+				if (p_cand.is_empty()) {
+					return;
+				}
+				const String s = p_cand.validate_node_name();
+				if (fast_used_snames.has(StringName(s))) {
+					GLTFFastAccess::unique_names(p_state.ptr()).insert(s);
+					int suffix = 2;
+					while (fast_used_snames.has(StringName(s + itos(suffix)))) {
+						GLTFFastAccess::unique_names(p_state.ptr()).insert(s + itos(suffix));
+						suffix++;
+					}
+				}
+			};
+			sync_fast_collision(GLTFFastAccess::scene_name(p_state.ptr()));
+			if (yyjson_val *m_arr_chk = yyjson_obj_get(root, "meshes")) {
+				if (yyjson_is_arr(m_arr_chk)) {
+					yyjson_arr_iter mit = yyjson_arr_iter_with(m_arr_chk);
+					yyjson_val *mobj = nullptr;
+					while ((mobj = yyjson_arr_iter_next(&mit)) != nullptr) {
+						if (yyjson_is_obj(mobj)) {
+							const String om = yj_str(yyjson_obj_get(mobj, "name"));
+							const String bm = !om.is_empty() ? om : String("mesh");
+							sync_fast_collision(vformat("%s_%s", GLTFFastAccess::scene_name(p_state.ptr()), bm));
+						}
 					}
 				}
 			}
-			state_nodes.write[ni++] = node;
-		}
+		} else {
+			state_nodes.resize(node_cnt);
+			yyjson_arr_iter it = yyjson_arr_iter_with(nodes_arr);
+			int ni = 0;
+			yyjson_val *nobj = nullptr;
+			while ((nobj = yyjson_arr_iter_next(&it)) != nullptr) {
+				ERR_FAIL_COND_V(!yyjson_is_obj(nobj), ERR_PARSE_ERROR);
+				Ref<GLTFNode> node;
+				node.instantiate();
+				if (yyjson_val *nm = yyjson_obj_get(nobj, "name")) {
+					const String ns = yj_str(nm);
+					node->set_original_name(ns);
+					node->set_name(ns);
+				}
+				if (yyjson_val *cv = yyjson_obj_get(nobj, "camera")) {
+					GLTFFastAccess::node_camera(node.ptr()) = GLTFCameraIndex(yj_int(cv, -1));
+				}
+				if (yyjson_val *mv = yyjson_obj_get(nobj, "mesh")) {
+					GLTFFastAccess::node_mesh(node.ptr()) = GLTFMeshIndex(yj_int(mv, -1));
+				}
+				if (yyjson_val *sv = yyjson_obj_get(nobj, "skin")) {
+					GLTFFastAccess::node_skin(node.ptr()) = GLTFSkinIndex(yj_int(sv, -1));
+				}
+				if (yyjson_val *mat_arr = yyjson_obj_get(nobj, "matrix")) {
+					Transform3D xf;
+					ERR_FAIL_COND_V(!yj_xform(mat_arr, xf), ERR_PARSE_ERROR);
+					GLTFFastAccess::node_xform(node.ptr()) = xf;
+				} else {
+					Vector3 pos(0.0f, 0.0f, 0.0f);
+					Quaternion rot;
+					Vector3 scl(1.0f, 1.0f, 1.0f);
+					bool has_trs = false;
+					if (yyjson_val *tv = yyjson_obj_get(nobj, "translation")) {
+						ERR_FAIL_COND_V(!yj_vec3(tv, pos), ERR_PARSE_ERROR);
+						has_trs = true;
+					}
+					if (yyjson_val *rv = yyjson_obj_get(nobj, "rotation")) {
+						ERR_FAIL_COND_V(!yj_quat(rv, rot), ERR_PARSE_ERROR);
+						has_trs = true;
+					}
+					if (yyjson_val *sv = yyjson_obj_get(nobj, "scale")) {
+						ERR_FAIL_COND_V(!yj_vec3(sv, scl), ERR_PARSE_ERROR);
+						has_trs = true;
+					}
+					if (has_trs) {
+						Transform3D xf;
+						xf.basis.set_quaternion_scale(rot.normalized(), scl);
+						xf.origin = pos;
+						GLTFFastAccess::node_xform(node.ptr()) = xf;
+					}
+				}
+				GLTFFastAccess::set_node_rest_xform(node.ptr(), GLTFFastAccess::node_xform(node.ptr()));
 
-		// Link parents and compute heights (with cycle guard).
-		for (int i = 0; i < node_cnt; i++) {
-			const Vector<int> &ch = GLTFFastAccess::node_children(state_nodes[i].ptr());
-			for (int j = 0; j < ch.size(); j++) {
-				const int child_i = ch[j];
-				ERR_FAIL_INDEX_V(child_i, node_cnt, ERR_FILE_CORRUPT);
-				ERR_CONTINUE(GLTFFastAccess::node_parent(state_nodes[child_i].ptr()) != -1);
-				GLTFFastAccess::node_parent(state_nodes.write[child_i].ptr()) = i;
+				if (yyjson_val *w_arr = yyjson_obj_get(nobj, "weights")) {
+					if (yyjson_is_arr(w_arr) && yyjson_arr_size(w_arr) > 0) {
+						Vector<float> &nw = GLTFFastAccess::node_weights(node.ptr());
+						nw.resize(int(yyjson_arr_size(w_arr)));
+						yyjson_arr_iter wit = yyjson_arr_iter_with(w_arr);
+						int wi = 0;
+						yyjson_val *wv = nullptr;
+						while ((wv = yyjson_arr_iter_next(&wit)) != nullptr) {
+							nw.write[wi++] = float(yj_num(wv, 0.0));
+						}
+					}
+				}
+
+				if (yyjson_val *nexts = yyjson_obj_get(nobj, "extensions")) {
+					if (yyjson_is_obj(nexts)) {
+						if (yyjson_val *lp = yyjson_obj_get(nexts, "KHR_lights_punctual")) {
+							if (yyjson_is_obj(lp)) {
+								if (yyjson_val *lv = yyjson_obj_get(lp, "light")) {
+									GLTFFastAccess::node_light(node.ptr()) = GLTFLightIndex(yj_int(lv, -1));
+								}
+							}
+						}
+						if (yyjson_val *vis = yyjson_obj_get(nexts, "KHR_node_visibility")) {
+							if (yyjson_is_obj(vis)) {
+								if (yyjson_val *vv = yyjson_obj_get(vis, "visible")) {
+									GLTFFastAccess::node_visible(node.ptr()) = yj_bool(vv, true);
+								}
+							}
+						}
+					}
+				}
+
+				attach_yyjson_extras_to_meta(yyjson_obj_get(nobj, "extras"), node);
+
+				if (yyjson_val *ch_arr = yyjson_obj_get(nobj, "children")) {
+					if (yyjson_is_arr(ch_arr) && yyjson_arr_size(ch_arr) > 0) {
+						Vector<int> &children = GLTFFastAccess::node_children(node.ptr());
+						children.resize(int(yyjson_arr_size(ch_arr)));
+						yyjson_arr_iter cit = yyjson_arr_iter_with(ch_arr);
+						int ci = 0;
+						yyjson_val *cv = nullptr;
+						while ((cv = yyjson_arr_iter_next(&cit)) != nullptr) {
+							children.write[ci++] = int(yj_int(cv, -1));
+						}
+					}
+				}
+				state_nodes.write[ni++] = node;
 			}
-		}
-		if (p_doc->get_naming_version() < 2) {
-			rnodes.clear();
-		}
-		for (int i = 0; i < node_cnt; i++) {
-			int h = 0;
-			int cur = GLTFFastAccess::node_parent(state_nodes[i].ptr());
-			while (cur >= 0 && h <= node_cnt) {
-				h++;
-				cur = GLTFFastAccess::node_parent(state_nodes[cur].ptr());
+
+			// Link parents and compute heights (with cycle guard).
+			for (int i = 0; i < node_cnt; i++) {
+				const Vector<int> &ch = GLTFFastAccess::node_children(state_nodes[i].ptr());
+				for (int j = 0; j < ch.size(); j++) {
+					const int child_i = ch[j];
+					ERR_FAIL_INDEX_V(child_i, node_cnt, ERR_FILE_CORRUPT);
+					ERR_CONTINUE(GLTFFastAccess::node_parent(state_nodes[child_i].ptr()) != -1);
+					GLTFFastAccess::node_parent(state_nodes.write[child_i].ptr()) = i;
+				}
 			}
-			ERR_FAIL_COND_V(h > node_cnt, ERR_FILE_CORRUPT);
-			GLTFFastAccess::node_height(state_nodes.write[i].ptr()) = h;
-			if (p_doc->get_naming_version() < 2 && h == 0) {
-				rnodes.push_back(i);
+			if (p_doc->get_naming_version() < 2) {
+				rnodes.clear();
+			}
+			for (int i = 0; i < node_cnt; i++) {
+				int h = 0;
+				int cur = GLTFFastAccess::node_parent(state_nodes[i].ptr());
+				while (cur >= 0 && h <= node_cnt) {
+					h++;
+					cur = GLTFFastAccess::node_parent(state_nodes[cur].ptr());
+				}
+				ERR_FAIL_COND_V(h > node_cnt, ERR_FILE_CORRUPT);
+				GLTFFastAccess::node_height(state_nodes.write[i].ptr()) = h;
+				if (p_doc->get_naming_version() < 2 && h == 0) {
+					rnodes.push_back(i);
+				}
 			}
 		}
 	}
@@ -1183,6 +1479,13 @@ Error gltf_yyjson_populate_state(
 				if (strict_ext_ktx2) {
 					const String game_dir = p_state->get_additional_data(SNAME("_ange_asset_game_dir"));
 					const Callable ext_resolver = p_state->get_additional_data(SNAME("_ange_external_uri_resolver"));
+					const Callable ktx2_lookup = p_state->get_additional_data(SNAME("_ange_ktx2_pool_lookup"));
+					const Callable ktx2_register = p_state->get_additional_data(SNAME("_ange_ktx2_pool_register"));
+					const bool use_rescache_parallel = p_state->get_additional_data(SNAME("_ange_parallel_ktx2_rescache")).booleanize();
+
+					LocalVector<String> resolved_uris;
+					resolved_uris.resize(uint32_t(img_cnt));
+
 					yyjson_arr_iter it = yyjson_arr_iter_with(imgs_arr);
 					int ii = 0;
 					yyjson_val *iobj = nullptr;
@@ -1255,11 +1558,110 @@ Error gltf_yyjson_populate_state(
 						ERR_FAIL_COND_V_MSG(res_uri.is_empty(), ERR_FILE_NOT_FOUND,
 								vformat("GLTF-KTX2-002: External KTX2 texture '%s' (image %d) was not found.", decoded_uri, ii));
 
-						Ref<Texture2D> ext_tex = ResourceLoader::load(res_uri, "Texture2D", ResourceFormatLoader::CACHE_MODE_REUSE);
-						ERR_FAIL_COND_V_MSG(ext_tex.is_null(), ERR_FILE_CORRUPT,
-								vformat("GLTF-KTX2-003: Failed to transcode external KTX2 texture '%s'.", res_uri));
-						state_images.write[ii] = ext_tex;
+						resolved_uris[uint32_t(ii)] = res_uri;
 						ii++;
+					}
+
+					if (img_mode != GLTFState::HANDLE_BINARY_IMAGE_MODE_DISCARD_TEXTURES) {
+						const bool has_custom_pool = ktx2_lookup.is_valid() && ktx2_register.is_valid();
+						if (has_custom_pool || use_rescache_parallel) {
+							LocalVector<String> unique_uris;
+							LocalVector<Ref<Texture2D>> unique_texs;
+							LocalVector<int32_t> img_to_unique;
+							img_to_unique.resize(uint32_t(img_cnt));
+							HashMap<String, uint32_t> uri_to_idx;
+
+							for (int k = 0; k < img_cnt; k++) {
+								const String &u_str = resolved_uris[uint32_t(k)];
+								HashMap<String, uint32_t>::Iterator E = uri_to_idx.find(u_str);
+								if (E) {
+									img_to_unique[uint32_t(k)] = int32_t(E->value);
+								} else {
+									const uint32_t uidx = unique_uris.size();
+									unique_uris.push_back(u_str);
+									unique_texs.push_back(Ref<Texture2D>());
+									uri_to_idx.insert(u_str, uidx);
+									img_to_unique[uint32_t(k)] = int32_t(uidx);
+								}
+							}
+
+							LocalVector<uint32_t> miss_indices;
+							for (uint32_t u = 0; u < unique_uris.size(); u++) {
+								Ref<Texture2D> hit_tex;
+								if (has_custom_pool) {
+									Variant arg = unique_uris[u];
+									const Variant *argp = &arg;
+									Variant found_var;
+									Callable::CallError cerr;
+									ktx2_lookup.callp(&argp, 1, found_var, cerr);
+									if (cerr.error == Callable::CallError::CALL_OK) {
+										hit_tex = Ref<Texture2D>(found_var);
+									}
+								} else {
+									hit_tex = ResourceCache::get_ref(unique_uris[u]);
+								}
+								if (hit_tex.is_valid()) {
+									unique_texs[u] = hit_tex;
+								} else {
+									miss_indices.push_back(u);
+								}
+							}
+
+							if (!miss_indices.is_empty()) {
+								LocalVector<Ref<Image>> miss_imgs;
+								miss_imgs.resize(miss_indices.size());
+								for (uint32_t m = 0; m < miss_indices.size(); m++) {
+									const uint32_t u = miss_indices[m];
+									FileAccessMMapView kview;
+									if (Image::_ktx_mem_loader_func && kview.open(unique_uris[u]) == OK && kview.is_valid()) {
+										if (kview.size() > 0 && kview.size() <= INT32_MAX) {
+											miss_imgs[m] = Image::_ktx_mem_loader_func(kview.ptr(), static_cast<int>(kview.size()));
+										}
+									} else {
+										miss_imgs[m] = Image::load_from_file(unique_uris[u]);
+									}
+								}
+
+								for (uint32_t m = 0; m < miss_indices.size(); m++) {
+									const uint32_t u = miss_indices[m];
+									ERR_FAIL_COND_V_MSG(miss_imgs[m].is_null() || miss_imgs[m]->is_empty(), ERR_FILE_CORRUPT,
+											vformat("GLTF-KTX2-003: Failed to transcode external KTX2 texture '%s'.", unique_uris[u]));
+									Ref<Texture2D> reg_tex;
+									if (has_custom_pool) {
+										Variant arg_u = unique_uris[u];
+										Variant arg_i = miss_imgs[m];
+										const Variant *argsp[2] = { &arg_u, &arg_i };
+										Variant reg_var;
+										Callable::CallError cerr;
+										ktx2_register.callp(argsp, 2, reg_var, cerr);
+										if (cerr.error == Callable::CallError::CALL_OK) {
+											reg_tex = Ref<Texture2D>(reg_var);
+										}
+									} else {
+										Ref<ImageTexture> itex = ImageTexture::create_from_image(miss_imgs[m]);
+										if (itex.is_valid()) {
+											itex->set_meta("_ange_authored_block_texture", true);
+											itex->set_path(unique_uris[u], true);
+											reg_tex = itex;
+										}
+									}
+									ERR_FAIL_COND_V_MSG(reg_tex.is_null(), ERR_FILE_CORRUPT,
+											vformat("GLTF-KTX2-003: Failed to upload external KTX2 texture '%s'.", unique_uris[u]));
+									unique_texs[u] = reg_tex;
+								}
+							}
+
+							for (int k = 0; k < img_cnt; k++) {
+								state_images.write[k] = unique_texs[uint32_t(img_to_unique[uint32_t(k)])];
+							}
+						} else {
+							for (int k = 0; k < img_cnt; k++) {
+								Ref<Texture2D> ext_tex = ResourceLoader::load(resolved_uris[uint32_t(k)], "Texture2D", ResourceFormatLoader::CACHE_MODE_REUSE);
+								ERR_FAIL_COND_V_MSG(ext_tex.is_null(), ERR_FILE_CORRUPT,
+										vformat("GLTF-KTX2-003: Failed to transcode external KTX2 texture '%s'.", resolved_uris[uint32_t(k)]));
+								state_images.write[k] = ext_tex;
+							}
+						}
 					}
 				} else {
 					struct PendingImgJob {
@@ -1743,15 +2145,19 @@ Error gltf_yyjson_populate_state(
 	}
 
 	Vector<Ref<GLTFSkeleton>> &state_skeletons = GLTFFastAccess::skeletons(p_state.ptr());
-	if (p_state->get_import_as_skeleton_bones()) {
-		ERR_FAIL_COND_V(SkinTool::_determine_skeletons(state_skins, state_nodes, state_skeletons, rnodes, true) != OK, ERR_PARSE_ERROR);
+	if (use_fast_pod_nodes) {
+		state_skeletons.clear();
 	} else {
-		ERR_FAIL_COND_V(SkinTool::_determine_skeletons(state_skins, state_nodes, state_skeletons, Vector<GLTFNodeIndex>(), p_doc->get_naming_version() < 2) != OK, ERR_PARSE_ERROR);
+		if (p_state->get_import_as_skeleton_bones()) {
+			ERR_FAIL_COND_V(SkinTool::_determine_skeletons(state_skins, state_nodes, state_skeletons, rnodes, true) != OK, ERR_PARSE_ERROR);
+		} else {
+			ERR_FAIL_COND_V(SkinTool::_determine_skeletons(state_skins, state_nodes, state_skeletons, Vector<GLTFNodeIndex>(), p_doc->get_naming_version() < 2) != OK, ERR_PARSE_ERROR);
+		}
+		if (state_nodes.size() > 16) {
+			GLTFFastAccess::unique_names(p_state.ptr()).reserve(uint32_t(state_nodes.size() + 16));
+		}
+		GLTFFastAccess::assign_node_names(p_doc, p_state);
 	}
-	if (state_nodes.size() > 16) {
-		GLTFFastAccess::unique_names(p_state.ptr()).reserve(uint32_t(state_nodes.size() + 16));
-	}
-	GLTFFastAccess::assign_node_names(p_doc, p_state);
 
 	// 10. Parse meshes directly into runtime ArrayMeshes!
 	Vector<Ref<GLTFMesh>> &state_meshes = GLTFFastAccess::meshes(p_state.ptr());
@@ -1815,6 +2221,11 @@ Error gltf_yyjson_populate_state(
 				ps.mode = int32_t(yj_int(yyjson_obj_get(pobj, "mode"), 4));
 				ps.indices = int32_t(yj_int(yyjson_obj_get(pobj, "indices"), -1));
 				ps.material = int32_t(yj_int(yyjson_obj_get(pobj, "material"), -1));
+				if (yyjson_val *pextras = yyjson_obj_get(pobj, "extras")) {
+					if (yyjson_is_obj(pextras)) {
+						ps.dense_verts_verified = yj_bool(yyjson_obj_get(pextras, "_ange_dense_verts"), false);
+					}
+				}
 
 				yyjson_val *attrs = yyjson_obj_get(pobj, "attributes");
 				ERR_FAIL_COND_V(!attrs || !yyjson_is_obj(attrs), ERR_PARSE_ERROR);
@@ -2056,35 +2467,89 @@ Error gltf_yyjson_populate_state(
 				const GLTFNodeIndex nidx = GLTFNodeIndex(yj_int(node_v, -1));
 				ERR_FAIL_INDEX_V(nidx, state_nodes.size(), ERR_PARSE_ERROR);
 
-				PackedFloat64Array times;
-				auto t_it = time_accessor_cache.find(ss.input);
-				if (t_it) {
-					times = t_it->value;
-				} else {
-					ERR_FAIL_COND_V(!fast_decode_accessor_f64(p_state, ss.input, times), ERR_PARSE_ERROR);
-					time_accessor_cache.insert(ss.input, times);
-				}
+				auto get_fallback_times = [&](PackedFloat64Array &r_times) -> bool {
+					auto t_it = time_accessor_cache.find(ss.input);
+					if (t_it) {
+						r_times = t_it->value;
+						return true;
+					}
+					if (!fast_decode_accessor_f64(p_state, ss.input, r_times)) {
+						return false;
+					}
+					time_accessor_cache.insert(ss.input, r_times);
+					return true;
+				};
 
 				GLTFAnimation::NodeTrack &track = node_tracks[nidx];
 				if (yj_str_eq(path_v, "translation")) {
-					PackedVector3Array vals;
-					ERR_FAIL_COND_V(!fast_decode_accessor_vec3(p_state, ss.output, vals), ERR_PARSE_ERROR);
-					track.position_track.interpolation = ss.interp;
-					track.position_track.times = times;
-					track.position_track.values = vals;
+					const float *t_f32 = nullptr;
+					int32_t t_cnt = 0;
+					const Vector3 *v_ptr = nullptr;
+					int32_t v_cnt = 0;
+					if (want_packed_scene &&
+							try_get_tight_f32_span<float>(p_state, ss.input, GLTFAccessor::TYPE_SCALAR, 4, t_f32, t_cnt) &&
+							try_get_tight_f32_span<Vector3>(p_state, ss.output, GLTFAccessor::TYPE_VEC3, 12, v_ptr, v_cnt)) {
+						track.position_track.interpolation = ss.interp;
+						track.position_track.raw_times_f32 = t_f32;
+						track.position_track.raw_times_count = t_cnt;
+						track.position_track.raw_values_ptr = v_ptr;
+						track.position_track.raw_values_count = v_cnt;
+					} else {
+						PackedFloat64Array times;
+						ERR_FAIL_COND_V(!get_fallback_times(times), ERR_PARSE_ERROR);
+						PackedVector3Array vals;
+						ERR_FAIL_COND_V(!fast_decode_accessor_vec3(p_state, ss.output, vals), ERR_PARSE_ERROR);
+						track.position_track.interpolation = ss.interp;
+						track.position_track.times = times;
+						track.position_track.values = vals;
+					}
 				} else if (yj_str_eq(path_v, "rotation")) {
-					Vector<Quaternion> vals;
-					ERR_FAIL_COND_V(!fast_decode_accessor_quat(p_state, ss.output, vals), ERR_PARSE_ERROR);
-					track.rotation_track.interpolation = ss.interp;
-					track.rotation_track.times = times;
-					track.rotation_track.values = vals;
+					const float *t_f32 = nullptr;
+					int32_t t_cnt = 0;
+					const Quaternion *v_ptr = nullptr;
+					int32_t v_cnt = 0;
+					if (want_packed_scene &&
+							try_get_tight_f32_span<float>(p_state, ss.input, GLTFAccessor::TYPE_SCALAR, 4, t_f32, t_cnt) &&
+							try_get_tight_f32_span<Quaternion>(p_state, ss.output, GLTFAccessor::TYPE_VEC4, 16, v_ptr, v_cnt)) {
+						track.rotation_track.interpolation = ss.interp;
+						track.rotation_track.raw_times_f32 = t_f32;
+						track.rotation_track.raw_times_count = t_cnt;
+						track.rotation_track.raw_values_ptr = v_ptr;
+						track.rotation_track.raw_values_count = v_cnt;
+					} else {
+						PackedFloat64Array times;
+						ERR_FAIL_COND_V(!get_fallback_times(times), ERR_PARSE_ERROR);
+						Vector<Quaternion> vals;
+						ERR_FAIL_COND_V(!fast_decode_accessor_quat(p_state, ss.output, vals), ERR_PARSE_ERROR);
+						track.rotation_track.interpolation = ss.interp;
+						track.rotation_track.times = times;
+						track.rotation_track.values = vals;
+					}
 				} else if (yj_str_eq(path_v, "scale")) {
-					PackedVector3Array vals;
-					ERR_FAIL_COND_V(!fast_decode_accessor_vec3(p_state, ss.output, vals), ERR_PARSE_ERROR);
-					track.scale_track.interpolation = ss.interp;
-					track.scale_track.times = times;
-					track.scale_track.values = vals;
+					const float *t_f32 = nullptr;
+					int32_t t_cnt = 0;
+					const Vector3 *v_ptr = nullptr;
+					int32_t v_cnt = 0;
+					if (want_packed_scene &&
+							try_get_tight_f32_span<float>(p_state, ss.input, GLTFAccessor::TYPE_SCALAR, 4, t_f32, t_cnt) &&
+							try_get_tight_f32_span<Vector3>(p_state, ss.output, GLTFAccessor::TYPE_VEC3, 12, v_ptr, v_cnt)) {
+						track.scale_track.interpolation = ss.interp;
+						track.scale_track.raw_times_f32 = t_f32;
+						track.scale_track.raw_times_count = t_cnt;
+						track.scale_track.raw_values_ptr = v_ptr;
+						track.scale_track.raw_values_count = v_cnt;
+					} else {
+						PackedFloat64Array times;
+						ERR_FAIL_COND_V(!get_fallback_times(times), ERR_PARSE_ERROR);
+						PackedVector3Array vals;
+						ERR_FAIL_COND_V(!fast_decode_accessor_vec3(p_state, ss.output, vals), ERR_PARSE_ERROR);
+						track.scale_track.interpolation = ss.interp;
+						track.scale_track.times = times;
+						track.scale_track.values = vals;
+					}
 				} else if (yj_str_eq(path_v, "weights")) {
+					PackedFloat64Array times;
+					ERR_FAIL_COND_V(!get_fallback_times(times), ERR_PARSE_ERROR);
 					ERR_FAIL_INDEX_V(ss.output, state_accs.size(), ERR_PARSE_ERROR);
 					const PackedFloat32Array weights = state_accs[ss.output]->decode_as_float32s(p_state);
 					const GLTFMeshIndex midx = GLTFFastAccess::node_mesh(state_nodes[nidx].ptr());

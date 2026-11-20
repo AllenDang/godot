@@ -35,6 +35,8 @@ struct GLTFFastAccess {
 	static _FORCE_INLINE_ Vector<Ref<GLTFBufferView>> &buffer_views(GLTFState *s) { return s->buffer_views; }
 	static _FORCE_INLINE_ Vector<Ref<GLTFAccessor>> &accessors(GLTFState *s) { return s->accessors; }
 	static _FORCE_INLINE_ Vector<Ref<GLTFNode>> &nodes(GLTFState *s) { return s->nodes; }
+	static _FORCE_INLINE_ LocalVector<GLTFState::FastNodeRec> &fast_nodes(GLTFState *s) { return s->fast_nodes; }
+	static _FORCE_INLINE_ LocalVector<int32_t> &fast_children_pool(GLTFState *s) { return s->fast_children_pool; }
 	static _FORCE_INLINE_ Vector<Ref<GLTFMesh>> &meshes(GLTFState *s) { return s->meshes; }
 	static _FORCE_INLINE_ Vector<Ref<Material>> &materials(GLTFState *s) { return s->materials; }
 	static _FORCE_INLINE_ Vector<Ref<GLTFTexture>> &textures(GLTFState *s) { return s->textures; }

@@ -35,35 +35,50 @@ int query_env_max_threads() {
 	return CLAMP(val, 1, LoadThreadPool::MAX_LOAD_THREADS);
 }
 
-bool is_platform_thermally_constrained() {
+int query_platform_thermal_state() {
 #if defined(__APPLE__)
 	// Query NSProcessInfo.processInfo.thermalState via Objective-C runtime:
 	// 0 = Nominal, 1 = Fair, 2 = Serious, 3 = Critical.
 	Class cls = objc_getClass("NSProcessInfo");
 	if (!cls) {
-		return false;
+		return 0;
 	}
 	SEL proc_sel = sel_registerName("processInfo");
 	SEL therm_sel = sel_registerName("thermalState");
 	id proc_info = ((id(*)(id, SEL))objc_msgSend)((id)cls, proc_sel);
 	if (!proc_info) {
-		return false;
+		return 0;
 	}
-	const long state = ((long (*)(id, SEL))objc_msgSend)(proc_info, therm_sel);
-	return state >= 2;
+	return static_cast<int>(((long (*)(id, SEL))objc_msgSend)(proc_info, therm_sel));
 #else
-	return false;
+	return 0;
 #endif
 }
+
+struct ScopedPoolParticipant {
+	bool prev;
+	ScopedPoolParticipant() :
+			prev(tl_is_load_pool_worker) {
+		tl_is_load_pool_worker = true;
+	}
+	~ScopedPoolParticipant() {
+		tl_is_load_pool_worker = prev;
+	}
+};
 
 } // namespace
 
 LoadThreadPool *LoadThreadPool::get_singleton() {
-	std::lock_guard<std::mutex> lock(g_pool_singleton_mutex);
-	if (!g_load_pool_singleton) {
-		g_load_pool_singleton = memnew(LoadThreadPool);
+	LoadThreadPool *pool = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(g_pool_singleton_mutex);
+		if (!g_load_pool_singleton) {
+			g_load_pool_singleton = memnew(LoadThreadPool);
+		}
+		pool = g_load_pool_singleton;
 	}
-	return g_load_pool_singleton;
+	pool->_ensure_initialized();
+	return pool;
 }
 
 void LoadThreadPool::cleanup() {
@@ -98,8 +113,12 @@ int LoadThreadPool::get_concurrency_budget(bool p_gameplay_throttle) const {
 	if (env_cap > 0) {
 		budget = MIN(budget, env_cap);
 	}
-	if (is_platform_thermally_constrained()) {
+	const int thermal = query_platform_thermal_state();
+	if (thermal >= 3) {
 		return 1;
+	}
+	if (thermal == 2) {
+		budget = MIN(budget, 2);
 	}
 	if (p_gameplay_throttle) {
 		const Engine *eng = Engine::get_singleton();
@@ -116,7 +135,8 @@ void LoadThreadPool::_ensure_initialized() {
 		return;
 	}
 	const int cpu_count = OS::get_singleton() ? MAX(1, OS::get_singleton()->get_processor_count()) : 1;
-	const int num_workers = CLAMP(cpu_count, 1, MAX_LOAD_THREADS);
+	// Calling thread participates as 1 worker, so at most (MAX_LOAD_THREADS - 1) helper threads are needed.
+	const int num_workers = CLAMP(cpu_count - 1, 1, MAX_LOAD_THREADS - 1);
 	Thread::Settings settings;
 	settings.priority = Thread::PRIORITY_LOW;
 
@@ -147,7 +167,10 @@ void LoadThreadPool::_worker_loop(int p_slot_index) {
 		{
 			std::unique_lock<std::mutex> qlock(queue_mutex);
 			worker_cv.wait(qlock, [&]() {
-				return shutting_down || (job_generation != seen_generation && p_slot_index < active_worker_limit);
+				return shutting_down ||
+						(job_generation != seen_generation &&
+								p_slot_index < active_worker_limit &&
+								next_index.load(std::memory_order_relaxed) < job_count);
 			});
 			if (shutting_down) {
 				return;
@@ -156,6 +179,7 @@ void LoadThreadPool::_worker_loop(int p_slot_index) {
 			cb = job_callback;
 			ud = job_userdata;
 			count = job_count;
+			remaining_workers.fetch_add(1, std::memory_order_relaxed);
 		}
 
 		for (;;) {
@@ -166,9 +190,11 @@ void LoadThreadPool::_worker_loop(int p_slot_index) {
 			cb(ud, idx);
 		}
 
-		if (remaining_workers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+		{
 			std::lock_guard<std::mutex> qlock(queue_mutex);
-			done_cv.notify_one();
+			if (remaining_workers.fetch_sub(1, std::memory_order_acq_rel) == 1 && active_worker_limit == 0) {
+				done_cv.notify_one();
+			}
 		}
 	}
 }
@@ -195,8 +221,9 @@ void LoadThreadPool::parallel_for_raw(int p_count, TaskCallback p_callback, void
 	std::lock_guard<std::mutex> dlock(dispatch_mutex);
 	_ensure_initialized();
 	const int avail = static_cast<int>(workers.size());
-	const int active = CLAMP(MIN(p_count, budget), 1, avail);
-	if (active <= 0) {
+	const int total_threads = CLAMP(MIN(p_count, budget), 1, MAX_LOAD_THREADS);
+	const int helpers = CLAMP(total_threads - 1, 0, avail);
+	if (helpers <= 0) {
 		for (int i = 0; i < p_count; i++) {
 			p_callback(p_userdata, i);
 		}
@@ -208,25 +235,32 @@ void LoadThreadPool::parallel_for_raw(int p_count, TaskCallback p_callback, void
 		job_callback = p_callback;
 		job_userdata = p_userdata;
 		job_count = p_count;
-		active_worker_limit = active;
+		active_worker_limit = helpers;
 		next_index.store(0, std::memory_order_relaxed);
-		remaining_workers.store(active, std::memory_order_release);
+		remaining_workers.store(0, std::memory_order_relaxed);
 		job_generation++;
 	}
-	if (active == 1) {
-		worker_cv.notify_one();
-	} else {
-		worker_cv.notify_all();
+	worker_cv.notify_all();
+
+	{
+		ScopedPoolParticipant participant_guard;
+		for (;;) {
+			const int idx = next_index.fetch_add(1, std::memory_order_relaxed);
+			if (idx >= p_count) {
+				break;
+			}
+			p_callback(p_userdata, idx);
+		}
 	}
 
 	{
 		std::unique_lock<std::mutex> qlock(queue_mutex);
+		active_worker_limit = 0;
 		done_cv.wait(qlock, [&]() {
 			return remaining_workers.load(std::memory_order_acquire) == 0;
 		});
 		job_callback = nullptr;
 		job_userdata = nullptr;
 		job_count = 0;
-		active_worker_limit = 0;
 	}
 }

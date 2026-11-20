@@ -284,13 +284,29 @@ Error GLTFDocument::_parse_glb(Ref<FileAccess> p_file, Ref<GLTFState> p_state) {
 	uint32_t chunk_length = p_file->get_32();
 	uint32_t chunk_type = p_file->get_32();
 
-	ERR_FAIL_COND_V(chunk_type != 0x4E4F534A, ERR_PARSE_ERROR); //JSON
 	Vector<uint8_t> json_data;
-	json_data.resize(chunk_length);
-	uint32_t len = p_file->get_buffer(json_data.ptrw(), chunk_length);
-	ERR_FAIL_COND_V(len != chunk_length, ERR_FILE_CORRUPT);
+	if (chunk_type == 0x4E4F534Au) { // JSON
+		json_data.resize(chunk_length);
+		uint32_t len = p_file->get_buffer(json_data.ptrw(), chunk_length);
+		ERR_FAIL_COND_V(len != chunk_length, ERR_FILE_CORRUPT);
+	} else if (chunk_type == 0x4A54535Au) { // ZSTJ lossless Zstd JSON chunk: [u64 uncomp_len][u64 comp_len][zstd_frame][pad]
+		ERR_FAIL_COND_V(chunk_length < 16, ERR_FILE_CORRUPT);
+		Vector<uint8_t> comp_json;
+		comp_json.resize(chunk_length);
+		uint32_t len = p_file->get_buffer(comp_json.ptrw(), chunk_length);
+		ERR_FAIL_COND_V(len != chunk_length, ERR_FILE_CORRUPT);
+		const uint64_t uncomp_len = decode_uint64(comp_json.ptr());
+		const uint64_t comp_len = decode_uint64(comp_json.ptr() + 8);
+		ERR_FAIL_COND_V(uncomp_len == 0 || uncomp_len > (512ULL << 20) || comp_len > uint64_t(chunk_length - 16), ERR_FILE_CORRUPT);
+		json_data.resize(int64_t(uncomp_len));
+		const int64_t dec = Compression::decompress(json_data.ptrw(), int64_t(uncomp_len), comp_json.ptr() + 16, int64_t(comp_len), Compression::MODE_ZSTD);
+		ERR_FAIL_COND_V(dec != int64_t(uncomp_len), ERR_FILE_CORRUPT);
+	} else {
+		ERR_FAIL_V(ERR_PARSE_ERROR);
+	}
 
 	String text = String::utf8((const char *)json_data.ptr(), json_data.size());
+	uint32_t len = 0;
 
 	JSON json;
 	Error err = json.parse(text);
@@ -7584,16 +7600,31 @@ Error GLTFDocument::_parse_from_raw_bytes(
 
 	const uint8_t *json_ptr = nullptr;
 	size_t json_len = 0;
+	PackedByteArray decomp_json_owner;
 
 	if (p_size >= 4 && decode_uint32(p_bytes) == 0x46546C67u) {
 		// Binary .glb container.
 		ERR_FAIL_COND_V(p_size < 20, ERR_FILE_CORRUPT);
 		const uint32_t chunk0_len = decode_uint32(p_bytes + 12);
 		const uint32_t chunk0_type = decode_uint32(p_bytes + 16);
-		ERR_FAIL_COND_V(chunk0_type != 0x4E4F534Au, ERR_PARSE_ERROR); // JSON
 		ERR_FAIL_COND_V(int64_t(20) + int64_t(chunk0_len) > p_size, ERR_FILE_CORRUPT);
-		json_ptr = p_bytes + 20;
-		json_len = size_t(chunk0_len);
+		if (chunk0_type == 0x4E4F534Au) { // JSON
+			json_ptr = p_bytes + 20;
+			json_len = size_t(chunk0_len);
+		} else if (chunk0_type == 0x4A54535Au) { // ZSTJ lossless Zstd JSON chunk: [u64 uncomp_len][u64 comp_len][zstd_frame][pad]
+			ERR_FAIL_COND_V(chunk0_len < 16, ERR_FILE_CORRUPT);
+			const uint8_t *jz = p_bytes + 20;
+			const uint64_t uncomp_len = decode_uint64(jz);
+			const uint64_t comp_len = decode_uint64(jz + 8);
+			ERR_FAIL_COND_V(uncomp_len == 0 || uncomp_len > (512ULL << 20) || comp_len > uint64_t(chunk0_len - 16), ERR_FILE_CORRUPT);
+			ERR_FAIL_COND_V(decomp_json_owner.resize(int64_t(uncomp_len)) != OK, ERR_OUT_OF_MEMORY);
+			const int64_t dec = Compression::decompress(decomp_json_owner.ptrw(), int64_t(uncomp_len), jz + 16, int64_t(comp_len), Compression::MODE_ZSTD);
+			ERR_FAIL_COND_V(dec != int64_t(uncomp_len), ERR_FILE_CORRUPT);
+			json_ptr = decomp_json_owner.ptr();
+			json_len = size_t(uncomp_len);
+		} else {
+			ERR_FAIL_V(ERR_PARSE_ERROR);
+		}
 
 		const int64_t bin_hdr_off = int64_t(20) + int64_t(chunk0_len);
 		if (bin_hdr_off + 8 <= p_size) {

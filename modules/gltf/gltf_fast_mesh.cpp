@@ -977,7 +977,7 @@ Error gltf_build_fast_array_mesh(
 		int32_t vertex_num = orig_vertex_num;
 		LocalVector<int32_t> source_vertices;
 
-		if (has_index_buffer && idx_acc_ptr != nullptr) {
+		if (has_index_buffer && idx_acc_ptr != nullptr && !(prim.dense_verts_verified && defer_direct_tri_indices)) {
 			const uint32_t word_count = uint32_t((orig_vertex_num + 63) >> 6);
 			LocalVector<uint64_t> used_bits;
 			used_bits.resize(word_count);
@@ -1285,22 +1285,64 @@ Error gltf_build_fast_array_mesh(
 		uint8_t *aw = attrib_array.ptrw();
 		uint8_t *sw = skin_array.ptrw();
 
-		// Precompute UV scale if using compressed UVs.
+		// Precompute UV scale if using compressed UVs (ARM NEON 4-wide vector reduction on tight float32 UVs).
 		Vector4 uv_scale(0.0f, 0.0f, 0.0f, 0.0f);
 		if (use_compressed && (has_uv0 || has_uv1)) {
 			Vector2 min0(0.0f, 0.0f), max0(0.0f, 0.0f);
 			Vector2 min1(0.0f, 0.0f), max1(0.0f, 0.0f);
-			for (int32_t i = 0; i < vertex_num; i++) {
-				const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
+#if defined(__aarch64__) || defined(_M_ARM64)
+			auto reduce_uv_minmax_neon = [](const float *p_uv, int32_t p_cnt, Vector2 &r_min, Vector2 &r_max) {
+				int32_t k = 0;
+				if (p_cnt >= 4) {
+					float32x4_t vmin0 = vld1q_f32(p_uv);
+					float32x4_t vmax0 = vmin0;
+					float32x4_t vmin1 = vld1q_f32(p_uv + 4);
+					float32x4_t vmax1 = vmin1;
+					k = 4;
+					for (; k + 4 <= p_cnt; k += 4) {
+						const float32x4_t a = vld1q_f32(p_uv + 2 * size_t(k));
+						const float32x4_t b = vld1q_f32(p_uv + 2 * size_t(k) + 4);
+						vmin0 = vminq_f32(vmin0, a);
+						vmax0 = vmaxq_f32(vmax0, a);
+						vmin1 = vminq_f32(vmin1, b);
+						vmax1 = vmaxq_f32(vmax1, b);
+					}
+					const float32x4_t vmin = vminq_f32(vmin0, vmin1);
+					const float32x4_t vmax = vmaxq_f32(vmax0, vmax1);
+					float mn[4], mx[4];
+					vst1q_f32(mn, vmin);
+					vst1q_f32(mx, vmax);
+					r_min = Vector2(MIN(mn[0], mn[2]), MIN(mn[1], mn[3])).min(Vector2(0.0f, 0.0f));
+					r_max = Vector2(MAX(mx[0], mx[2]), MAX(mx[1], mx[3])).max(Vector2(0.0f, 0.0f));
+				}
+				for (; k < p_cnt; k++) {
+					const Vector2 uv(p_uv[2 * size_t(k)], p_uv[2 * size_t(k) + 1]);
+					r_min = r_min.min(uv);
+					r_max = r_max.max(uv);
+				}
+			};
+			if (identity_mapping && (!has_uv0 || uv0_acc.is_tight_f32(2)) && (!has_uv1 || uv1_acc.is_tight_f32(2))) {
 				if (has_uv0) {
-					const Vector2 uv = uv0_acc.read_vec2(src_v);
-					min0 = min0.min(uv);
-					max0 = max0.max(uv);
+					reduce_uv_minmax_neon(reinterpret_cast<const float *>(uv0_acc.data), vertex_num, min0, max0);
 				}
 				if (has_uv1) {
-					const Vector2 uv2 = uv1_acc.read_vec2(src_v);
-					min1 = min1.min(uv2);
-					max1 = max1.max(uv2);
+					reduce_uv_minmax_neon(reinterpret_cast<const float *>(uv1_acc.data), vertex_num, min1, max1);
+				}
+			} else
+#endif
+			{
+				for (int32_t i = 0; i < vertex_num; i++) {
+					const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
+					if (has_uv0) {
+						const Vector2 uv = uv0_acc.read_vec2(src_v);
+						min0 = min0.min(uv);
+						max0 = max0.max(uv);
+					}
+					if (has_uv1) {
+						const Vector2 uv2 = uv1_acc.read_vec2(src_v);
+						min1 = min1.min(uv2);
+						max1 = max1.max(uv2);
+					}
 				}
 			}
 			max0 = max0.abs().max(min0.abs());
@@ -1318,11 +1360,47 @@ Error gltf_build_fast_array_mesh(
 			std::memcpy(aw, uv0_acc.data, size_t(vertex_num) * 8);
 		}
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+		const bool fast_neon_uv0_u16 = (use_compressed && attrib_elem_size == 4 && offsets[RSE::ARRAY_TEX_UV] == 0 &&
+				!valid_color && !has_uv1 && custom_channels[0] == 0 && has_uv0 &&
+				identity_mapping && cached_uv0.is_empty() && uv0_acc.is_tight_f32(2));
+#endif
+
 		auto pack_attrib_range = [&](uint32_t p_begin, uint32_t p_end) {
 			if (attrib_elem_size == 0 || fast_memcpy_uv0) {
 				return;
 			}
-			for (uint32_t i = p_begin; i < p_end; i++) {
+			uint32_t i = p_begin;
+#if defined(__aarch64__) || defined(_M_ARM64)
+			if (fast_neon_uv0_u16) {
+				const float *src_uv = reinterpret_cast<const float *>(uv0_acc.data);
+				const float32x4_t zero = vdupq_n_f32(0.0f);
+				const float32x4_t one = vdupq_n_f32(1.0f);
+				if (has_nonzero_uv_scale) {
+					const float inv_x = uv_scale.x > 0.0f ? (1.0f / uv_scale.x) : 0.0f;
+					const float inv_y = uv_scale.y > 0.0f ? (1.0f / uv_scale.y) : 0.0f;
+					const float sc_arr[4] = { inv_x, inv_y, inv_x, inv_y };
+					const float32x4_t sc_v = vld1q_f32(sc_arr);
+					const float32x4_t half = vdupq_n_f32(0.5f);
+					for (; i + 4 <= p_end; i += 4) {
+						const float32x4_t u0 = vminq_f32(vmaxq_f32(vfmaq_f32(half, vld1q_f32(src_uv + 2 * size_t(i)), sc_v), zero), one);
+						const float32x4_t u1 = vminq_f32(vmaxq_f32(vfmaq_f32(half, vld1q_f32(src_uv + 2 * size_t(i) + 4), sc_v), zero), one);
+						const uint16x4_t q0 = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(u0, 65535.0f)));
+						const uint16x4_t q1 = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(u1, 65535.0f)));
+						vst1q_u16(reinterpret_cast<uint16_t *>(aw + size_t(i) * 4), vcombine_u16(q0, q1));
+					}
+				} else {
+					for (; i + 4 <= p_end; i += 4) {
+						const float32x4_t u0 = vminq_f32(vmaxq_f32(vld1q_f32(src_uv + 2 * size_t(i)), zero), one);
+						const float32x4_t u1 = vminq_f32(vmaxq_f32(vld1q_f32(src_uv + 2 * size_t(i) + 4), zero), one);
+						const uint16x4_t q0 = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(u0, 65535.0f)));
+						const uint16x4_t q1 = vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(u1, 65535.0f)));
+						vst1q_u16(reinterpret_cast<uint16_t *>(aw + size_t(i) * 4), vcombine_u16(q0, q1));
+					}
+				}
+			}
+#endif
+			for (; i < p_end; i++) {
 				const int32_t src_v = identity_mapping ? int32_t(i) : source_vertices[i];
 				uint8_t *dst_a = aw + i * attrib_elem_size;
 				if (valid_color) {
@@ -1440,7 +1518,7 @@ Error gltf_build_fast_array_mesh(
 				pack_attrib_range(p_begin, p_end);
 			};
 			if (vertex_num >= 16384 && LoadThreadPool::get_singleton()) {
-				const uint32_t chunks = 3;
+				const uint32_t chunks = CLAMP(uint32_t((vertex_num + 16383) / 16384), 6u, 24u);
 				const uint32_t step = ((uint32_t(vertex_num) + chunks - 1) / chunks + 3u) & ~3u;
 				LoadThreadPool::get_singleton()->parallel_for(chunks, [&](uint32_t c) {
 					const uint32_t b = c * step;
@@ -1503,7 +1581,7 @@ Error gltf_build_fast_array_mesh(
 			};
 
 			if (vertex_num >= 8192 && LoadThreadPool::get_singleton()) {
-				const uint32_t chunks = 3;
+				const uint32_t chunks = CLAMP(uint32_t((vertex_num + 8191) / 8192), 6u, 24u);
 				const uint32_t step = ((uint32_t(vertex_num) + chunks - 1) / chunks + 3u) & ~3u;
 				LoadThreadPool::get_singleton()->parallel_for(chunks, [&](uint32_t c) {
 					const uint32_t b = c * step;
@@ -1532,7 +1610,115 @@ Error gltf_build_fast_array_mesh(
 				}
 				r_max_bone = -1;
 				r_any_valid = false;
-				for (uint32_t i = p_begin; i < p_end; i++) {
+				uint32_t i = p_begin;
+#if defined(__aarch64__) || defined(_M_ARM64)
+				const bool tight_j_u8 = has_joints_0 && !j0_acc.is_materialized_u32 && !j0_acc.is_zero && j0_acc.data &&
+						j0_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_BYTE && j0_acc.comps == 4 && j0_acc.stride == 4;
+				const bool tight_j_u16 = has_joints_0 && !j0_acc.is_materialized_u32 && !j0_acc.is_zero && j0_acc.data &&
+						j0_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_SHORT && j0_acc.comps == 4 && j0_acc.stride == 8;
+				if (!use_8_bones && identity_mapping && (tight_j_u8 || tight_j_u16) &&
+						has_weights_0 && w0_acc.is_tight_f32(4) && skin_elem_size == 16 &&
+						offsets[RSE::ARRAY_BONES] == 0 && offsets[RSE::ARRAY_WEIGHTS] == 8) {
+					struct SimdBoneBox {
+						float32x4_t bmin;
+						float32x4_t bmax;
+						bool valid = false;
+					};
+					LocalVector<SimdBoneBox> sboxes;
+					if (tight_j_u8) {
+						sboxes.resize(256);
+					}
+					const float32x4_t zero = vdupq_n_f32(0.0f);
+					const float32x4_t one = vdupq_n_f32(1.0f);
+					const float32x4_t eps_v = vdupq_n_f32(CMP_EPSILON);
+					const float *w_src = reinterpret_cast<const float *>(w0_acc.data);
+
+					for (; i + 4 <= p_end; i += 4) {
+						uint16_t j16[16];
+						if (tight_j_u8) {
+							const uint8x16_t jb = vld1q_u8(j0_acc.data + size_t(i) * 4);
+							const uint16x8_t jlo = vmovl_u8(vget_low_u8(jb));
+							const uint16x8_t jhi = vmovl_high_u8(jb);
+							const int mb = int(MAX(vmaxvq_u16(jlo), vmaxvq_u16(jhi)));
+							if (mb > r_max_bone) {
+								r_max_bone = mb;
+							}
+							vst1q_u16(j16, jlo);
+							vst1q_u16(j16 + 8, jhi);
+						} else {
+							const uint16_t *js = reinterpret_cast<const uint16_t *>(j0_acc.data) + size_t(i) * 4;
+							const uint16x8_t jlo = vld1q_u16(js);
+							const uint16x8_t jhi = vld1q_u16(js + 8);
+							const int mb = int(MAX(vmaxvq_u16(jlo), vmaxvq_u16(jhi)));
+							if (mb > r_max_bone) {
+								r_max_bone = mb;
+							}
+							vst1q_u16(j16, jlo);
+							vst1q_u16(j16 + 8, jhi);
+						}
+						if (r_max_bone >= int(sboxes.size())) {
+							sboxes.resize(uint32_t(r_max_bone + 1));
+						}
+
+						for (uint32_t lane = 0; lane < 4; lane++) {
+							const uint32_t vi = i + lane;
+							uint8_t *dst_s = sw + size_t(vi) * 16;
+							const uint16_t *jl = j16 + lane * 4;
+							std::memcpy(dst_s, jl, 8);
+
+							float32x4_t wv = vld1q_f32(w_src + size_t(vi) * 4);
+							const float tot = vaddvq_f32(wv);
+							if (tot > 0.0f && tot != 1.0f) {
+								wv = vdivq_f32(wv, vdupq_n_f32(tot));
+							}
+							const float32x4_t wcl = vminq_f32(vmaxq_f32(wv, zero), one);
+							vst1_u16(reinterpret_cast<uint16_t *>(dst_s + 8), vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(wcl, 65535.0f))));
+
+							float wf_lane[4];
+							vst1q_f32(wf_lane, wv);
+							const Vector3 &p = pos_ptr[vi];
+							const float p4[4] = { p.x, p.y, p.z, 0.0f };
+							const float32x4_t pv = vld1q_f32(p4);
+							for (uint32_t b = 0; b < 4; b++) {
+								if (wf_lane[b] > 0.0f) {
+									SimdBoneBox &sb = sboxes[jl[b]];
+									if (!sb.valid) {
+										sb.bmin = pv;
+										sb.bmax = vaddq_f32(pv, eps_v);
+										sb.valid = true;
+										r_any_valid = true;
+									} else {
+										sb.bmin = vminq_f32(sb.bmin, pv);
+										sb.bmax = vmaxq_f32(sb.bmax, pv);
+									}
+								}
+							}
+						}
+					}
+
+					if (r_max_bone >= 0) {
+						if (r_max_bone >= int(r_bounds.size())) {
+							const uint32_t old_sz = r_bounds.size();
+							r_bounds.resize(uint32_t(r_max_bone + 1));
+							for (uint32_t b = old_sz; b < r_bounds.size(); b++) {
+								r_bounds[b] = empty_bone_box;
+							}
+						}
+						const uint32_t sb_lim = MIN(uint32_t(r_max_bone + 1), sboxes.size());
+						for (uint32_t b = 0; b < sb_lim; b++) {
+							if (sboxes[b].valid) {
+								float mn[4], mx[4];
+								vst1q_f32(mn, sboxes[b].bmin);
+								vst1q_f32(mx, sboxes[b].bmax);
+								const Vector3 pmin(mn[0], mn[1], mn[2]);
+								const Vector3 pmax(mx[0], mx[1], mx[2]);
+								r_bounds[b] = AABB(pmin, (pmax - pmin).max(small_vec3));
+							}
+						}
+					}
+				}
+#endif
+				for (; i < p_end; i++) {
 					const int32_t src_v = identity_mapping ? int32_t(i) : source_vertices[i];
 					uint8_t *dst_s = sw + i * skin_elem_size;
 
@@ -1619,11 +1805,15 @@ Error gltf_build_fast_array_mesh(
 			};
 
 			if (vertex_num >= 8192 && LoadThreadPool::get_singleton()) {
-				constexpr uint32_t kSkinChunks = 3;
+				constexpr uint32_t kSkinChunks = 12;
 				LocalVector<AABB> chunk_bounds[kSkinChunks];
-				int chunk_max[kSkinChunks] = { -1, -1, -1 };
-				bool chunk_valid[kSkinChunks] = { false, false, false };
-				const uint32_t step = (uint32_t(vertex_num) + kSkinChunks - 1) / kSkinChunks;
+				int chunk_max[kSkinChunks];
+				bool chunk_valid[kSkinChunks];
+				for (uint32_t c = 0; c < kSkinChunks; c++) {
+					chunk_max[c] = -1;
+					chunk_valid[c] = false;
+				}
+				const uint32_t step = ((uint32_t(vertex_num) + kSkinChunks - 1) / kSkinChunks + 3u) & ~3u;
 				LoadThreadPool::get_singleton()->parallel_for(kSkinChunks, [&](uint32_t c) {
 					const uint32_t b = c * step;
 					const uint32_t e = MIN(b + step, uint32_t(vertex_num));
@@ -1671,51 +1861,87 @@ Error gltf_build_fast_array_mesh(
 			}
 		}
 
-		// Pack index buffer (16-bit when vertex_num <= 65536, else 32-bit).
+		// Pack index buffer (16-bit when vertex_num <= 65536, else 32-bit) with ARM NEON vld3q/vst3q CW swap + bounds guard.
 		if (index_count > 0) {
 			uint8_t *iw = index_array.ptrw();
 			if (defer_direct_tri_indices) {
+				std::atomic<bool> idx_oob{ false };
 				auto write_direct_tris = [&](int32_t k_begin, int32_t k_end) {
+					uint32_t local_max = 0;
 					if (vertex_num <= 65536) {
 						uint16_t *dst16 = reinterpret_cast<uint16_t *>(iw);
 						if (tight_tri_u16) {
 							const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
-							for (int32_t k = k_begin; k < k_end; k += 3) {
-								dst16[k + 0] = src16[k + 0];
-								dst16[k + 1] = src16[k + 2];
-								dst16[k + 2] = src16[k + 1];
+							int32_t k = k_begin;
+#if defined(__aarch64__) || defined(_M_ARM64)
+							uint16x8_t vmax16 = vdupq_n_u16(0);
+							for (; k + 24 <= k_end; k += 24) {
+								uint16x8x3_t tri = vld3q_u16(src16 + k);
+								vmax16 = vmaxq_u16(vmax16, vmaxq_u16(tri.val[0], vmaxq_u16(tri.val[1], tri.val[2])));
+								std::swap(tri.val[1], tri.val[2]);
+								vst3q_u16(dst16 + k, tri);
+							}
+							local_max = MAX(local_max, uint32_t(vmaxvq_u16(vmax16)));
+#endif
+							for (; k < k_end; k += 3) {
+								const uint16_t a = src16[k + 0], b = src16[k + 1], c = src16[k + 2];
+								local_max = MAX(local_max, MAX(uint32_t(a), MAX(uint32_t(b), uint32_t(c))));
+								dst16[k + 0] = a;
+								dst16[k + 1] = c;
+								dst16[k + 2] = b;
 							}
 						} else {
 							const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
 							for (int32_t k = k_begin; k < k_end; k += 3) {
-								dst16[k + 0] = uint16_t(src32[k + 0]);
-								dst16[k + 1] = uint16_t(src32[k + 2]);
-								dst16[k + 2] = uint16_t(src32[k + 1]);
+								const uint32_t a = src32[k + 0], b = src32[k + 1], c = src32[k + 2];
+								local_max = MAX(local_max, MAX(a, MAX(b, c)));
+								dst16[k + 0] = uint16_t(a);
+								dst16[k + 1] = uint16_t(c);
+								dst16[k + 2] = uint16_t(b);
 							}
 						}
 					} else {
 						uint32_t *dst32 = reinterpret_cast<uint32_t *>(iw);
 						if (tight_tri_u32) {
 							const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
-							for (int32_t k = k_begin; k < k_end; k += 3) {
-								dst32[k + 0] = src32[k + 0];
-								dst32[k + 1] = src32[k + 2];
-								dst32[k + 2] = src32[k + 1];
+							int32_t k = k_begin;
+#if defined(__aarch64__) || defined(_M_ARM64)
+							uint32x4_t vmax32 = vdupq_n_u32(0);
+							for (; k + 12 <= k_end; k += 12) {
+								uint32x4x3_t tri = vld3q_u32(src32 + k);
+								vmax32 = vmaxq_u32(vmax32, vmaxq_u32(tri.val[0], vmaxq_u32(tri.val[1], tri.val[2])));
+								std::swap(tri.val[1], tri.val[2]);
+								vst3q_u32(dst32 + k, tri);
+							}
+							local_max = MAX(local_max, vmaxvq_u32(vmax32));
+#endif
+							for (; k < k_end; k += 3) {
+								const uint32_t a = src32[k + 0], b = src32[k + 1], c = src32[k + 2];
+								local_max = MAX(local_max, MAX(a, MAX(b, c)));
+								dst32[k + 0] = a;
+								dst32[k + 1] = c;
+								dst32[k + 2] = b;
 							}
 						} else {
 							const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
 							for (int32_t k = k_begin; k < k_end; k += 3) {
-								dst32[k + 0] = src16[k + 0];
-								dst32[k + 1] = src16[k + 2];
-								dst32[k + 2] = src16[k + 1];
+								const uint16_t a = src16[k + 0], b = src16[k + 1], c = src16[k + 2];
+								local_max = MAX(local_max, MAX(uint32_t(a), MAX(uint32_t(b), uint32_t(c))));
+								dst32[k + 0] = a;
+								dst32[k + 1] = c;
+								dst32[k + 2] = b;
 							}
 						}
 					}
+					if (local_max >= uint32_t(orig_vertex_num)) {
+						idx_oob.store(true, std::memory_order_relaxed);
+					}
 				};
-				if (index_count >= 98304 && LoadThreadPool::get_singleton()) {
+				if (index_count >= 24576 && LoadThreadPool::get_singleton()) {
 					const int32_t tri_total = index_count / 3;
-					const int32_t tri_step = (tri_total + 2) / 3;
-					LoadThreadPool::get_singleton()->parallel_for(3, [&](uint32_t c) {
+					const uint32_t tri_chunks = CLAMP(uint32_t((tri_total + 8191) / 8192), 6u, 24u);
+					const int32_t tri_step = int32_t(((uint32_t(tri_total) + tri_chunks - 1u) / tri_chunks + 7u) & ~7u);
+					LoadThreadPool::get_singleton()->parallel_for(tri_chunks, [&](uint32_t c) {
 						const int32_t tb = int32_t(c) * tri_step;
 						const int32_t te = MIN(tb + tri_step, tri_total);
 						if (tb < te) {
@@ -1725,6 +1951,7 @@ Error gltf_build_fast_array_mesh(
 				} else {
 					write_direct_tris(0, index_count);
 				}
+				ERR_FAIL_COND_V(idx_oob.load(std::memory_order_relaxed), ERR_INVALID_DATA);
 			} else {
 				const uint32_t *src_idx = expanded_indices.ptr();
 				if (vertex_num <= 65536) {

@@ -26,6 +26,11 @@
 #include "scene/resources/animation_library.h"
 
 #include <cmath>
+#include <cstring>
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
 
 namespace {
 
@@ -36,8 +41,11 @@ struct SampleStep {
 };
 
 struct SampleSchedule {
-	const double *times_ptr = nullptr;
+	const void *times_ptr = nullptr;
 	int32_t times_len = 0;
+	bool is_f32 = false;
+	bool is_uniform_direct = false;
+	bool steps_built = false;
 	LocalVector<SampleStep> steps;
 };
 
@@ -60,46 +68,209 @@ void build_sample_times(double p_anim_start, double p_anim_end, double p_increme
 	}
 }
 
-const SampleSchedule &get_or_build_schedule(
+void ensure_schedule_steps(SampleSchedule &r_sched, const LocalVector<double> &p_abs_times) {
+	if (r_sched.steps_built) {
+		return;
+	}
+	const uint32_t scount = p_abs_times.size();
+	r_sched.steps.resize(scount);
+	const int32_t tlen = r_sched.times_len;
+
+	if (r_sched.is_f32) {
+		const float *tptr = static_cast<const float *>(r_sched.times_ptr);
+		int32_t cursor = -1;
+		for (uint32_t s = 0; s < scount; s++) {
+			const float query_t = float(p_abs_times[s]);
+			if (cursor >= 0 && tptr[cursor] > query_t) {
+				cursor = -1;
+			}
+			while (cursor + 1 < tlen && tptr[cursor + 1] <= query_t) {
+				cursor++;
+			}
+			SampleStep step;
+			step.idx = cursor;
+			if (cursor >= 0 && cursor < tlen - 1) {
+				const float td = tptr[cursor + 1] - tptr[cursor];
+				step.td = td;
+				step.frac = td > 0.0f ? ((query_t - tptr[cursor]) / td) : 0.0f;
+			}
+			r_sched.steps[s] = step;
+		}
+	} else {
+		const double *tptr = static_cast<const double *>(r_sched.times_ptr);
+		int32_t cursor = -1;
+		for (uint32_t s = 0; s < scount; s++) {
+			const float query_t = float(p_abs_times[s]);
+			if (cursor >= 0 && tptr[cursor] > double(query_t)) {
+				cursor = -1;
+			}
+			while (cursor + 1 < tlen && tptr[cursor + 1] <= double(query_t)) {
+				cursor++;
+			}
+			SampleStep step;
+			step.idx = cursor;
+			if (cursor >= 0 && cursor < tlen - 1) {
+				const float td = float(tptr[cursor + 1] - tptr[cursor]);
+				step.td = td;
+				step.frac = td > 0.0f ? ((query_t - float(tptr[cursor])) / td) : 0.0f;
+			}
+			r_sched.steps[s] = step;
+		}
+	}
+	r_sched.steps_built = true;
+}
+
+SampleSchedule &get_or_build_schedule_raw(
 		LocalVector<SampleSchedule> &r_cache,
-		const Vector<double> &p_times,
-		const LocalVector<double> &p_abs_times) {
-	const double *tptr = p_times.ptr();
-	const int32_t tlen = p_times.size();
+		const void *p_tptr,
+		int32_t p_tlen,
+		bool p_is_f32,
+		const LocalVector<double> &p_abs_times,
+		double p_increment) {
 	for (uint32_t i = 0; i < r_cache.size(); i++) {
-		if (r_cache[i].times_ptr == tptr && r_cache[i].times_len == tlen) {
+		if (r_cache[i].times_ptr == p_tptr && r_cache[i].times_len == p_tlen && r_cache[i].is_f32 == p_is_f32) {
 			return r_cache[i];
 		}
 	}
 
 	SampleSchedule sched;
-	sched.times_ptr = tptr;
-	sched.times_len = tlen;
-	const uint32_t scount = p_abs_times.size();
-	sched.steps.resize(scount);
+	sched.times_ptr = p_tptr;
+	sched.times_len = p_tlen;
+	sched.is_f32 = p_is_f32;
 
-	int32_t cursor = -1;
-	for (uint32_t s = 0; s < scount; s++) {
-		const float query_t = float(p_abs_times[s]);
-		// Monotonic advance (falls back to reset only if input times are non-monotonic).
-		if (cursor >= 0 && tptr[cursor] > double(query_t)) {
-			cursor = -1;
+	const uint32_t scount = p_abs_times.size();
+	if (p_tlen > 0 && uint32_t(p_tlen) == scount) {
+		const double tol = MAX(1e-6, 1e-5 * p_increment);
+		bool uniform_ok = true;
+		if (p_is_f32) {
+			const float *tf = static_cast<const float *>(p_tptr);
+			for (uint32_t s = 0; s < scount; s++) {
+				if ((s > 0 && tf[s] <= tf[s - 1]) || std::abs(double(tf[s]) - p_abs_times[s]) > tol) {
+					uniform_ok = false;
+					break;
+				}
+			}
+		} else {
+			const double *td = static_cast<const double *>(p_tptr);
+			for (uint32_t s = 0; s < scount; s++) {
+				if ((s > 0 && td[s] <= td[s - 1]) || std::abs(td[s] - p_abs_times[s]) > tol) {
+					uniform_ok = false;
+					break;
+				}
+			}
 		}
-		while (cursor + 1 < tlen && tptr[cursor + 1] <= double(query_t)) {
-			cursor++;
-		}
-		SampleStep step;
-		step.idx = cursor;
-		if (cursor >= 0 && cursor < tlen - 1) {
-			const float td = float(tptr[cursor + 1] - tptr[cursor]);
-			step.td = td;
-			step.frac = td > 0.0f ? ((query_t - float(tptr[cursor])) / td) : 0.0f;
-		}
-		sched.steps[s] = step;
+		sched.is_uniform_direct = uniform_ok;
 	}
 
 	r_cache.push_back(sched);
 	return r_cache[r_cache.size() - 1];
+}
+
+template <typename T>
+SampleSchedule &get_or_build_schedule_chan(
+		LocalVector<SampleSchedule> &r_cache,
+		const GLTFAnimation::Channel<T> &p_chan,
+		const LocalVector<double> &p_abs_times,
+		double p_increment) {
+	if (p_chan.raw_times_f32 != nullptr && p_chan.raw_times_count > 0) {
+		return get_or_build_schedule_raw(r_cache, p_chan.raw_times_f32, p_chan.raw_times_count, true, p_abs_times, p_increment);
+	}
+	return get_or_build_schedule_raw(r_cache, p_chan.times.ptr(), p_chan.times.size(), false, p_abs_times, p_increment);
+}
+
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REAL_T_IS_DOUBLE)
+// 4-wide ARM NEON acos(x) for x in [0, 1] (~0.5 ULP max error).
+_FORCE_INLINE_ float32x4_t neon_acos_01(float32x4_t x) {
+	const float32x4_t one = vdupq_n_f32(1.0f);
+	const float32x4_t zero = vdupq_n_f32(0.0f);
+	float32x4_t p = vdupq_n_f32(-1.211737748e-03f);
+	p = vfmaq_f32(vdupq_n_f32(6.491521373e-03f), p, x);
+	p = vfmaq_f32(vdupq_n_f32(-1.684105210e-02f), p, x);
+	p = vfmaq_f32(vdupq_n_f32(3.072212264e-02f), p, x);
+	p = vfmaq_f32(vdupq_n_f32(-5.011430383e-02f), p, x);
+	p = vfmaq_f32(vdupq_n_f32(8.896885067e-02f), p, x);
+	p = vfmaq_f32(vdupq_n_f32(-2.145981491e-01f), p, x);
+	p = vfmaq_f32(vdupq_n_f32(1.570796251e+00f), p, x);
+	const float32x4_t root = vsqrtq_f32(vmaxq_f32(zero, vsubq_f32(one, x)));
+	return vmulq_f32(root, p);
+}
+
+// 4-wide ARM NEON sin(x) for x in [0, pi/2] (< 0.2 ULP max error).
+_FORCE_INLINE_ float32x4_t neon_sin_halfpi(float32x4_t x) {
+	const float32x4_t x2 = vmulq_f32(x, x);
+	float32x4_t p = vdupq_n_f32(2.75573192e-06f);
+	p = vfmaq_f32(vdupq_n_f32(-1.98412698e-04f), p, x2);
+	p = vfmaq_f32(vdupq_n_f32(8.33333333e-03f), p, x2);
+	p = vfmaq_f32(vdupq_n_f32(-1.66666667e-01f), p, x2);
+	p = vfmaq_f32(vdupq_n_f32(1.0f), p, x2);
+	return vmulq_f32(x, p);
+}
+
+_FORCE_INLINE_ void neon_load_soa_quat4(
+		const Quaternion &q0,
+		const Quaternion &q1,
+		const Quaternion &q2,
+		const Quaternion &q3,
+		float32x4_t &rx,
+		float32x4_t &ry,
+		float32x4_t &rz,
+		float32x4_t &rw) {
+	const float32x4_t r0 = vld1q_f32(&q0.x);
+	const float32x4_t r1 = vld1q_f32(&q1.x);
+	const float32x4_t r2 = vld1q_f32(&q2.x);
+	const float32x4_t r3 = vld1q_f32(&q3.x);
+	const float32x4_t t0 = vtrn1q_f32(r0, r1); // x0 x1 z0 z1
+	const float32x4_t t1 = vtrn2q_f32(r0, r1); // y0 y1 w0 w1
+	const float32x4_t t2 = vtrn1q_f32(r2, r3); // x2 x3 z2 z3
+	const float32x4_t t3 = vtrn2q_f32(r2, r3); // y2 y3 w2 w3
+	rx = vcombine_f32(vget_low_f32(t0), vget_low_f32(t2));
+	rz = vcombine_f32(vget_high_f32(t0), vget_high_f32(t2));
+	ry = vcombine_f32(vget_low_f32(t1), vget_low_f32(t3));
+	rw = vcombine_f32(vget_high_f32(t1), vget_high_f32(t3));
+}
+#endif
+
+void normalize_quats_bulk(const Quaternion *p_src, Quaternion *p_dst, int32_t p_count) {
+	int32_t i = 0;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REAL_T_IS_DOUBLE)
+	const float32x4_t one = vdupq_n_f32(1.0f);
+	const float32x4_t zero = vdupq_n_f32(0.0f);
+	const float32x4_t eps = vdupq_n_f32(1e-5f);
+	for (; i + 4 <= p_count; i += 4) {
+		float32x4x4_t q4 = vld4q_f32(&p_src[i].x);
+		float32x4_t l2 = vmulq_f32(q4.val[0], q4.val[0]);
+		l2 = vfmaq_f32(l2, q4.val[1], q4.val[1]);
+		l2 = vfmaq_f32(l2, q4.val[2], q4.val[2]);
+		l2 = vfmaq_f32(l2, q4.val[3], q4.val[3]);
+		if (likely(vmaxvq_f32(vabdq_f32(l2, one)) <= 1e-5f)) {
+			p_dst[i + 0] = p_src[i + 0];
+			p_dst[i + 1] = p_src[i + 1];
+			p_dst[i + 2] = p_src[i + 2];
+			p_dst[i + 3] = p_src[i + 3];
+		} else {
+			const uint32x4_t unit_m = vcleq_f32(vabdq_f32(l2, one), eps);
+			const uint32x4_t pos_m = vcgtq_f32(l2, zero);
+			const float32x4_t inv = vdivq_f32(one, vsqrtq_f32(vmaxq_f32(l2, vdupq_n_f32(1e-30f))));
+			q4.val[0] = vbslq_f32(unit_m, q4.val[0], vbslq_f32(pos_m, vmulq_f32(q4.val[0], inv), zero));
+			q4.val[1] = vbslq_f32(unit_m, q4.val[1], vbslq_f32(pos_m, vmulq_f32(q4.val[1], inv), zero));
+			q4.val[2] = vbslq_f32(unit_m, q4.val[2], vbslq_f32(pos_m, vmulq_f32(q4.val[2], inv), zero));
+			q4.val[3] = vbslq_f32(unit_m, q4.val[3], vbslq_f32(pos_m, vmulq_f32(q4.val[3], inv), one));
+			vst4q_f32(&p_dst[i].x, q4);
+		}
+	}
+#endif
+	for (; i < p_count; i++) {
+		const Quaternion &q = p_src[i];
+		const float l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+		if (std::abs(l2 - 1.0f) <= 1e-5f) {
+			p_dst[i] = q;
+		} else if (l2 > 0.0f) {
+			const float inv = 1.0f / std::sqrt(l2);
+			p_dst[i] = Quaternion(q.x * inv, q.y * inv, q.z * inv, q.w * inv);
+		} else {
+			p_dst[i] = Quaternion();
+		}
+	}
 }
 
 template <typename T>
@@ -120,22 +291,21 @@ _FORCE_INLINE_ T catmull_eval(const T &p0, const T &p1, const T &p2, const T &p3
 	return 0.5f * ((2.0f * p1) + (-p0 + p2) * p_t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
 }
 
-void eval_vec3_samples(
+void eval_vec3_samples_ptr(
 		const SampleSchedule &p_sched,
-		const Vector<Vector3> &p_values,
+		const Vector3 *vptr,
+		int32_t vlen,
 		GLTFAnimation::Interpolation p_interp,
 		LocalVector<Vector3> &r_out) {
 	const uint32_t scount = p_sched.steps.size();
 	r_out.resize(scount);
 	const int32_t tlen = p_sched.times_len;
-	const int32_t vlen = p_values.size();
-	if (vlen == 0) {
+	if (vlen == 0 || !vptr) {
 		for (uint32_t s = 0; s < scount; s++) {
 			r_out[s] = Vector3();
 		}
 		return;
 	}
-	const Vector3 *vptr = p_values.ptr();
 	const int expected_mult = (p_interp == GLTFAnimation::INTERP_CUBIC_SPLINE) ? 3 : 1;
 	if (tlen != vlen / expected_mult) {
 		for (uint32_t s = 0; s < scount; s++) {
@@ -148,7 +318,55 @@ void eval_vec3_samples(
 
 	switch (p_interp) {
 		case GLTFAnimation::INTERP_LINEAR: {
-			for (uint32_t s = 0; s < scount; s++) {
+			uint32_t s = 0;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REAL_T_IS_DOUBLE)
+			const float32x4_t lo_snap = vdupq_n_f32(1e-6f);
+			const float32x4_t hi_snap = vdupq_n_f32(1.0f - 1e-6f);
+			for (; s + 4 <= scount; s += 4) {
+				const int32_t i0 = steps[s + 0].idx;
+				const int32_t i1 = steps[s + 1].idx;
+				const int32_t i2 = steps[s + 2].idx;
+				const int32_t i3 = steps[s + 3].idx;
+				if (unlikely((i0 | i1 | i2 | i3) < 0 || i0 >= tlen - 1 || i1 >= tlen - 1 || i2 >= tlen - 1 || i3 >= tlen - 1)) {
+					for (uint32_t k = s; k < s + 4; k++) {
+						const int32_t idx = steps[k].idx;
+						if (idx < 0) {
+							dst[k] = vptr[0];
+						} else if (idx >= tlen - 1) {
+							dst[k] = vptr[tlen - 1];
+						} else {
+							const float f = steps[k].frac;
+							dst[k] = (f <= 1e-6f) ? vptr[idx] : ((f >= 1.0f - 1e-6f) ? vptr[idx + 1] : (vptr[idx] + (vptr[idx + 1] - vptr[idx]) * f));
+						}
+					}
+					continue;
+				}
+				const Vector3 &a0 = vptr[i0], &b0 = vptr[i0 + 1];
+				const Vector3 &a1 = vptr[i1], &b1 = vptr[i1 + 1];
+				const Vector3 &a2 = vptr[i2], &b2 = vptr[i2 + 1];
+				const Vector3 &a3 = vptr[i3], &b3 = vptr[i3 + 1];
+				const float ax_arr[4] = { a0.x, a1.x, a2.x, a3.x };
+				const float ay_arr[4] = { a0.y, a1.y, a2.y, a3.y };
+				const float az_arr[4] = { a0.z, a1.z, a2.z, a3.z };
+				const float bx_arr[4] = { b0.x, b1.x, b2.x, b3.x };
+				const float by_arr[4] = { b0.y, b1.y, b2.y, b3.y };
+				const float bz_arr[4] = { b0.z, b1.z, b2.z, b3.z };
+				const float f_arr[4] = { steps[s + 0].frac, steps[s + 1].frac, steps[s + 2].frac, steps[s + 3].frac };
+
+				const float32x4_t ax = vld1q_f32(ax_arr), ay = vld1q_f32(ay_arr), az = vld1q_f32(az_arr);
+				const float32x4_t bx = vld1q_f32(bx_arr), by = vld1q_f32(by_arr), bz = vld1q_f32(bz_arr);
+				const float32x4_t f4 = vld1q_f32(f_arr);
+				const uint32x4_t m_lo = vcleq_f32(f4, lo_snap);
+				const uint32x4_t m_hi = vcgeq_f32(f4, hi_snap);
+
+				float32x4x3_t out3;
+				out3.val[0] = vbslq_f32(m_lo, ax, vbslq_f32(m_hi, bx, vfmaq_f32(ax, vsubq_f32(bx, ax), f4)));
+				out3.val[1] = vbslq_f32(m_lo, ay, vbslq_f32(m_hi, by, vfmaq_f32(ay, vsubq_f32(by, ay), f4)));
+				out3.val[2] = vbslq_f32(m_lo, az, vbslq_f32(m_hi, bz, vfmaq_f32(az, vsubq_f32(bz, az), f4)));
+				vst3q_f32(&dst[s].x, out3);
+			}
+#endif
+			for (; s < scount; s++) {
 				const int32_t idx = steps[s].idx;
 				if (idx < 0) {
 					dst[s] = vptr[0];
@@ -211,22 +429,21 @@ void eval_vec3_samples(
 	}
 }
 
-void eval_quat_samples(
+void eval_quat_samples_ptr(
 		const SampleSchedule &p_sched,
-		const Vector<Quaternion> &p_values,
+		const Quaternion *vptr,
+		int32_t vlen,
 		GLTFAnimation::Interpolation p_interp,
 		LocalVector<Quaternion> &r_out) {
 	const uint32_t scount = p_sched.steps.size();
 	r_out.resize(scount);
 	const int32_t tlen = p_sched.times_len;
-	const int32_t vlen = p_values.size();
-	if (vlen == 0) {
+	if (vlen == 0 || !vptr) {
 		for (uint32_t s = 0; s < scount; s++) {
 			r_out[s] = Quaternion();
 		}
 		return;
 	}
-	const Quaternion *vptr = p_values.ptr();
 	const int expected_mult = (p_interp == GLTFAnimation::INTERP_CUBIC_SPLINE) ? 3 : 1;
 	if (tlen != vlen / expected_mult) {
 		const Quaternion q0 = vptr[0].normalized();
@@ -290,7 +507,108 @@ void eval_quat_samples(
 
 	switch (p_interp) {
 		case GLTFAnimation::INTERP_LINEAR: {
-			for (uint32_t s = 0; s < scount; s++) {
+			uint32_t s = 0;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REAL_T_IS_DOUBLE)
+			const float32x4_t one = vdupq_n_f32(1.0f);
+			const float32x4_t zero = vdupq_n_f32(0.0f);
+			const float32x4_t lo_snap = vdupq_n_f32(1e-6f);
+			const float32x4_t hi_snap = vdupq_n_f32(1.0f - 1e-6f);
+			const float32x4_t unit_eps = vdupq_n_f32(1e-5f);
+			const uint32x4_t sign_bit = vdupq_n_u32(0x80000000u);
+
+			for (; s + 4 <= scount; s += 4) {
+				const int32_t i0 = steps[s + 0].idx;
+				const int32_t i1 = steps[s + 1].idx;
+				const int32_t i2 = steps[s + 2].idx;
+				const int32_t i3 = steps[s + 3].idx;
+				if (unlikely((i0 | i1 | i2 | i3) < 0 || i0 >= tlen - 1 || i1 >= tlen - 1 || i2 >= tlen - 1 || i3 >= tlen - 1)) {
+					for (uint32_t k = s; k < s + 4; k++) {
+						const int32_t idx = steps[k].idx;
+						dst[k] = (idx < 0) ? ensure_unit(vptr[0]) : ((idx >= tlen - 1) ? ensure_unit(vptr[tlen - 1]) : safe_slerp(vptr[idx], vptr[idx + 1], steps[k].frac));
+					}
+					continue;
+				}
+
+				float32x4_t ax, ay, az, aw;
+				float32x4_t bx, by, bz, bw;
+				neon_load_soa_quat4(vptr[i0], vptr[i1], vptr[i2], vptr[i3], ax, ay, az, aw);
+				neon_load_soa_quat4(vptr[i0 + 1], vptr[i1 + 1], vptr[i2 + 1], vptr[i3 + 1], bx, by, bz, bw);
+
+				float32x4_t l2a = vfmaq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(ax, ax), ay, ay), az, az), aw, aw);
+				if (unlikely(vmaxvq_f32(vabdq_f32(l2a, one)) > 1e-5f)) {
+					const uint32x4_t um = vcleq_f32(vabdq_f32(l2a, one), unit_eps);
+					const uint32x4_t pm = vcgtq_f32(l2a, zero);
+					const float32x4_t inv = vdivq_f32(one, vsqrtq_f32(vmaxq_f32(l2a, vdupq_n_f32(1e-30f))));
+					ax = vbslq_f32(um, ax, vbslq_f32(pm, vmulq_f32(ax, inv), zero));
+					ay = vbslq_f32(um, ay, vbslq_f32(pm, vmulq_f32(ay, inv), zero));
+					az = vbslq_f32(um, az, vbslq_f32(pm, vmulq_f32(az, inv), zero));
+					aw = vbslq_f32(um, aw, vbslq_f32(pm, vmulq_f32(aw, inv), one));
+				}
+
+				float32x4_t l2b = vfmaq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(bx, bx), by, by), bz, bz), bw, bw);
+				if (unlikely(vmaxvq_f32(vabdq_f32(l2b, one)) > 1e-5f)) {
+					const uint32x4_t um = vcleq_f32(vabdq_f32(l2b, one), unit_eps);
+					const uint32x4_t pm = vcgtq_f32(l2b, zero);
+					const float32x4_t inv = vdivq_f32(one, vsqrtq_f32(vmaxq_f32(l2b, vdupq_n_f32(1e-30f))));
+					bx = vbslq_f32(um, bx, vbslq_f32(pm, vmulq_f32(bx, inv), zero));
+					by = vbslq_f32(um, by, vbslq_f32(pm, vmulq_f32(by, inv), zero));
+					bz = vbslq_f32(um, bz, vbslq_f32(pm, vmulq_f32(bz, inv), zero));
+					bw = vbslq_f32(um, bw, vbslq_f32(pm, vmulq_f32(bw, inv), one));
+				}
+
+				const float f_arr[4] = { steps[s + 0].frac, steps[s + 1].frac, steps[s + 2].frac, steps[s + 3].frac };
+				const float32x4_t f4 = vld1q_f32(f_arr);
+				const uint32x4_t m_lo = vcleq_f32(f4, lo_snap);
+				const uint32x4_t m_hi = vcgeq_f32(f4, hi_snap);
+
+				// Keep original normalized nb before sign flip for exact f >= 1 - 1e-6 snap!
+				const float32x4_t orig_bx = bx, orig_by = by, orig_bz = bz, orig_bw = bw;
+
+				float32x4_t cosom = vfmaq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(ax, bx), ay, by), az, bz), aw, bw);
+				const uint32x4_t flip = vandq_u32(vcltq_f32(cosom, zero), sign_bit);
+				cosom = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(cosom), flip));
+				bx = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(bx), flip));
+				by = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(by), flip));
+				bz = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(bz), flip));
+				bw = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(bw), flip));
+
+				float32x4_t s0 = vsubq_f32(one, f4);
+				float32x4_t s1 = f4;
+				if (unlikely(vminvq_f32(cosom) <= 0.9995f)) {
+					const float32x4_t c_clamped = vminq_f32(cosom, one);
+					const float32x4_t omega = neon_acos_01(c_clamped);
+					const float32x4_t sin_om = vmaxq_f32(neon_sin_halfpi(omega), vdupq_n_f32(1e-12f));
+					const float32x4_t inv_sin = vdivq_f32(one, sin_om);
+					const float32x4_t trig_s0 = vmulq_f32(neon_sin_halfpi(vmulq_f32(s0, omega)), inv_sin);
+					const float32x4_t trig_s1 = vmulq_f32(neon_sin_halfpi(vmulq_f32(s1, omega)), inv_sin);
+					const uint32x4_t near_m = vcgtq_f32(cosom, vdupq_n_f32(0.9995f));
+					s0 = vbslq_f32(near_m, s0, trig_s0);
+					s1 = vbslq_f32(near_m, s1, trig_s1);
+				}
+
+				float32x4_t rx = vfmaq_f32(vmulq_f32(s0, ax), s1, bx);
+				float32x4_t ry = vfmaq_f32(vmulq_f32(s0, ay), s1, by);
+				float32x4_t rz = vfmaq_f32(vmulq_f32(s0, az), s1, bz);
+				float32x4_t rw = vfmaq_f32(vmulq_f32(s0, aw), s1, bw);
+				const float32x4_t rl2 = vfmaq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(rx, rx), ry, ry), rz, rz), rw, rw);
+				const float32x4_t rinv = vdivq_f32(one, vsqrtq_f32(vmaxq_f32(rl2, vdupq_n_f32(1e-30f))));
+				rx = vmulq_f32(rx, rinv);
+				ry = vmulq_f32(ry, rinv);
+				rz = vmulq_f32(rz, rinv);
+				rw = vmulq_f32(rw, rinv);
+
+				const uint32x4_t m_ident = vcgeq_f32(cosom, vdupq_n_f32(0.999999f));
+				const uint32x4_t m_use_a = vorrq_u32(m_lo, vandq_u32(m_ident, vmvnq_u32(m_hi)));
+
+				float32x4x4_t out4;
+				out4.val[0] = vbslq_f32(m_use_a, ax, vbslq_f32(m_hi, orig_bx, rx));
+				out4.val[1] = vbslq_f32(m_use_a, ay, vbslq_f32(m_hi, orig_by, ry));
+				out4.val[2] = vbslq_f32(m_use_a, az, vbslq_f32(m_hi, orig_bz, rz));
+				out4.val[3] = vbslq_f32(m_use_a, aw, vbslq_f32(m_hi, orig_bw, rw));
+				vst4q_f32(&dst[s].x, out4);
+			}
+#endif
+			for (; s < scount; s++) {
 				const int32_t idx = steps[s].idx;
 				if (idx < 0) {
 					dst[s] = ensure_unit(vptr[0]);
@@ -467,7 +785,7 @@ Ref<Animation> build_animation_fast_impl(
 	double anim_end = 0.0;
 	for (const KeyValue<int, GLTFAnimation::NodeTrack> &track_i : anim->get_node_tracks()) {
 		const GLTFAnimation::NodeTrack &track = track_i.value;
-		auto scan_times = [&](const Vector<double> &tvec) {
+		auto scan_times_f64 = [&](const Vector<double> &tvec) {
 			const int n = tvec.size();
 			if (n <= 0) {
 				return;
@@ -487,11 +805,33 @@ Ref<Animation> build_animation_fast_impl(
 				}
 			}
 		};
-		scan_times(track.rotation_track.times);
-		scan_times(track.position_track.times);
-		scan_times(track.scale_track.times);
+		auto scan_chan = [&](const auto &ch) {
+			if (ch.raw_times_f32 != nullptr && ch.raw_times_count > 0) {
+				const float *tp = ch.raw_times_f32;
+				const int n = ch.raw_times_count;
+				if (p_trimming) {
+					for (int i = 0; i < n; i++) {
+						const double d = double(tp[i]);
+						anim_start = MIN(anim_start, d);
+						anim_end = MAX(anim_end, d);
+					}
+				} else {
+					anim_end = MAX(anim_end, double(tp[n - 1]));
+					for (int i = 0; i < n - 1; i++) {
+						if (unlikely(double(tp[i]) > anim_end)) {
+							anim_end = double(tp[i]);
+						}
+					}
+				}
+			} else {
+				scan_times_f64(ch.times);
+			}
+		};
+		scan_chan(track.rotation_track);
+		scan_chan(track.position_track);
+		scan_chan(track.scale_track);
 		for (int i = 0; i < track.weight_tracks.size(); i++) {
-			scan_times(track.weight_tracks[i].times);
+			scan_chan(track.weight_tracks[i]);
 		}
 	}
 	for (const KeyValue<String, GLTFAnimation::Channel<Variant>> &track_iter : anim->get_pointer_tracks()) {
@@ -607,20 +947,30 @@ Ref<Animation> build_animation_fast_impl(
 				GLTFFastAccess::node_skeleton(gltf_node.ptr()) < 0 &&
 				GLTFFastAccess::node_skin(gltf_node.ptr()) >= 0;
 
-		if ((track.rotation_track.values.size() || track.position_track.values.size() || track.scale_track.values.size()) &&
+		auto chan_tcnt = [](const auto &ch) -> int32_t {
+			return (ch.raw_times_f32 != nullptr && ch.raw_times_count > 0) ? ch.raw_times_count : int32_t(ch.times.size());
+		};
+		auto chan_vcnt = [](const auto &ch) -> int32_t {
+			return (ch.raw_values_ptr != nullptr && ch.raw_values_count > 0) ? ch.raw_values_count : int32_t(ch.values.size());
+		};
+		auto chan_vptr = [](const auto &ch) {
+			return (ch.raw_values_ptr != nullptr && ch.raw_values_count > 0) ? ch.raw_values_ptr : ch.values.ptr();
+		};
+
+		if ((chan_vcnt(track.rotation_track) || chan_vcnt(track.position_track) || chan_vcnt(track.scale_track)) &&
 				!transform_affects_skinned_mesh_instance) {
 			const bool has_pre_trs = (p_direct_ctx && uint32_t(node_index) < p_direct_ctx->base_trs.size());
-			if (track.position_track.values.size() && track.position_track.times.size()) {
+			const int32_t pos_vcnt = chan_vcnt(track.position_track);
+			const int32_t pos_tcnt = chan_tcnt(track.position_track);
+			if (pos_vcnt > 0 && pos_tcnt > 0) {
+				const Vector3 *vp = chan_vptr(track.position_track);
 				bool is_default = true;
 				if (p_remove_immutable_tracks) {
 					const Vector3 base_pos = has_pre_trs ? p_direct_ctx->base_trs[uint32_t(node_index)].pos : gltf_node->get_position();
-					const Vector3 *vp = track.position_track.values.ptr();
-					const int vcnt = track.position_track.values.size();
-					const int tcnt = track.position_track.times.size();
 					const bool cubic = track.position_track.interpolation == GLTFAnimation::INTERP_CUBIC_SPLINE;
-					for (int i = 0; i < tcnt; i++) {
-						const int vi = cubic ? (1 + i * 3) : i;
-						ERR_BREAK(vi >= vcnt);
+					for (int32_t i = 0; i < pos_tcnt; i++) {
+						const int32_t vi = cubic ? (1 + i * 3) : i;
+						ERR_BREAK(vi >= pos_vcnt);
 						if (!vp[vi].is_equal_approx(base_pos)) {
 							is_default = false;
 							break;
@@ -637,23 +987,31 @@ Ref<Animation> build_animation_fast_impl(
 					if (track.position_track.interpolation == GLTFAnimation::INTERP_STEP) {
 						animation->track_set_interpolation_type(pos_idx, Animation::INTERPOLATION_NEAREST);
 					}
-					const SampleSchedule &sched = get_or_build_schedule(schedule_cache, track.position_track.times, abs_sample_times);
-					eval_vec3_samples(sched, track.position_track.values, track.position_track.interpolation, scratch_vec3);
-					animation->position_track_set_keys_bulk(pos_idx, rel_sample_times.ptr(), scratch_vec3.ptr(), int(rel_sample_times.size()));
+					SampleSchedule &sched = get_or_build_schedule_chan(schedule_cache, track.position_track, abs_sample_times, increment);
+					if (sched.is_uniform_direct &&
+							(track.position_track.interpolation == GLTFAnimation::INTERP_LINEAR ||
+									track.position_track.interpolation == GLTFAnimation::INTERP_STEP) &&
+							pos_vcnt == int32_t(rel_sample_times.size())) {
+						animation->position_track_set_keys_bulk(pos_idx, rel_sample_times.ptr(), vp, int(rel_sample_times.size()));
+					} else {
+						ensure_schedule_steps(sched, abs_sample_times);
+						eval_vec3_samples_ptr(sched, vp, pos_vcnt, track.position_track.interpolation, scratch_vec3);
+						animation->position_track_set_keys_bulk(pos_idx, rel_sample_times.ptr(), scratch_vec3.ptr(), int(rel_sample_times.size()));
+					}
 				}
 			}
 
-			if (track.rotation_track.values.size() && track.rotation_track.times.size()) {
+			const int32_t rot_vcnt = chan_vcnt(track.rotation_track);
+			const int32_t rot_tcnt = chan_tcnt(track.rotation_track);
+			if (rot_vcnt > 0 && rot_tcnt > 0) {
+				const Quaternion *vp = chan_vptr(track.rotation_track);
 				bool is_default = true;
 				if (p_remove_immutable_tracks) {
 					const Quaternion base_rot = has_pre_trs ? p_direct_ctx->base_trs[uint32_t(node_index)].rot : gltf_node->get_rotation();
-					const Quaternion *vp = track.rotation_track.values.ptr();
-					const int vcnt = track.rotation_track.values.size();
-					const int tcnt = track.rotation_track.times.size();
 					const bool cubic = track.rotation_track.interpolation == GLTFAnimation::INTERP_CUBIC_SPLINE;
-					for (int i = 0; i < tcnt; i++) {
-						const int vi = cubic ? (1 + i * 3) : i;
-						ERR_BREAK(vi >= vcnt);
+					for (int32_t i = 0; i < rot_tcnt; i++) {
+						const int32_t vi = cubic ? (1 + i * 3) : i;
+						ERR_BREAK(vi >= rot_vcnt);
 						const Quaternion &q = vp[vi];
 						const float l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
 						const Quaternion val = (std::abs(l2 - 1.0f) <= 1e-5f) ? q : q.normalized();
@@ -673,23 +1031,33 @@ Ref<Animation> build_animation_fast_impl(
 					if (track.rotation_track.interpolation == GLTFAnimation::INTERP_STEP) {
 						animation->track_set_interpolation_type(rot_idx, Animation::INTERPOLATION_NEAREST);
 					}
-					const SampleSchedule &sched = get_or_build_schedule(schedule_cache, track.rotation_track.times, abs_sample_times);
-					eval_quat_samples(sched, track.rotation_track.values, track.rotation_track.interpolation, scratch_quat);
-					animation->rotation_track_set_keys_bulk(rot_idx, rel_sample_times.ptr(), scratch_quat.ptr(), int(rel_sample_times.size()));
+					SampleSchedule &sched = get_or_build_schedule_chan(schedule_cache, track.rotation_track, abs_sample_times, increment);
+					if (sched.is_uniform_direct &&
+							(track.rotation_track.interpolation == GLTFAnimation::INTERP_LINEAR ||
+									track.rotation_track.interpolation == GLTFAnimation::INTERP_STEP) &&
+							rot_vcnt == int32_t(rel_sample_times.size())) {
+						scratch_quat.resize(rel_sample_times.size());
+						normalize_quats_bulk(vp, scratch_quat.ptr(), rot_vcnt);
+						animation->rotation_track_set_keys_bulk(rot_idx, rel_sample_times.ptr(), scratch_quat.ptr(), int(rel_sample_times.size()));
+					} else {
+						ensure_schedule_steps(sched, abs_sample_times);
+						eval_quat_samples_ptr(sched, vp, rot_vcnt, track.rotation_track.interpolation, scratch_quat);
+						animation->rotation_track_set_keys_bulk(rot_idx, rel_sample_times.ptr(), scratch_quat.ptr(), int(rel_sample_times.size()));
+					}
 				}
 			}
 
-			if (track.scale_track.values.size() && track.scale_track.times.size()) {
+			const int32_t scl_vcnt = chan_vcnt(track.scale_track);
+			const int32_t scl_tcnt = chan_tcnt(track.scale_track);
+			if (scl_vcnt > 0 && scl_tcnt > 0) {
+				const Vector3 *vp = chan_vptr(track.scale_track);
 				bool is_default = true;
 				if (p_remove_immutable_tracks) {
 					const Vector3 base_scale = has_pre_trs ? p_direct_ctx->base_trs[uint32_t(node_index)].scale : gltf_node->get_scale();
-					const Vector3 *vp = track.scale_track.values.ptr();
-					const int vcnt = track.scale_track.values.size();
-					const int tcnt = track.scale_track.times.size();
 					const bool cubic = track.scale_track.interpolation == GLTFAnimation::INTERP_CUBIC_SPLINE;
-					for (int i = 0; i < tcnt; i++) {
-						const int vi = cubic ? (1 + i * 3) : i;
-						ERR_BREAK(vi >= vcnt);
+					for (int32_t i = 0; i < scl_tcnt; i++) {
+						const int32_t vi = cubic ? (1 + i * 3) : i;
+						ERR_BREAK(vi >= scl_vcnt);
 						if (!vp[vi].is_equal_approx(base_scale)) {
 							is_default = false;
 							break;
@@ -706,9 +1074,17 @@ Ref<Animation> build_animation_fast_impl(
 					if (track.scale_track.interpolation == GLTFAnimation::INTERP_STEP) {
 						animation->track_set_interpolation_type(scl_idx, Animation::INTERPOLATION_NEAREST);
 					}
-					const SampleSchedule &sched = get_or_build_schedule(schedule_cache, track.scale_track.times, abs_sample_times);
-					eval_vec3_samples(sched, track.scale_track.values, track.scale_track.interpolation, scratch_vec3);
-					animation->scale_track_set_keys_bulk(scl_idx, rel_sample_times.ptr(), scratch_vec3.ptr(), int(rel_sample_times.size()));
+					SampleSchedule &sched = get_or_build_schedule_chan(schedule_cache, track.scale_track, abs_sample_times, increment);
+					if (sched.is_uniform_direct &&
+							(track.scale_track.interpolation == GLTFAnimation::INTERP_LINEAR ||
+									track.scale_track.interpolation == GLTFAnimation::INTERP_STEP) &&
+							scl_vcnt == int32_t(rel_sample_times.size())) {
+						animation->scale_track_set_keys_bulk(scl_idx, rel_sample_times.ptr(), vp, int(rel_sample_times.size()));
+					} else {
+						ensure_schedule_steps(sched, abs_sample_times);
+						eval_vec3_samples_ptr(sched, vp, scl_vcnt, track.scale_track.interpolation, scratch_vec3);
+						animation->scale_track_set_keys_bulk(scl_idx, rel_sample_times.ptr(), scratch_vec3.ptr(), int(rel_sample_times.size()));
+					}
 				}
 			}
 		}
@@ -770,7 +1146,8 @@ Ref<Animation> build_animation_fast_impl(
 					}
 				}
 			} else {
-				const SampleSchedule &sched = get_or_build_schedule(schedule_cache, wch.times, abs_sample_times);
+				SampleSchedule &sched = get_or_build_schedule_chan(schedule_cache, wch, abs_sample_times, increment);
+				ensure_schedule_steps(sched, abs_sample_times);
 				eval_scalar_samples(sched, wch.values, wch.interpolation, scratch_float);
 				animation->blend_shape_track_set_keys_bulk(track_idx, rel_sample_times.ptr(), scratch_float.ptr(), int(rel_sample_times.size()));
 			}
@@ -936,11 +1313,14 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 		return packed;
 	}
 
+	const LocalVector<GLTFState::FastNodeRec> &fast_nodes = GLTFFastAccess::fast_nodes(p_state.ptr());
+	const LocalVector<int32_t> &fast_children_pool = GLTFFastAccess::fast_children_pool(p_state.ptr());
+
 	// Zero-Node* direct SceneState builder (handles both static hierarchies and full Skeleton3D + Skin + BoneAttachment3D rigs).
 	Ref<SceneState> ss;
 	ss.instantiate();
 	HashMap<StringName, int> name_map;
-	if (nodes.size() > 32) {
+	if (fast_nodes.is_empty() && nodes.size() > 32) {
 		name_map.reserve(uint32_t(nodes.size() + 64));
 	}
 	HashMap<Variant, int> resource_val_map;
@@ -1022,7 +1402,85 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 	int single_root_gltf_idx = -1;
 	DirectAnimContext anim_ctx;
 
-	if (skeletons.is_empty()) {
+	if (!fast_nodes.is_empty()) {
+		// Contiguous POD FastNodeRec path (zero GLTFNode allocations, zero 10k-entry name_map insertions).
+		auto add_unique_fast_sname = [&](const StringName &p_sn) -> int {
+			HashMap<StringName, int>::Iterator E = name_map.find(p_sn);
+			return E ? E->value : ss->add_name(p_sn);
+		};
+		auto emit_fast_props = [&](int p_ss_node_idx, const GLTFState::FastNodeRec &p_fn) {
+			if (p_fn.has_non_identity_xform) {
+				ss->add_node_property(p_ss_node_idx, prop_transform, ss->add_value(p_fn.xform));
+			}
+			if (!p_fn.visible) {
+				ss->add_node_property(p_ss_node_idx, prop_visible, val_false);
+			}
+			if (p_fn.mesh >= 0 && p_fn.mesh < meshes.size() && meshes[p_fn.mesh].is_valid()) {
+				Ref<GLTFMesh> gmesh = meshes[p_fn.mesh];
+				Ref<Mesh> mres = gmesh->get_runtime_mesh();
+				if (mres.is_null() && gmesh->get_mesh().is_valid()) {
+					mres = gmesh->get_mesh()->get_mesh();
+				}
+				if (mres.is_valid()) {
+					if (gmesh->has_meta("extras")) {
+						mres->set_meta("extras", gmesh->get_meta("extras"));
+					}
+					ss->add_node_property(p_ss_node_idx, prop_mesh, intern_shared_val(mres));
+					const Vector<float> &weights = gmesh->get_blend_weights();
+					const int bs_cnt = MIN(weights.size(), mres->get_blend_shape_count());
+					for (int b = 0; b < bs_cnt; b++) {
+						if (weights[b] != 0.0f) {
+							const StringName bprop(String("blend_shapes/") + String(mres->get_blend_shape_name(b)));
+							ss->add_node_property(p_ss_node_idx, intern_name(bprop), ss->add_value(weights[b]));
+						}
+					}
+				}
+			}
+		};
+
+		struct FastStackEntry {
+			int32_t gltf_idx = -1;
+			int parent_ss_idx = -1;
+		};
+		LocalVector<FastStackEntry> stack;
+		const int32_t fn_cnt = int32_t(fast_nodes.size());
+
+		if (use_single_root) {
+			single_root_gltf_idx = 0;
+			const GLTFState::FastNodeRec &rfn = fast_nodes[0];
+			const int rtype = rfn.mesh >= 0 ? type_mesh_instance : type_node3d;
+			const int root_ss_idx = ss->add_node(-1, -1, rtype, add_unique_fast_sname(rfn.name), -1, -1, next_unique_id++);
+			emit_fast_props(root_ss_idx, rfn);
+			for (int32_t c = int32_t(rfn.child_count) - 1; c >= 0; c--) {
+				stack.push_back(FastStackEntry{ fast_children_pool[rfn.first_child + uint32_t(c)], root_ss_idx });
+			}
+		} else {
+			String sname = p_state->get_scene_name();
+			if (sname.is_empty()) {
+				sname = "Node3D";
+			} else {
+				sname = GLTFFastAccess::gen_unique_name(p_doc, p_state, sname);
+			}
+			const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(sname)), -1, -1, next_unique_id++);
+			const Vector<int> &rnodes = GLTFFastAccess::root_nodes(p_state.ptr());
+			for (int r = rnodes.size() - 1; r >= 0; r--) {
+				stack.push_back(FastStackEntry{ rnodes[r], root_ss_idx });
+			}
+		}
+
+		while (!stack.is_empty()) {
+			const FastStackEntry item = stack[stack.size() - 1];
+			stack.resize(stack.size() - 1);
+			ERR_CONTINUE(item.gltf_idx < 0 || item.gltf_idx >= fn_cnt);
+			const GLTFState::FastNodeRec &fn = fast_nodes[uint32_t(item.gltf_idx)];
+			const int ntype = fn.mesh >= 0 ? type_mesh_instance : type_node3d;
+			const int ss_idx = ss->add_node(item.parent_ss_idx, 0, ntype, add_unique_fast_sname(fn.name), -1, -1, next_unique_id++);
+			emit_fast_props(ss_idx, fn);
+			for (int32_t c = int32_t(fn.child_count) - 1; c >= 0; c--) {
+				stack.push_back(FastStackEntry{ fast_children_pool[fn.first_child + uint32_t(c)], ss_idx });
+			}
+		}
+	} else if (skeletons.is_empty()) {
 		// Ultra-lean zero-allocation stack walk for static / morph / node-animated scenes (e.g. nodes_10000).
 		auto emit_static_props = [&](int p_ss_node_idx, const Ref<GLTFNode> &p_gnode) {
 			const Transform3D &xf = GLTFFastAccess::node_xform(p_gnode.ptr());
@@ -1591,7 +2049,34 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 		LocalVector<Ref<Animation>> built_anims;
 		built_anims.resize(uint32_t(anims.size()));
 		if (anims.size() >= 2 && LoadThreadPool::get_singleton()) {
-			LoadThreadPool::get_singleton()->parallel_for(uint32_t(anims.size()), [&](uint32_t a_i) {
+			LocalVector<uint32_t> anim_order;
+			anim_order.resize(uint32_t(anims.size()));
+			LocalVector<uint64_t> anim_weights;
+			anim_weights.resize(uint32_t(anims.size()));
+			for (uint32_t a_i = 0; a_i < uint32_t(anims.size()); a_i++) {
+				anim_order[a_i] = a_i;
+				uint64_t w = 0;
+				if (anims[int(a_i)].is_valid()) {
+					for (const KeyValue<int, GLTFAnimation::NodeTrack> &kv : anims[int(a_i)]->get_node_tracks()) {
+						w += uint64_t(MAX(kv.value.rotation_track.raw_times_count, int32_t(kv.value.rotation_track.times.size()))) +
+								uint64_t(MAX(kv.value.position_track.raw_times_count, int32_t(kv.value.position_track.times.size())));
+					}
+				}
+				anim_weights[a_i] = w;
+			}
+			// Sort heaviest clip first so the calling P-core claims anim_order[0] immediately.
+			for (uint32_t i = 1; i < anim_order.size(); i++) {
+				const uint32_t key_idx = anim_order[i];
+				const uint64_t key_w = anim_weights[key_idx];
+				int32_t j = int32_t(i) - 1;
+				while (j >= 0 && anim_weights[anim_order[uint32_t(j)]] < key_w) {
+					anim_order[uint32_t(j + 1)] = anim_order[uint32_t(j)];
+					j--;
+				}
+				anim_order[uint32_t(j + 1)] = key_idx;
+			}
+			LoadThreadPool::get_singleton()->parallel_for(anim_order.size(), [&](uint32_t ord_i) {
+				const uint32_t a_i = anim_order[ord_i];
 				built_anims[a_i] = build_animation_fast_impl(
 						p_doc, p_state, nullptr, int(a_i), p_trimming, p_remove_immutable_tracks, single_root_gltf_idx, &anim_ctx);
 			});
@@ -1633,6 +2118,7 @@ Ref<Resource> ResourceFormatLoaderGLB::load(const String &p_path, const String &
 	state->set_handle_binary_image_mode(GLTFState::HANDLE_BINARY_IMAGE_MODE_EMBED_AS_UNCOMPRESSED);
 	state->set_additional_data(SNAME("_ange_want_packed_scene"), true);
 	state->set_additional_data(SNAME("_ange_strict_external_ktx2"), true);
+	state->set_additional_data(SNAME("_ange_parallel_ktx2_rescache"), true);
 
 	Error err = doc->append_from_file(p_path, state);
 	if (err != OK) {

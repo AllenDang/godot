@@ -65,6 +65,18 @@ public:
 		HANDLE_BINARY_IMAGE_MODE_EMBED_AS_UNCOMPRESSED, // If this value changes from 3, ResourceImporterScene::pre_import must be changed as well.
 	};
 
+	// Contiguous POD node record for zero-Resource-allocation direct SceneState building (e.g. nodes_10000).
+	struct FastNodeRec {
+		StringName name;
+		Transform3D xform;
+		int32_t parent = -1;
+		uint32_t first_child = 0;
+		uint32_t child_count = 0;
+		int32_t mesh = -1;
+		bool has_non_identity_xform = false;
+		bool visible = true;
+	};
+
 protected:
 	String base_path;
 	String extract_path;
@@ -95,6 +107,8 @@ protected:
 	HandleBinaryImageMode handle_binary_image_mode = HANDLE_BINARY_IMAGE_MODE_EXTRACT_TEXTURES;
 
 	Vector<Ref<GLTFNode>> nodes;
+	LocalVector<FastNodeRec> fast_nodes;
+	LocalVector<int32_t> fast_children_pool;
 	mutable Vector<Vector<uint8_t>> buffers;
 	Vector<Ref<GLTFBufferView>> buffer_views;
 	Vector<Ref<GLTFAccessor>> accessors;

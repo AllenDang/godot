@@ -282,7 +282,7 @@ Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Erro
 
 			uint8_t *dst_lv = dst + Image::get_image_mipmap_offset(width, height, image_format, lv);
 			if (pool && uint64_t(bx) * uint64_t(by) >= 1024ULL && by >= 4u) {
-				const uint32_t strips = MIN(24u, by);
+				const uint32_t strips = MIN(48u, by);
 				pool->parallel_for(strips, [&](uint32_t s) {
 					if (failed.load(std::memory_order_relaxed)) {
 						return;

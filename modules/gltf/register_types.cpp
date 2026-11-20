@@ -42,6 +42,7 @@
 #include "core/config/engine.h"
 #include "core/io/resource_loader.h"
 #include "core/object/class_db.h"
+#include "core/os/load_thread_pool.h"
 
 static Ref<ResourceFormatLoaderGLB> resource_loader_glb;
 
@@ -149,6 +150,7 @@ void initialize_gltf_module(ModuleInitializationLevel p_level) {
 			GDREGISTER_INTERNAL_CLASS(ResourceFormatLoaderGLB);
 			resource_loader_glb.instantiate();
 			ResourceLoader::add_resource_format_loader(resource_loader_glb, false);
+			(void)LoadThreadPool::get_singleton();
 		}
 	}
 
