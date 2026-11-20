@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/effects/debug_effects.h"
 #include "servers/rendering/renderer_rd/effects/fsr.h"
 #include "servers/rendering/renderer_rd/effects/luminance.h"
+#include "servers/rendering/renderer_rd/effects/mobile_taau.h"
 #include "servers/rendering/renderer_rd/effects/resolve.h"
 #include "servers/rendering/renderer_rd/effects/smaa.h"
 #include "servers/rendering/renderer_rd/effects/tone_mapper.h"
@@ -67,6 +68,7 @@ protected:
 	RendererRD::SMAA *smaa = nullptr;
 	RendererRD::ToneMapper *tone_mapper = nullptr;
 	RendererRD::FSR *fsr = nullptr;
+	RendererRD::MobileTAAU *mobile_taau = nullptr;
 	RendererRD::VRS *vrs = nullptr;
 	RendererRD::Resolve *resolve_effects = nullptr;
 #ifdef METAL_ENABLED

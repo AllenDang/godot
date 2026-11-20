@@ -156,13 +156,12 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 			if (scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_OFF && scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR && scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST && OS::get_singleton()->get_current_rendering_method() == "gl_compatibility") {
 				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
 				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
-				WARN_PRINT_ONCE("MetalFX and FSR upscaling are not supported in the Compatibility renderer. Falling back to bilinear scaling.");
+				WARN_PRINT_ONCE("Temporal and spatial upscaling are not supported in the Compatibility renderer. Falling back to bilinear scaling.");
 			}
 
-			if ((scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) && OS::get_singleton()->get_current_rendering_method() == "mobile") {
-				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
+			if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR && OS::get_singleton()->get_current_rendering_method() == "mobile") {
+				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_TAAU;
 				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
-				WARN_PRINT_ONCE("MetalFX temporal and FSR upscaling are not supported in the Mobile renderer. Falling back to bilinear scaling.");
 			}
 
 			if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL && !RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_TEMPORAL)) {
@@ -243,6 +242,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 				case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR:
 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
+				case RSE::VIEWPORT_SCALING_3D_MODE_TAAU:
 					target_width = p_viewport->size.width;
 					target_height = p_viewport->size.height;
 					render_width = MAX(target_width * scaling_3d_scale, 1.0); // target_width / (target_width * scaling)
@@ -1023,23 +1023,11 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
 	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
-	if (rendering_method != "forward_plus") {
-		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR) {
-			WARN_PRINT_ONCE_ED("FSR1 3D scaling is only available when using the Forward+ renderer.");
+	if (rendering_method == "gl_compatibility") {
+		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR || p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL || p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL || p_mode == RSE::VIEWPORT_SCALING_3D_MODE_TAAU) {
+			WARN_PRINT_ONCE_ED("Temporal and spatial upscaling are only available when using the Forward+ or Mobile renderer.");
 			return;
 		}
-		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2) {
-			WARN_PRINT_ONCE_ED("FSR2 3D scaling is only available when using the Forward+ renderer.");
-			return;
-		}
-		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
-			WARN_PRINT_ONCE_ED("MetalFX Temporal 3D scaling is only available when using the Forward+ renderer.");
-			return;
-		}
-	}
-	if (rendering_method == "gl_compatibility" && p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL) {
-		WARN_PRINT_ONCE_ED("MetalFX Spatial 3D scaling is only available when using the Forward+ or Mobile renderer.");
-		return;
 	}
 
 	if (viewport->scaling_3d_mode == p_mode) {
@@ -1446,8 +1434,8 @@ void RendererViewport::viewport_set_screen_space_aa(RID p_viewport, RSE::Viewpor
 void RendererViewport::viewport_set_use_taa(RID p_viewport, bool p_use_taa) {
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus") {
-		WARN_PRINT_ONCE_ED("TAA is only available when using the Forward+ renderer.");
+	if (OS::get_singleton()->get_current_rendering_method() == "gl_compatibility") {
+		WARN_PRINT_ONCE_ED("TAA is only available when using the Forward+ or Mobile renderer.");
 		return;
 	}
 

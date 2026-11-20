@@ -71,9 +71,17 @@ private:
 	bool force_hdr = false;
 	uint32_t max_cluster_elements = 512;
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
+	RD::DataFormat base_data_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 	RendererRD::VRS *vrs = nullptr;
 	uint64_t auto_exposure_version = 1;
 	RSE::ViewportVRSMode vrs_mode = RSE::VIEWPORT_VRS_DISABLED;
+	uint32_t taau_write_index = 0;
+	bool taau_ready = false;
+	bool flora_tile_vis_active = false;
+	bool flora_desktop_tile_compute = false;
+	Callable flora_shadow_cb;
+	Callable flora_subpass_vis_cb;
+	Callable flora_subpass_resolve_cb;
 
 	// Our render target represents our final destination that we display on screen.
 	RID render_target;
@@ -191,9 +199,12 @@ public:
 	bool get_can_be_storage() const { return can_be_storage; }
 	void set_max_cluster_elements(const uint32_t p_max_elements) { max_cluster_elements = p_max_elements; }
 	uint32_t get_max_cluster_elements() { return max_cluster_elements; }
-	void set_preferred_data_format(const RD::DataFormat p_preferred_data_format) { preferred_data_format = p_preferred_data_format; }
+	void set_preferred_data_format(const RD::DataFormat p_preferred_data_format) {
+		preferred_data_format = p_preferred_data_format;
+		base_data_format = force_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : preferred_data_format;
+	}
 	RD::DataFormat get_preferred_data_format() const { return preferred_data_format; }
-	RD::DataFormat get_base_data_format() const { return force_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : preferred_data_format; }
+	RD::DataFormat get_base_data_format() const { return base_data_format; }
 	float get_luminance_multiplier() const;
 	void set_vrs(RendererRD::VRS *p_vrs) { vrs = p_vrs; }
 	RSE::ViewportVRSMode get_vrs_mode() { return vrs_mode; }
@@ -263,10 +274,11 @@ public:
 	}
 	_FORCE_INLINE_ RID get_internal_texture_reactive(const uint32_t p_layer) {
 		RD::TextureView alpha_only_view;
-		alpha_only_view.swizzle_r = RD::TEXTURE_SWIZZLE_A;
-		alpha_only_view.swizzle_g = RD::TEXTURE_SWIZZLE_A;
-		alpha_only_view.swizzle_b = RD::TEXTURE_SWIZZLE_A;
-		alpha_only_view.swizzle_a = RD::TEXTURE_SWIZZLE_A;
+		const RD::TextureSwizzle swz = (base_data_format == RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32) ? RD::TEXTURE_SWIZZLE_ZERO : RD::TEXTURE_SWIZZLE_A;
+		alpha_only_view.swizzle_r = swz;
+		alpha_only_view.swizzle_g = swz;
+		alpha_only_view.swizzle_b = swz;
+		alpha_only_view.swizzle_a = swz;
 		return get_texture_slice_view(RB_SCOPE_BUFFERS, RB_TEX_COLOR, p_layer, 0, 1, 1, alpha_only_view);
 	}
 	_FORCE_INLINE_ RID get_color_msaa() const {
@@ -304,7 +316,7 @@ public:
 		}
 	}
 
-	// Upscaled.
+	// Upscaled & TAAU.
 	void ensure_upscaled();
 
 	_FORCE_INLINE_ bool has_upscaled_texture() const {
@@ -316,6 +328,33 @@ public:
 	_FORCE_INLINE_ RID get_upscaled_texture(const uint32_t p_layer) {
 		return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED, p_layer, 0);
 	}
+
+	_FORCE_INLINE_ uint32_t get_taau_write_index() const { return taau_write_index; }
+	_FORCE_INLINE_ void set_taau_output_state(uint32_t p_write_index, bool p_ready) {
+		taau_write_index = p_write_index;
+		taau_ready = p_ready;
+	}
+	_FORCE_INLINE_ bool has_taau_output() const {
+		return taau_ready && has_texture(SNAME("taau"), taau_write_index == 0 ? SNAME("history_0") : SNAME("history_1"));
+	}
+	_FORCE_INLINE_ RID get_taau_output_texture() const {
+		return get_texture(SNAME("taau"), taau_write_index == 0 ? SNAME("history_0") : SNAME("history_1"));
+	}
+	_FORCE_INLINE_ RID get_taau_output_texture(const uint32_t p_layer) {
+		return get_texture_slice(SNAME("taau"), taau_write_index == 0 ? SNAME("history_0") : SNAME("history_1"), p_layer, 0);
+	}
+
+	// FloraTileVis single-RenderPass multi-subpass visibility buffer API.
+	void set_flora_tile_vis_active(bool p_active, bool p_desktop_tile_compute = false);
+	_FORCE_INLINE_ bool is_flora_tile_vis_active() const { return flora_tile_vis_active; }
+	_FORCE_INLINE_ bool is_flora_desktop_tile_compute() const { return flora_desktop_tile_compute; }
+	void set_flora_pass_callbacks(const Callable &p_shadow_cb, const Callable &p_subpass_vis_cb, const Callable &p_subpass_resolve_cb);
+	_FORCE_INLINE_ const Callable &get_flora_shadow_callback() const { return flora_shadow_cb; }
+	_FORCE_INLINE_ const Callable &get_flora_subpass_vis_callback() const { return flora_subpass_vis_cb; }
+	_FORCE_INLINE_ const Callable &get_flora_subpass_resolve_callback() const { return flora_subpass_resolve_cb; }
+	RID ensure_flora_vis_texture();
+	RID get_flora_vis_texture() const;
+	RID get_flora_vis_layer(uint32_t p_layer);
 
 	// Velocity, currently only used by TAA (Clustered) but we'll be using this in other places soon too.
 

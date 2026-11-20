@@ -348,7 +348,8 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 			RD::COMPARE_OP_ALWAYS,
 		};
 
-		uint32_t stencil_mask = 255;
+		// Reserve stencil bit 0x80 for FloraTileVis hardware Early-Stencil tile skipping.
+		uint32_t stencil_mask = 0x7F;
 
 		RD::PipelineDepthStencilState::StencilOperationState op;
 		op.fail = RD::STENCIL_OP_KEEP;
@@ -403,12 +404,14 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 			multisample_state.enable_alpha_to_one = true;
 		}
 
-		if (p_pipeline_key.version == SHADER_VERSION_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS_MULTIVIEW) {
+		if (p_pipeline_key.version == SHADER_VERSION_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW) {
 			blend_state = blend_state_blend;
 			if (depth_draw == DEPTH_DRAW_OPAQUE && !uses_alpha_clip) {
 				// Alpha does not write to depth.
 				depth_stencil_state.enable_depth_write = false;
 			}
+		} else if (p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS || p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS_MULTIVIEW) {
+			blend_state = blend_state_opaque;
 		} else if (p_pipeline_key.version == SHADER_VERSION_SHADOW_PASS || p_pipeline_key.version == SHADER_VERSION_SHADOW_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_SHADOW_PASS_DP) {
 			// Contains nothing.
 		} else if (p_pipeline_key.version == SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL) {
@@ -418,7 +421,7 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 			// Do not use this version (error case).
 		}
 	} else {
-		if (p_pipeline_key.version == SHADER_VERSION_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS_MULTIVIEW) {
+		if (p_pipeline_key.version == SHADER_VERSION_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS || p_pipeline_key.version == SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS || p_pipeline_key.version == SHADER_VERSION_MOTION_VECTORS_MULTIVIEW) {
 			blend_state = blend_state_opaque;
 		} else if (p_pipeline_key.version == SHADER_VERSION_SHADOW_PASS || p_pipeline_key.version == SHADER_VERSION_SHADOW_PASS_MULTIVIEW || p_pipeline_key.version == SHADER_VERSION_SHADOW_PASS_DP) {
 			// Contains nothing.
@@ -623,6 +626,7 @@ void SceneShaderForwardMobile::init(const String p_defines) {
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_RENDER_DEPTH\n#define SHADOW_PASS\n", default_enabled)); // SHADER_VERSION_SHADOW_PASS, should probably change this to MODE_RENDER_SHADOW because we don't have a depth pass here...
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_RENDER_DEPTH\n#define MODE_DUAL_PARABOLOID\n#define SHADOW_PASS\n", default_enabled)); // SHADER_VERSION_SHADOW_PASS_DP
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_RENDER_DEPTH\n#define MODE_RENDER_MATERIAL\n", default_enabled)); // SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL
+				shader_versions.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_RENDER_MOTION_VECTORS\n", default_enabled)); // SHADER_VERSION_MOTION_VECTORS
 
 				// Multiview versions of our shaders.
 				shader_versions.push_back(ShaderRD::VariantDefine(shader_group_multiview, base_define + "\n#define USE_MULTIVIEW\n", false)); // SHADER_VERSION_COLOR_PASS_MULTIVIEW

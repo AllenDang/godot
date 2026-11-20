@@ -2451,13 +2451,18 @@ void main() {
 #endif //MODE_RENDER_DEPTH
 
 #ifdef MODE_RENDER_MOTION_VECTORS
+#ifdef USE_MULTIVIEW
 	// These motion vectors are in NDC space (as opposed to screen space) to fit the OpenXR XR_FB_space_warp specification.
 	// https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#XR_FB_space_warp
-
 	vec3 ndc = screen_position.xyz / screen_position.w;
 	ndc.y = -ndc.y;
 	vec3 prev_ndc = prev_screen_position.xyz / prev_screen_position.w;
 	prev_ndc.y = -prev_ndc.y;
 	frag_color = vec4(ndc - prev_ndc, 0.0);
+#else
+	vec2 position_clip = (screen_position.xy / screen_position.w) - scene_data_block.data.taa_jitter;
+	vec2 prev_position_clip = (prev_screen_position.xy / prev_screen_position.w) - scene_data_block.prev_data.taa_jitter;
+	frag_color = vec4((prev_position_clip - position_clip) * vec2(0.5, 0.5), 0.0, 0.0);
+#endif
 #endif
 }

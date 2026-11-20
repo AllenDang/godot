@@ -32,6 +32,7 @@
 #include "render_scene_buffers_rd.compat.inc"
 
 #include "core/object/class_db.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_device_binds.h"
 #include "servers/rendering/rendering_server.h" // IWYU pragma: keep // Needed to bind RSE enums.
@@ -56,6 +57,12 @@ bool RenderSceneBuffersRD::composite_mobile_ao(RID p_ao, RID p_guide, int p_algo
 }
 void RenderSceneBuffersRD::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("composite_mobile_ao", "ao", "guide", "algorithm", "view", "radius", "intensity", "max_distance"), &RenderSceneBuffersRD::composite_mobile_ao);
+	ClassDB::bind_method(D_METHOD("set_flora_tile_vis_active", "active", "desktop_tile_compute"), &RenderSceneBuffersRD::set_flora_tile_vis_active, DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("is_flora_tile_vis_active"), &RenderSceneBuffersRD::is_flora_tile_vis_active);
+	ClassDB::bind_method(D_METHOD("is_flora_desktop_tile_compute"), &RenderSceneBuffersRD::is_flora_desktop_tile_compute);
+	ClassDB::bind_method(D_METHOD("set_flora_pass_callbacks", "shadow_cb", "subpass_vis_cb", "subpass_resolve_cb"), &RenderSceneBuffersRD::set_flora_pass_callbacks);
+	ClassDB::bind_method(D_METHOD("get_flora_vis_texture"), &RenderSceneBuffersRD::get_flora_vis_texture);
+	ClassDB::bind_method(D_METHOD("get_flora_vis_layer", "layer"), &RenderSceneBuffersRD::get_flora_vis_layer);
 	ClassDB::bind_method(D_METHOD("has_texture", "context", "name"), &RenderSceneBuffersRD::has_texture);
 	ClassDB::bind_method(D_METHOD("create_texture", "context", "name", "data_format", "usage_bits", "texture_samples", "size", "layers", "mipmaps", "unique", "discardable"), &RenderSceneBuffersRD::create_texture);
 	ClassDB::bind_method(D_METHOD("create_texture_from_format", "context", "name", "format", "view", "unique"), &RenderSceneBuffersRD::_create_texture_from_format);
@@ -142,6 +149,7 @@ void RenderSceneBuffersRD::cleanup() {
 		free_named_texture(E.value);
 	}
 	named_textures.clear();
+	taau_ready = false;
 
 	// Clear weight_buffer / blur textures.
 	for (WeightBuffers &weight_buffer : weight_buffers) {
@@ -190,7 +198,21 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
 
 	// Create our color buffer.
 	const bool resolve_target = msaa_3d != RSE::VIEWPORT_MSAA_DISABLED;
-	create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR, get_base_data_format(), get_color_usage_bits(resolve_target, false, can_be_storage));
+	const bool color_needs_storage = can_be_storage || flora_desktop_tile_compute;
+	const bool transparent_bg = render_target.is_valid() && texture_storage->render_target_get_transparent(render_target);
+	if (!transparent_bg && !can_be_storage) {
+		// Non-transparent Mobile 3D viewports use 32-bit packed float HDR (B10G11R11_UFLOAT_PACK32),
+		// enabling full linear HDR range (luminance_multiplier = 1.0) at 32bpp with hardware AFBC/UBWC.
+		const uint32_t probe_usage = get_color_usage_bits(resolve_target, false, color_needs_storage);
+		if (RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32, probe_usage)) {
+			base_data_format = RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32;
+		} else {
+			base_data_format = force_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : preferred_data_format;
+		}
+	} else {
+		base_data_format = force_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : preferred_data_format;
+	}
+	create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR, get_base_data_format(), get_color_usage_bits(resolve_target, false, color_needs_storage));
 
 	// TODO: Detect when it is safe to use RD::TEXTURE_USAGE_TRANSIENT_BIT for RB_TEX_DEPTH, RB_TEX_COLOR_MSAA and/or RB_TEX_DEPTH_MSAA.
 	// (it means we cannot sample from it, we cannot copy from/to it) to save VRAM (and maybe performance too).
@@ -726,10 +748,76 @@ RID RenderSceneBuffersRD::get_depth_msaa_subsampled() {
 
 void RenderSceneBuffersRD::ensure_upscaled() {
 	if (!has_upscaled_texture()) {
-		uint32_t usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | (can_be_storage ? RD::TEXTURE_USAGE_STORAGE_BIT : 0) | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
-		usage_bits |= RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
-		create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED, get_base_data_format(), usage_bits, RD::TEXTURE_SAMPLES_1, target_size);
+		uint32_t usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
+		RD::DataFormat upscaled_fmt = get_base_data_format();
+		if (!RD::get_singleton()->texture_is_format_supported_for_usage(upscaled_fmt, usage_bits)) {
+			upscaled_fmt = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+		}
+		create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED, upscaled_fmt, usage_bits, RD::TEXTURE_SAMPLES_1, target_size);
 	}
+}
+
+void RenderSceneBuffersRD::set_flora_tile_vis_active(bool p_active, bool p_desktop_tile_compute) {
+	if (flora_tile_vis_active == p_active && flora_desktop_tile_compute == p_desktop_tile_compute) {
+		return;
+	}
+	const bool compute_changed = flora_desktop_tile_compute != p_desktop_tile_compute;
+	flora_tile_vis_active = p_active;
+	flora_desktop_tile_compute = p_desktop_tile_compute;
+	clear_context(SNAME("flora_vis"));
+	if (compute_changed && internal_size.x > 0 && internal_size.y > 0 && has_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR)) {
+		const bool resolve_target = msaa_3d != RSE::VIEWPORT_MSAA_DISABLED;
+		const bool color_needs_storage = can_be_storage || flora_desktop_tile_compute;
+		const uint32_t color_usage = get_color_usage_bits(resolve_target, false, color_needs_storage);
+		if (!RD::get_singleton()->texture_is_format_supported_for_usage(base_data_format, color_usage)) {
+			base_data_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+		}
+		free_named_texture(named_textures[NTKey(RB_SCOPE_BUFFERS, RB_TEX_COLOR)]);
+		named_textures.erase(NTKey(RB_SCOPE_BUFFERS, RB_TEX_COLOR));
+		create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR, base_data_format, color_usage);
+		if (has_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY)) {
+			free_named_texture(named_textures[NTKey(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY)]);
+			named_textures.erase(NTKey(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY));
+		}
+	}
+}
+
+void RenderSceneBuffersRD::set_flora_pass_callbacks(const Callable &p_shadow_cb, const Callable &p_subpass_vis_cb, const Callable &p_subpass_resolve_cb) {
+	flora_shadow_cb = p_shadow_cb;
+	flora_subpass_vis_cb = p_subpass_vis_cb;
+	flora_subpass_resolve_cb = p_subpass_resolve_cb;
+}
+
+RID RenderSceneBuffersRD::ensure_flora_vis_texture() {
+	if (has_texture(SNAME("flora_vis"), SNAME("vis_id"))) {
+		return get_texture(SNAME("flora_vis"), SNAME("vis_id"));
+	}
+	uint32_t usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
+	const bool is_vulkan = OS::get_singleton() && OS::get_singleton()->get_current_rendering_driver_name() == "vulkan";
+	if (is_vulkan && !flora_desktop_tile_compute) {
+		if (RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R32_UINT, usage_bits | RD::TEXTURE_USAGE_TRANSIENT_BIT)) {
+			usage_bits |= RD::TEXTURE_USAGE_TRANSIENT_BIT;
+		} else {
+			usage_bits |= RD::TEXTURE_USAGE_SAMPLING_BIT;
+		}
+	} else {
+		usage_bits |= RD::TEXTURE_USAGE_SAMPLING_BIT;
+	}
+	return create_texture(SNAME("flora_vis"), SNAME("vis_id"), RD::DATA_FORMAT_R32_UINT, usage_bits, RD::TEXTURE_SAMPLES_1, Size2i(), 0, 1, true, !flora_desktop_tile_compute);
+}
+
+RID RenderSceneBuffersRD::get_flora_vis_texture() const {
+	if (!has_texture(SNAME("flora_vis"), SNAME("vis_id"))) {
+		return RID();
+	}
+	return get_texture(SNAME("flora_vis"), SNAME("vis_id"));
+}
+
+RID RenderSceneBuffersRD::get_flora_vis_layer(uint32_t p_layer) {
+	if (!has_texture(SNAME("flora_vis"), SNAME("vis_id"))) {
+		return RID();
+	}
+	return get_texture_slice(SNAME("flora_vis"), SNAME("vis_id"), p_layer, 0);
 }
 
 // Velocity texture.
@@ -737,10 +825,11 @@ void RenderSceneBuffersRD::ensure_upscaled() {
 void RenderSceneBuffersRD::ensure_velocity() {
 	if (!has_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY)) {
 		const bool msaa = msaa_3d != RSE::VIEWPORT_MSAA_DISABLED;
-		create_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY, get_velocity_format(), get_velocity_usage_bits(msaa, false, can_be_storage));
+		const bool need_storage = can_be_storage || flora_desktop_tile_compute || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
+		create_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY, get_velocity_format(), get_velocity_usage_bits(msaa, false, need_storage));
 
 		if (msaa) {
-			create_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY_MSAA, get_velocity_format(), get_velocity_usage_bits(false, msaa, can_be_storage), texture_samples, Size2i(), 0, 1, true, true);
+			create_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY_MSAA, get_velocity_format(), get_velocity_usage_bits(false, msaa, need_storage), texture_samples, Size2i(), 0, 1, true, true);
 		}
 	}
 }
@@ -866,7 +955,7 @@ uint32_t RenderSceneBuffersRD::get_vrs_usage_bits() {
 }
 
 float RenderSceneBuffersRD::get_luminance_multiplier() const {
-	// On mobile renderer when not using HDR2D we need to scale HDR values by two
-	// to fit 0-2 range color values into a UNORM buffer.
-	return (force_hdr || can_be_storage) ? 1.0 : 2.0;
+	// Only scale by 2.0 when rendering into [0..1] UNORM RGB10A2 buffers.
+	// Packed float HDR (B10G11R11_UFLOAT_PACK32) and RGBA16F operate directly in 1.0x linear HDR.
+	return (force_hdr || can_be_storage || base_data_format != RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32) ? 1.0 : 2.0;
 }

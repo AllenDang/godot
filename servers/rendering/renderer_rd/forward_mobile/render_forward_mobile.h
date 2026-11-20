@@ -32,7 +32,10 @@
 
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
+#include "servers/rendering/renderer_rd/effects/fsr2.h"
+#include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/environment/aerial_perspective.h"
+#include "servers/rendering/renderer_rd/forward_mobile/flora_tile_vis.h"
 #include "servers/rendering/renderer_rd/forward_mobile/scene_shader_forward_mobile.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 
@@ -52,6 +55,11 @@ private:
 	static RenderForwardMobile *singleton;
 	RendererRD::AerialPerspective aerial_perspective;
 	RendererRD::MobileFog mobile_fog;
+	RendererRD::FSR2Effect *fsr2_effect = nullptr;
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
+#endif
+	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
 	/* Scene Shader */
 
@@ -98,8 +106,19 @@ private:
 
 		RID get_motion_vectors_fb();
 
+		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
+		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
+#ifdef METAL_MFXTEMPORAL_ENABLED
+		bool ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect);
+		RendererRD::MFXTemporalContext *get_mfx_temporal_context() const { return mfx_temporal_context; }
+#endif
+
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
+		RendererRD::FSR2Context *fsr2_context = nullptr;
+#ifdef METAL_MFXTEMPORAL_ENABLED
+		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
+#endif
 	};
 
 	virtual void setup_render_buffer_data(Ref<RenderSceneBuffersRD> p_render_buffers) override;
@@ -146,6 +165,7 @@ private:
 		uint32_t subpass = 0;
 		bool use_material_feedback = false;
 		bool defer_opaque_fog = false;
+		bool dynamic_motion_only = false;
 
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, RID p_render_pass_uniform_set, SceneShaderForwardMobile::ShaderSpecialization p_base_specialization, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, bool p_use_material_feedback = false) {
 			elements = p_elements;
@@ -170,9 +190,9 @@ private:
 
 	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
 	void _render_shadow_begin();
-	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
+	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D(), bool p_is_directional = false, int32_t p_cascade_index = 0);
 	void _render_shadow_process();
-	void _render_shadow_end();
+	void _render_shadow_end(Ref<RenderSceneBuffersRD> p_rb = Ref<RenderSceneBuffersRD>());
 
 	/* Render Scene */
 
@@ -310,6 +330,7 @@ private:
 		bool used_depth_texture = false;
 		bool used_lightmap = false;
 		bool used_opaque_stencil = false;
+		bool has_dynamic_opaque_motion = false;
 
 		struct ShadowPass {
 			uint32_t element_from;
@@ -324,6 +345,11 @@ private:
 			RID framebuffer;
 			Rect2i rect;
 			bool clear_depth;
+			bool is_directional = false;
+			int32_t cascade_index = 0;
+			Projection projection;
+			Transform3D transform;
+			float zfar = 0.0f;
 		};
 
 		LocalVector<ShadowPass> shadow_passes;

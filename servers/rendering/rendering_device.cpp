@@ -3380,7 +3380,7 @@ RDD::RenderPassID RenderingDevice::_render_pass_create(RenderingDeviceDriver *p_
 			if (attachment_last_pass[attachment] != i) {
 				// Preserve can still be used to keep depth or color from being discarded after use.
 				attachment_last_pass[attachment] = i;
-				subpasses[i].preserve_attachments.push_back(attachment);
+				subpasses[i].preserve_attachments.push_back(attachment_remap[attachment]);
 			}
 		}
 
@@ -4732,8 +4732,8 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					ERR_FAIL_NULL_V_MSG(texture, RID(),
 							"InputAttachment (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") is not a valid texture.");
 
-					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_SAMPLING_BIT), RID(),
-							"InputAttachment (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_SAMPLING_BIT usage flag set in order to be used as uniform.");
+					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_INPUT_ATTACHMENT_BIT), RID(),
+							"InputAttachment (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_INPUT_ATTACHMENT_BIT usage flag set in order to be used as uniform.");
 
 					DEV_ASSERT(!texture->owner.is_valid() || texture_owner.get_or_null(texture->owner));
 
