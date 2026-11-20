@@ -33,6 +33,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
+#include "core/io/file_access_mmap.h"
 #include "core/io/image_loader.h"
 #include "core/io/resource_loader.h"
 #include "core/math/math_funcs.h"
@@ -2765,6 +2766,15 @@ Image::AlphaMode Image::detect_alpha() const {
 
 Error Image::load(const String &p_path) {
 	String path = ResourceUID::ensure_path(p_path);
+	if (_ktx_mem_loader_func && (path.has_extension("ktx2") || path.has_extension("ktx"))) {
+		FileAccessMMapView view;
+		if (view.open(path) == OK && view.is_valid() && view.size() > 0 && view.size() <= INT32_MAX) {
+			Ref<Image> ktx_img = _ktx_mem_loader_func(view.ptr(), static_cast<int>(view.size()));
+			ERR_FAIL_COND_V(ktx_img.is_null(), ERR_PARSE_ERROR);
+			copy_internals_from(ktx_img);
+			return OK;
+		}
+	}
 #ifdef DEBUG_ENABLED
 	if (path.begins_with("res://") && ResourceLoader::exists(path)) {
 		WARN_PRINT(vformat("Loaded resource as image file, this will not work on export: '%s'. Instead, import the image file as an Image resource and load it normally as a resource.", path));
@@ -2775,6 +2785,15 @@ Error Image::load(const String &p_path) {
 
 Ref<Image> Image::load_from_file(const String &p_path) {
 	String path = ResourceUID::ensure_path(p_path);
+	if (_ktx_mem_loader_func && (path.has_extension("ktx2") || path.has_extension("ktx"))) {
+		FileAccessMMapView view;
+		if (view.open(path) == OK && view.is_valid() && view.size() > 0 && view.size() <= INT32_MAX) {
+			Ref<Image> ktx_img = _ktx_mem_loader_func(view.ptr(), static_cast<int>(view.size()));
+			if (ktx_img.is_valid()) {
+				return ktx_img;
+			}
+		}
+	}
 #ifdef DEBUG_ENABLED
 	if (path.begins_with("res://") && ResourceLoader::exists(path)) {
 		WARN_PRINT(vformat("Loaded resource as image file, this will not work on export: '%s'. Instead, import the image file as an Image resource and load it normally as a resource.", path));

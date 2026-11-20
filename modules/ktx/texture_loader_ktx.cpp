@@ -30,11 +30,14 @@
 
 #include "texture_loader_ktx.h"
 
+#include "core/io/compression.h"
 #include "core/io/file_access.h"
 #include "core/io/file_access_memory.h"
 #include "core/io/file_access_mmap.h"
+#include "core/math/math_funcs.h"
 #include "core/object/class_db.h"
 #include "core/os/load_thread_pool.h"
+#include "core/templates/local_vector.h"
 #include "scene/resources/image_texture.h"
 #include "servers/rendering/rendering_server.h"
 
@@ -49,6 +52,7 @@ GODOT_GCC_WARNING_IGNORE("-Wunused-value")
 GODOT_GCC_WARNING_POP
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -58,10 +62,12 @@ constexpr uint8_t kKtx2Magic[12] = {
 };
 
 // Direct zero-stream KTX2 BasisU (UASTC / ETC1S / UASTC HDR) transcoder path.
-// Preserves native GPU block compression for both sRGB and Linear KTX2 textures
-// and parallelizes large multi-mip transcode across LoadThreadPool (<= 3 threads).
+// Preserves native GPU block compression for sRGB Color, 11-bit EAC_RG11 / BC5 Normal,
+// and 11-bit 4-bpp EAC_R11 / BC4 Scalar maps, and slices large UASTC mip levels into
+// 24 even block-row strips across LoadThreadPool (<= 3 low-priority utility threads)
+// with cDecodeFlagsHighQuality enabled for zero source degradation.
 Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Error *r_error) {
-	if (!p_data || p_size < 80 || std::memcmp(p_data, kKtx2Magic, 12) != 0) {
+	if (!p_data || p_size < sizeof(basist::ktx2_header) || std::memcmp(p_data, kKtx2Magic, 12) != 0) {
 		return Ref<Image>();
 	}
 	uint32_t vk_format = 0;
@@ -98,9 +104,13 @@ Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Erro
 	const bool block_aligned = (width % 4 == 0) && (height % 4 == 0);
 	const bool is_srgb = (transcoder.get_dfd_transfer_func() == basist::KTX2_KHR_DF_TRANSFER_SRGB);
 	const bool has_alpha = transcoder.get_has_alpha();
+	const basist::ktx2_df_channel_id ch0 = transcoder.get_dfd_channel_id0();
+	const basist::ktx2_df_channel_id ch1 = transcoder.get_dfd_channel_id1();
+	const uint32_t samples = transcoder.get_dfd_total_samples();
 
 	basist::transcoder_texture_format basisu_format = basist::transcoder_texture_format::cTFRGBA32;
 	Image::Format image_format = Image::FORMAT_RGBA8;
+	bool custom_uastc_rg_slice = false;
 
 	if (transcoder.is_hdr()) {
 		if (!transcoder.is_hdr_4x4()) {
@@ -117,18 +127,17 @@ Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Erro
 			image_format = Image::FORMAT_RGBE9995;
 		}
 	} else if (block_aligned) {
-		const basist::ktx2_df_channel_id ch0 = transcoder.get_dfd_channel_id0();
-		const basist::ktx2_df_channel_id ch1 = transcoder.get_dfd_channel_id1();
-		const uint32_t samples = transcoder.get_dfd_total_samples();
-
-		// Detect true 1-channel or 2-channel linear data maps when authored as R / RG.
+		// Detect 1-channel linear scalar (4 bpp EAC_R11 / BC4_R) and 2-channel linear normal/RG.
+		// On ASTC GPUs (iOS/macOS Metal, modern Android Vulkan), UASTC_RG (R=X, G=Y) transcodes directly
+		// to ASTC_4x4 (same 8 bpp VRAM, 100% lossless bit-repack of dual-plane UASTC, ~35x faster & lower power
+		// than brute-force EAC_RG11 re-quantization, and .xy == (X, Y) in scene_forward_mobile.glsl).
 		const bool is_single_r = !is_srgb && !has_alpha && samples == 1 &&
 				(ch0 == basist::KTX2_DF_CHANNEL_ETC1S_RRR || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRR);
 		const bool is_dual_rg = !is_srgb &&
-				((samples == 1 && (ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG)) ||
+				((samples == 1 && ((ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG && !astc_supported) || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG)) ||
 						(samples == 2 && ch0 == basist::KTX2_DF_CHANNEL_ETC1S_RRR && ch1 == basist::KTX2_DF_CHANNEL_ETC1S_GGG));
 
-		if (is_single_r && (rgtc_supported || (!astc_supported && etc2_supported))) {
+		if (is_single_r && (rgtc_supported || etc2_supported)) {
 			if (rgtc_supported) {
 				basisu_format = basist::transcoder_texture_format::cTFBC4_R;
 				image_format = Image::FORMAT_RGTC_R;
@@ -136,7 +145,7 @@ Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Erro
 				basisu_format = basist::transcoder_texture_format::cTFETC2_EAC_R11;
 				image_format = Image::FORMAT_ETC2_R11;
 			}
-		} else if (is_dual_rg && (rgtc_supported || (!astc_supported && etc2_supported))) {
+		} else if (is_dual_rg && (rgtc_supported || etc2_supported)) {
 			if (rgtc_supported) {
 				basisu_format = basist::transcoder_texture_format::cTFBC5_RG;
 				image_format = Image::FORMAT_RGTC_RG;
@@ -144,6 +153,7 @@ Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Erro
 				basisu_format = basist::transcoder_texture_format::cTFETC2_EAC_RG11;
 				image_format = Image::FORMAT_ETC2_RG11;
 			}
+			custom_uastc_rg_slice = (transcoder.is_uastc() && ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG);
 		} else if (has_alpha) {
 			if (astc_supported) {
 				basisu_format = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
@@ -191,36 +201,164 @@ Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Erro
 	}
 	uint8_t *dst = out_data.ptrw();
 	const bool compressed_out = Image::is_format_compressed(image_format);
+	const uint32_t dst_block_bytes = compressed_out
+			? ((image_format == Image::FORMAT_DXT1 || image_format == Image::FORMAT_RGTC_R ||
+					   image_format == Image::FORMAT_ETC || image_format == Image::FORMAT_ETC2_RGB8 ||
+					   image_format == Image::FORMAT_ETC2_R11)
+							  ? 8u
+							  : 16u)
+			: 4u;
 
-	auto transcode_one_level = [&](uint32_t p_level, basist::ktx2_transcoder_state *p_state) -> bool {
-		basist::ktx2_image_level_info level_info;
-		if (!transcoder.get_image_level_info(level_info, p_level, 0, 0)) {
-			return false;
+	const basist::ktx2_header *hdr = reinterpret_cast<const basist::ktx2_header *>(p_data);
+	const uint32_t supercomp = hdr->m_supercompression_scheme;
+	const size_t level_table_end = sizeof(basist::ktx2_header) + size_t(MAX(1u, authored_levels)) * sizeof(basist::ktx2_level_index);
+	const basist::ktx2_level_index *level_table = (level_table_end <= p_size)
+			? reinterpret_cast<const basist::ktx2_level_index *>(p_data + sizeof(basist::ktx2_header))
+			: nullptr;
+
+	const bool is_uastc_ldr = transcoder.is_uastc();
+	basist::basisu_lowlevel_uastc_ldr_4x4_transcoder uastc_tc;
+	LocalVector<uint8_t> zstd_scratch;
+	std::atomic<bool> failed{ false };
+
+	const uint32_t uastc_decode_flags =
+			(basisu_format == basist::transcoder_texture_format::cTFETC2_EAC_R11 ||
+					basisu_format == basist::transcoder_texture_format::cTFETC2_EAC_RG11)
+			? 0u
+			: uint32_t(basist::cDecodeFlagsHighQuality);
+
+	auto run_uastc_strip = [&](uint8_t *p_dst_strip, uint32_t p_blocks_x, uint32_t p_blocks_y,
+								   const uint8_t *p_src_strip, uint32_t p_src_bytes,
+								   uint32_t p_level_w, uint32_t p_strip_h_px, uint32_t p_level_idx) -> bool {
+		if (custom_uastc_rg_slice) {
+			const basist::block_format bfmt = (basisu_format == basist::transcoder_texture_format::cTFBC5_RG)
+					? basist::block_format::cBC5
+					: basist::block_format::cETC2_EAC_RG11;
+			return uastc_tc.transcode_slice(
+					p_dst_strip, p_blocks_x, p_blocks_y, p_src_strip, p_src_bytes, bfmt,
+					16u, false, has_alpha, p_level_w, p_strip_h_px, 0, nullptr, 0,
+					0, 1, uastc_decode_flags);
 		}
-		const uint32_t count = compressed_out ? level_info.m_total_blocks : (level_info.m_orig_width * level_info.m_orig_height);
-		const int64_t ofs = Image::get_image_mipmap_offset(width, height, image_format, p_level);
-		return transcoder.transcode_image_level(
-				p_level, 0, 0, dst + ofs, count, basisu_format,
-				basist::cDecodeFlagsHighQuality, 0, 0, -1, -1, p_state);
+		const uint32_t out_units = compressed_out ? (p_blocks_x * p_blocks_y) : (p_level_w * p_strip_h_px);
+		return uastc_tc.transcode_image(
+				basisu_format, p_dst_strip, out_units, p_src_strip, p_src_bytes,
+				p_blocks_x, p_blocks_y, p_level_w, p_strip_h_px, p_level_idx,
+				0, p_src_bytes, uastc_decode_flags, has_alpha, false, 0, nullptr, 0, -1, -1);
 	};
 
-	std::atomic<bool> failed{ false };
-	if (levels_to_load > 1 && width * height >= 512u * 512u) {
-		LoadThreadPool::get_singleton()->parallel_for(static_cast<int>(levels_to_load), [&](int p_idx) {
-			if (failed.load(std::memory_order_relaxed)) {
-				return;
-			}
-			basist::ktx2_transcoder_state state;
-			state.clear();
-			if (!transcode_one_level(static_cast<uint32_t>(p_idx), &state)) {
-				failed.store(true, std::memory_order_relaxed);
-			}
-		});
-	} else {
-		for (uint32_t i = 0; i < levels_to_load; i++) {
-			if (!transcode_one_level(i, nullptr)) {
+	if (is_uastc_ldr && level_table && (supercomp == basist::KTX2_SS_NONE || supercomp == basist::KTX2_SS_ZSTANDARD)) {
+		LoadThreadPool *pool = LoadThreadPool::get_singleton();
+		for (uint32_t lv = 0; lv < levels_to_load; lv++) {
+			const uint32_t lw = MAX(1u, width >> lv);
+			const uint32_t lh = MAX(1u, height >> lv);
+			const uint32_t bx = (lw + 3u) >> 2;
+			const uint32_t by = (lh + 3u) >> 2;
+			const uint64_t expected_uastc_bytes = uint64_t(bx) * uint64_t(by) * 16ULL;
+
+			const uint64_t comp_ofs = level_table[lv].m_byte_offset.get_uint64();
+			const uint64_t comp_len = level_table[lv].m_byte_length.get_uint64();
+			const uint64_t uncomp_len = level_table[lv].m_uncompressed_byte_length.get_uint64();
+			if (comp_ofs + comp_len > p_size || uncomp_len < expected_uastc_bytes || expected_uastc_bytes > UINT32_MAX) {
 				failed.store(true, std::memory_order_relaxed);
 				break;
+			}
+
+			const uint8_t *uastc_ptr = nullptr;
+			if (supercomp == basist::KTX2_SS_ZSTANDARD) {
+				if (zstd_scratch.size() < uncomp_len) {
+					zstd_scratch.resize(uint32_t(uncomp_len));
+				}
+				const int64_t dec = Compression::decompress(
+						zstd_scratch.ptr(), int64_t(uncomp_len),
+						p_data + comp_ofs, int64_t(comp_len), Compression::MODE_ZSTD);
+				if (dec != int64_t(uncomp_len)) {
+					failed.store(true, std::memory_order_relaxed);
+					break;
+				}
+				uastc_ptr = zstd_scratch.ptr();
+			} else {
+				uastc_ptr = p_data + comp_ofs;
+			}
+
+			uint8_t *dst_lv = dst + Image::get_image_mipmap_offset(width, height, image_format, lv);
+			if (pool && uint64_t(bx) * uint64_t(by) >= 1024ULL && by >= 4u) {
+				const uint32_t strips = MIN(24u, by);
+				pool->parallel_for(strips, [&](uint32_t s) {
+					if (failed.load(std::memory_order_relaxed)) {
+						return;
+					}
+					const uint32_t r0 = (s * by) / strips;
+					const uint32_t r1 = ((s + 1u) * by) / strips;
+					if (r0 >= r1) {
+						return;
+					}
+					const uint32_t sb_y = r1 - r0;
+					const uint32_t sp_h = MIN(sb_y * 4u, lh - r0 * 4u);
+					const uint32_t src_ofs = r0 * bx * 16u;
+					const uint32_t src_bytes = sb_y * bx * 16u;
+					uint8_t *out_ptr = compressed_out
+							? (dst_lv + size_t(r0) * size_t(bx) * size_t(dst_block_bytes))
+							: (dst_lv + size_t(r0 * 4u) * size_t(lw) * 4u);
+					if (!run_uastc_strip(out_ptr, bx, sb_y, uastc_ptr + src_ofs, src_bytes, lw, sp_h, lv)) {
+						failed.store(true, std::memory_order_relaxed);
+					}
+				});
+				if (failed.load(std::memory_order_relaxed)) {
+					break;
+				}
+			} else {
+				if (!run_uastc_strip(dst_lv, bx, by, uastc_ptr, uint32_t(expected_uastc_bytes), lw, lh, lv)) {
+					failed.store(true, std::memory_order_relaxed);
+					break;
+				}
+			}
+
+			// Reconstruct RGB normal channels when software/dummy fallback decoded RG or RRRG to RGBA8.
+			if (!compressed_out && !is_srgb &&
+					(ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG)) {
+				const size_t px_cnt = size_t(lw) * size_t(lh);
+				const int y_chan = (ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG) ? 3 : 1;
+				for (size_t pi = 0; pi < px_cnt; pi++) {
+					uint8_t *px = dst_lv + pi * 4;
+					const float nx = float(px[0]) * (2.0f / 255.0f) - 1.0f;
+					const float ny = float(px[y_chan]) * (2.0f / 255.0f) - 1.0f;
+					const float nz = std::sqrt(MAX(0.0f, 1.0f - nx * nx - ny * ny));
+					px[1] = px[y_chan];
+					px[2] = uint8_t(CLAMP(std::lround((nz * 0.5f + 0.5f) * 255.0f), 0L, 255L));
+					px[3] = 255;
+				}
+			}
+		}
+	} else {
+		auto transcode_one_level = [&](uint32_t p_level, basist::ktx2_transcoder_state *p_state) -> bool {
+			basist::ktx2_image_level_info level_info;
+			if (!transcoder.get_image_level_info(level_info, p_level, 0, 0)) {
+				return false;
+			}
+			const uint32_t count = compressed_out ? level_info.m_total_blocks : (level_info.m_orig_width * level_info.m_orig_height);
+			const int64_t ofs = Image::get_image_mipmap_offset(width, height, image_format, p_level);
+			return transcoder.transcode_image_level(
+					p_level, 0, 0, dst + ofs, count, basisu_format,
+					basist::cDecodeFlagsHighQuality, 0, 0, -1, -1, p_state);
+		};
+
+		if (levels_to_load > 1 && width * height >= 512u * 512u && LoadThreadPool::get_singleton()) {
+			LoadThreadPool::get_singleton()->parallel_for(static_cast<int>(levels_to_load), [&](int p_idx) {
+				if (failed.load(std::memory_order_relaxed)) {
+					return;
+				}
+				basist::ktx2_transcoder_state state;
+				state.clear();
+				if (!transcode_one_level(static_cast<uint32_t>(p_idx), &state)) {
+					failed.store(true, std::memory_order_relaxed);
+				}
+			});
+		} else {
+			for (uint32_t i = 0; i < levels_to_load; i++) {
+				if (!transcode_one_level(i, nullptr)) {
+					failed.store(true, std::memory_order_relaxed);
+					break;
+				}
 			}
 		}
 	}

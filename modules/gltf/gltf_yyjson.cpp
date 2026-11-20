@@ -1159,6 +1159,7 @@ Error gltf_yyjson_populate_state(
 	}
 
 	// 8. Parse images, samplers, textures, and materials (unless discarded).
+	const bool strict_ext_ktx2 = p_state->get_additional_data(SNAME("_ange_strict_external_ktx2")).booleanize();
 	if (!GLTFFastAccess::discard_meshes_and_materials(p_state.ptr())) {
 		Vector<Ref<Texture2D>> &state_images = GLTFFastAccess::images(p_state.ptr());
 		Vector<Ref<Image>> &state_src_images = GLTFFastAccess::source_images(p_state.ptr());
@@ -1171,153 +1172,214 @@ Error gltf_yyjson_populate_state(
 				state_images.resize(img_cnt);
 				state_src_images.resize(img_cnt);
 
-				struct PendingImgJob {
-					PackedByteArray raw_bytes;
-					String mime_type;
-					String name;
-					Ref<Texture2D> external_tex;
-					Ref<Image> decoded_img;
-					bool needs_decode = false;
-				};
-				LocalVector<PendingImgJob> jobs;
-				jobs.resize(uint32_t(img_cnt));
-				HashSet<String> used_img_names;
 				const GLTFState::HandleBinaryImageMode img_mode = GLTFFastAccess::handle_binary_image_mode(p_state.ptr());
+				if (strict_ext_ktx2) {
+					const String game_dir = p_state->get_additional_data(SNAME("_ange_asset_game_dir"));
+					const Callable ext_resolver = p_state->get_additional_data(SNAME("_ange_external_uri_resolver"));
+					yyjson_arr_iter it = yyjson_arr_iter_with(imgs_arr);
+					int ii = 0;
+					yyjson_val *iobj = nullptr;
+					while ((iobj = yyjson_arr_iter_next(&it)) != nullptr) {
+						ERR_FAIL_COND_V(!yyjson_is_obj(iobj), ERR_PARSE_ERROR);
+						if (img_mode == GLTFState::HANDLE_BINARY_IMAGE_MODE_DISCARD_TEXTURES) {
+							ii++;
+							continue;
+						}
+						yyjson_val *bv_val = yyjson_obj_get(iobj, "bufferView");
+						ERR_FAIL_COND_V_MSG(bv_val != nullptr, ERR_FILE_UNRECOGNIZED,
+								vformat("GLTF-KTX2-001: Image index '%d' uses embedded 'bufferView'; only external KTX2+UASTC URI textures are permitted.", ii));
+						yyjson_val *uri_val = yyjson_obj_get(iobj, "uri");
+						ERR_FAIL_COND_V_MSG(!uri_val || !yyjson_is_str(uri_val), ERR_FILE_UNRECOGNIZED,
+								vformat("GLTF-KTX2-001: Image index '%d' is missing external 'uri'.", ii));
+						const String raw_uri = yj_str(uri_val);
+						ERR_FAIL_COND_V_MSG(raw_uri.begins_with("data:"), ERR_FILE_UNRECOGNIZED,
+								vformat("GLTF-KTX2-001: Image index '%d' uses embedded 'data:' URI; only external KTX2+UASTC files are permitted.", ii));
+						const String mime_type = yj_str(yyjson_obj_get(iobj, "mimeType"));
+						ERR_FAIL_COND_V_MSG(!mime_type.is_empty() && mime_type != "image/ktx2", ERR_FILE_UNRECOGNIZED,
+								vformat("GLTF-KTX2-001: Image index '%d' has forbidden mimeType '%s'; only 'image/ktx2' is permitted.", ii, mime_type));
+						const String decoded_uri = raw_uri.uri_file_decode().replace_char('\\', '/');
+						ERR_FAIL_COND_V_MSG(decoded_uri.get_extension().to_lower() != "ktx2", ERR_FILE_UNRECOGNIZED,
+								vformat("GLTF-KTX2-001: Image index '%d' URI '%s' is not a .ktx2 file.", ii, decoded_uri));
 
-				yyjson_arr_iter it = yyjson_arr_iter_with(imgs_arr);
-				int ii = 0;
-				yyjson_val *iobj = nullptr;
-				while ((iobj = yyjson_arr_iter_next(&it)) != nullptr) {
-					ERR_FAIL_COND_V(!yyjson_is_obj(iobj), ERR_PARSE_ERROR);
-					PendingImgJob &job = jobs[uint32_t(ii)];
-					job.mime_type = yj_str(yyjson_obj_get(iobj, "mimeType"));
-					String iname = yj_str(yyjson_obj_get(iobj, "name")).get_file().get_basename().validate_filename();
-					if (iname.is_empty()) {
-						iname = itos(ii);
-					}
-					while (used_img_names.has(iname)) {
-						iname += "_" + itos(ii);
-					}
-					used_img_names.insert(iname);
-					job.name = iname;
+						auto probe_candidate = [](const String &p_cand) -> bool {
+							return !p_cand.is_empty() && (FileAccess::exists(p_cand) || ResourceLoader::exists(p_cand));
+						};
 
-					yyjson_val *uri_val = yyjson_obj_get(iobj, "uri");
-					yyjson_val *bv_val = yyjson_obj_get(iobj, "bufferView");
-					if (img_mode == GLTFState::HANDLE_BINARY_IMAGE_MODE_DISCARD_TEXTURES) {
-						ii++;
-						continue;
-					}
-					if (uri_val && yyjson_is_str(uri_val)) {
-						String uri = yj_str(uri_val);
-						if (uri.begins_with("data:")) {
-							job.raw_bytes = decode_base64_uri(uri);
-							if (job.mime_type.is_empty() && uri.contains_char(';')) {
-								job.mime_type = uri.substr(5, uri.find(";base64") - 5);
+						String res_uri;
+						if (!p_search_path.is_empty()) {
+							const String cand = p_search_path.path_join(decoded_uri).replace_char('\\', '/').simplify_path();
+							if (probe_candidate(cand)) {
+								res_uri = cand;
 							}
-							job.needs_decode = !job.raw_bytes.is_empty();
-						} else {
-							ERR_FAIL_COND_V(p_search_path.is_empty(), ERR_INVALID_PARAMETER);
-							const String res_uri = p_search_path.path_join(uri.uri_file_decode()).replace_char('\\', '/').simplify_path();
-							if (ResourceLoader::exists(res_uri)) {
-								job.external_tex = ResourceLoader::load(res_uri, "Texture2D");
+						}
+						if (res_uri.is_empty() && !game_dir.is_empty()) {
+							const String cand = game_dir.path_join(decoded_uri).replace_char('\\', '/').simplify_path();
+							if (probe_candidate(cand)) {
+								res_uri = cand;
 							}
-							if (job.external_tex.is_null()) {
-								if (job.mime_type.is_empty()) {
-									job.mime_type = "image/" + res_uri.get_extension().to_lower();
+						}
+						if (res_uri.is_empty()) {
+							const String fname = decoded_uri.get_file();
+							if (!fname.is_empty()) {
+								const String user_cand = String("user://save/resources/") + fname;
+								if (probe_candidate(user_cand)) {
+									res_uri = user_cand;
+								} else {
+									const String assets_cand = String("res://assets/") + fname;
+									if (probe_candidate(assets_cand)) {
+										res_uri = assets_cand;
+									}
 								}
-								job.raw_bytes = FileAccess::get_file_as_bytes(res_uri);
-								job.needs_decode = !job.raw_bytes.is_empty();
 							}
 						}
-					} else if (bv_val) {
-						ERR_FAIL_COND_V_MSG(job.mime_type.is_empty(), ERR_FILE_CORRUPT, vformat("glTF: Image index '%d' specifies 'bufferView' without 'mimeType'.", ii));
-						const int bvi = int(yj_int(bv_val, -1));
-						ERR_FAIL_INDEX_V(bvi, state_bvs.size(), ERR_PARAMETER_RANGE_ERROR);
-						const uint8_t *vptr = nullptr;
-						int64_t vlen = 0;
-						ERR_FAIL_COND_V(!state_bvs[bvi]->get_view_span(p_state.ptr(), vptr, vlen), ERR_FILE_CORRUPT);
-						if (vlen > 0) {
-							job.raw_bytes.resize(vlen);
-							std::memcpy(job.raw_bytes.ptrw(), vptr, size_t(vlen));
-							job.needs_decode = true;
+						if (res_uri.is_empty() && ext_resolver.is_valid()) {
+							Variant arg = decoded_uri;
+							const Variant *argp = &arg;
+							Variant resolved_var;
+							Callable::CallError cerr;
+							ext_resolver.callp(&argp, 1, resolved_var, cerr);
+							if (cerr.error == Callable::CallError::CALL_OK && resolved_var.get_type() == Variant::STRING) {
+								const String cand = String(resolved_var);
+								if (probe_candidate(cand)) {
+									res_uri = cand;
+								}
+							}
 						}
-					}
-					ii++;
-				}
+						ERR_FAIL_COND_V_MSG(res_uri.is_empty(), ERR_FILE_NOT_FOUND,
+								vformat("GLTF-KTX2-002: External KTX2 texture '%s' (image %d) was not found.", decoded_uri, ii));
 
-				// Decode raw image buffers in parallel on LoadThreadPool (<= 3 low-priority workers).
-				uint32_t decode_job_count = 0;
-				for (int i = 0; i < img_cnt; i++) {
-					if (jobs[uint32_t(i)].needs_decode) {
-						decode_job_count++;
+						Ref<Texture2D> ext_tex = ResourceLoader::load(res_uri, "Texture2D", ResourceFormatLoader::CACHE_MODE_REUSE);
+						ERR_FAIL_COND_V_MSG(ext_tex.is_null(), ERR_FILE_CORRUPT,
+								vformat("GLTF-KTX2-003: Failed to transcode external KTX2 texture '%s'.", res_uri));
+						state_images.write[ii] = ext_tex;
+						ii++;
 					}
-				}
-				if (decode_job_count >= 2 && LoadThreadPool::get_singleton()) {
-					LoadThreadPool::get_singleton()->parallel_for(uint32_t(img_cnt), [&](uint32_t idx) {
-						PendingImgJob &job = jobs[idx];
-						if (job.needs_decode) {
-							job.decoded_img = decode_raw_image_bytes(job.raw_bytes, job.mime_type, int(idx));
-							if (job.decoded_img.is_valid()) {
-								job.decoded_img->set_name(job.name);
+				} else {
+					struct PendingImgJob {
+						PackedByteArray raw_bytes;
+						String mime_type;
+						String name;
+						Ref<Texture2D> external_tex;
+						Ref<Image> decoded_img;
+						bool needs_decode = false;
+					};
+					LocalVector<PendingImgJob> jobs;
+					jobs.resize(uint32_t(img_cnt));
+					HashSet<String> used_img_names;
+
+					yyjson_arr_iter it = yyjson_arr_iter_with(imgs_arr);
+					int ii = 0;
+					yyjson_val *iobj = nullptr;
+					while ((iobj = yyjson_arr_iter_next(&it)) != nullptr) {
+						ERR_FAIL_COND_V(!yyjson_is_obj(iobj), ERR_PARSE_ERROR);
+						PendingImgJob &job = jobs[uint32_t(ii)];
+						job.mime_type = yj_str(yyjson_obj_get(iobj, "mimeType"));
+						String iname = yj_str(yyjson_obj_get(iobj, "name")).get_file().get_basename().validate_filename();
+						if (iname.is_empty()) {
+							iname = itos(ii);
+						}
+						while (used_img_names.has(iname)) {
+							iname += "_" + itos(ii);
+						}
+						used_img_names.insert(iname);
+						job.name = iname;
+
+						yyjson_val *uri_val = yyjson_obj_get(iobj, "uri");
+						yyjson_val *bv_val = yyjson_obj_get(iobj, "bufferView");
+						if (img_mode == GLTFState::HANDLE_BINARY_IMAGE_MODE_DISCARD_TEXTURES) {
+							ii++;
+							continue;
+						}
+						if (uri_val && yyjson_is_str(uri_val)) {
+							String uri = yj_str(uri_val);
+							if (uri.begins_with("data:")) {
+								job.raw_bytes = decode_base64_uri(uri);
+								if (job.mime_type.is_empty() && uri.contains_char(';')) {
+									job.mime_type = uri.substr(5, uri.find(";base64") - 5);
+								}
+								job.needs_decode = !job.raw_bytes.is_empty();
+							} else {
+								ERR_FAIL_COND_V(p_search_path.is_empty(), ERR_INVALID_PARAMETER);
+								const String res_uri = p_search_path.path_join(uri.uri_file_decode()).replace_char('\\', '/').simplify_path();
+								if (ResourceLoader::exists(res_uri)) {
+									job.external_tex = ResourceLoader::load(res_uri, "Texture2D");
+								}
+								if (job.external_tex.is_null()) {
+									if (job.mime_type.is_empty()) {
+										job.mime_type = "image/" + res_uri.get_extension().to_lower();
+									}
+									job.raw_bytes = FileAccess::get_file_as_bytes(res_uri);
+									job.needs_decode = !job.raw_bytes.is_empty();
+								}
+							}
+						} else if (bv_val) {
+							ERR_FAIL_COND_V_MSG(job.mime_type.is_empty(), ERR_FILE_CORRUPT, vformat("glTF: Image index '%d' specifies 'bufferView' without 'mimeType'.", ii));
+							const int bvi = int(yj_int(bv_val, -1));
+							ERR_FAIL_INDEX_V(bvi, state_bvs.size(), ERR_PARAMETER_RANGE_ERROR);
+							const uint8_t *vptr = nullptr;
+							int64_t vlen = 0;
+							ERR_FAIL_COND_V(!state_bvs[bvi]->get_view_span(p_state.ptr(), vptr, vlen), ERR_FILE_CORRUPT);
+							if (vlen > 0) {
+								job.raw_bytes.resize(vlen);
+								std::memcpy(job.raw_bytes.ptrw(), vptr, size_t(vlen));
+								job.needs_decode = true;
 							}
 						}
-					});
-				} else {
+						ii++;
+					}
+
+					uint32_t decode_job_count = 0;
+					for (int i = 0; i < img_cnt; i++) {
+						if (jobs[uint32_t(i)].needs_decode) {
+							decode_job_count++;
+						}
+					}
+					if (decode_job_count >= 2 && LoadThreadPool::get_singleton()) {
+						LoadThreadPool::get_singleton()->parallel_for(uint32_t(img_cnt), [&](uint32_t idx) {
+							PendingImgJob &job = jobs[idx];
+							if (job.needs_decode) {
+								job.decoded_img = decode_raw_image_bytes(job.raw_bytes, job.mime_type, int(idx));
+								if (job.decoded_img.is_valid()) {
+									job.decoded_img->set_name(job.name);
+								}
+							}
+						});
+					} else {
+						for (int i = 0; i < img_cnt; i++) {
+							PendingImgJob &job = jobs[uint32_t(i)];
+							if (job.needs_decode) {
+								job.decoded_img = decode_raw_image_bytes(job.raw_bytes, job.mime_type, i);
+								if (job.decoded_img.is_valid()) {
+									job.decoded_img->set_name(job.name);
+								}
+							}
+						}
+					}
+
 					for (int i = 0; i < img_cnt; i++) {
 						PendingImgJob &job = jobs[uint32_t(i)];
-						if (job.needs_decode) {
-							job.decoded_img = decode_raw_image_bytes(job.raw_bytes, job.mime_type, i);
-							if (job.decoded_img.is_valid()) {
-								job.decoded_img->set_name(job.name);
+						if (job.external_tex.is_valid()) {
+							state_images.write[i] = job.external_tex;
+							if (img_mode == GLTFState::HANDLE_BINARY_IMAGE_MODE_EMBED_AS_BASISU) {
+								state_src_images.write[i] = job.external_tex->get_image();
 							}
-						}
-					}
-				}
-
-				// Upload / wrap Texture2D objects on the caller thread.
-				const bool defer_uncompressed = bool(p_state->get_additional_data(SNAME("_ange_defer_uncompressed_images")));
-				for (int i = 0; i < img_cnt; i++) {
-					PendingImgJob &job = jobs[uint32_t(i)];
-					if (job.external_tex.is_valid()) {
-						state_images.write[i] = job.external_tex;
-						state_src_images.write[i] = job.external_tex->has_meta(SNAME("_ange_gpu_source_image"))
-								? Ref<Image>(job.external_tex->get_meta(SNAME("_ange_gpu_source_image")))
-								: job.external_tex->get_image();
-					} else if (job.decoded_img.is_valid() && !job.decoded_img->is_empty()) {
-						if (img_mode == GLTFState::HANDLE_BINARY_IMAGE_MODE_EMBED_AS_BASISU) {
-							Ref<PortableCompressedTexture2D> ptex;
-							ptex.instantiate();
-							ptex->set_name(job.name);
-							ptex->set_keep_compressed_buffer(true);
-							ptex->create_from_image(job.decoded_img, PortableCompressedTexture2D::COMPRESSION_MODE_BASIS_UNIVERSAL);
-							state_images.write[i] = ptex;
-							state_src_images.write[i] = job.decoded_img;
-						} else if (defer_uncompressed && !job.decoded_img->is_compressed()) {
-							Ref<PlaceholderTexture2D> ptex;
-							ptex.instantiate();
-							ptex->set_name(job.name);
-							ptex->set_size(Vector2i(job.decoded_img->get_width(), job.decoded_img->get_height()));
-							ptex->set_meta(SNAME("_ange_gpu_source_image"), job.decoded_img);
-							ptex->set_meta(SNAME("_ange_gltf_placeholder"), true);
-							state_images.write[i] = ptex;
-							state_src_images.write[i] = job.decoded_img;
-						} else {
-							const bool authored_blocks = job.decoded_img->is_compressed() && job.decoded_img->has_mipmaps();
-							if (authored_blocks) {
-								job.decoded_img->set_meta(SNAME("_ange_authored_block_texture"), true);
+						} else if (job.decoded_img.is_valid() && !job.decoded_img->is_empty()) {
+							if (img_mode == GLTFState::HANDLE_BINARY_IMAGE_MODE_EMBED_AS_BASISU) {
+								Ref<PortableCompressedTexture2D> ptex;
+								ptex.instantiate();
+								ptex->set_name(job.name);
+								ptex->set_keep_compressed_buffer(true);
+								ptex->create_from_image(job.decoded_img, PortableCompressedTexture2D::COMPRESSION_MODE_BASIS_UNIVERSAL);
+								state_images.write[i] = ptex;
+								state_src_images.write[i] = job.decoded_img;
+							} else {
+								Ref<ImageTexture> itex;
+								itex.instantiate();
+								itex->set_name(job.name);
+								itex->set_image(job.decoded_img);
+								state_images.write[i] = itex;
+								state_src_images.write[i] = job.decoded_img;
 							}
-							Ref<ImageTexture> itex;
-							itex.instantiate();
-							itex->set_name(job.name);
-							itex->set_image(job.decoded_img);
-							if (authored_blocks) {
-								itex->set_meta(SNAME("_ange_authored_block_texture"), true);
-							}
-							if (p_state->get_additional_data(SNAME("_ange_want_packed_scene")).booleanize()) {
-								itex->set_meta(SNAME("_ange_transient_save_image"), job.decoded_img);
-							}
-							state_images.write[i] = itex;
-							state_src_images.write[i] = job.decoded_img;
 						}
 					}
 				}
@@ -1373,7 +1435,7 @@ Error gltf_yyjson_populate_state(
 								src_img = int(yj_int(yyjson_obj_get(kt, "source"), -1));
 							}
 						}
-						if (src_img < 0) {
+						if (src_img < 0 && !strict_ext_ktx2) {
 							if (yyjson_val *wt = yyjson_obj_get(texts, "EXT_texture_webp")) {
 								if (yyjson_is_obj(wt)) {
 									src_img = int(yj_int(yyjson_obj_get(wt, "source"), -1));
@@ -1382,7 +1444,10 @@ Error gltf_yyjson_populate_state(
 						}
 					}
 				}
-				if (src_img < 0) {
+				if (strict_ext_ktx2) {
+					ERR_FAIL_COND_V_MSG(src_img < 0, ERR_FILE_UNRECOGNIZED,
+							vformat("GLTF-KTX2-001: Texture index '%d' must reference an external KTX2 image via extensions.KHR_texture_basisu.", ti));
+				} else if (src_img < 0) {
 					src_img = int(yj_int(yyjson_obj_get(tobj, "source"), -1));
 				}
 				ERR_FAIL_COND_V(src_img < 0, ERR_PARSE_ERROR);

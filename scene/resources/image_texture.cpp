@@ -114,12 +114,6 @@ void ImageTexture::update(const Ref<Image> &p_image) {
 }
 
 Ref<Image> ImageTexture::get_image() const {
-	if (has_meta(SNAME("_ange_transient_save_image"))) {
-		Ref<Image> transient_img = get_meta(SNAME("_ange_transient_save_image"));
-		if (transient_img.is_valid()) {
-			return transient_img;
-		}
-	}
 	if (image_stored) {
 		return RenderingServer::get_singleton()->texture_2d_get(texture);
 	} else {

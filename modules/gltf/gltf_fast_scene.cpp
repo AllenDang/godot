@@ -940,6 +940,7 @@ Ref<Resource> ResourceFormatLoaderGLB::load(const String &p_path, const String &
 	state.instantiate();
 	state->set_handle_binary_image_mode(GLTFState::HANDLE_BINARY_IMAGE_MODE_EMBED_AS_UNCOMPRESSED);
 	state->set_additional_data(SNAME("_ange_want_packed_scene"), true);
+	state->set_additional_data(SNAME("_ange_strict_external_ktx2"), true);
 
 	Error err = doc->append_from_file(p_path, state);
 	if (err != OK) {
