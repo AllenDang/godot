@@ -38,6 +38,10 @@
 #include <astcenc.h>
 #include <atomic>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 namespace {
 
 struct CachedAstcEncoderContext {
@@ -100,7 +104,38 @@ void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 		r_img->convert(Image::FORMAT_RGBAH);
 	} else if (src_format >= Image::FORMAT_RF && src_format <= Image::FORMAT_RGBE9995) {
 		r_img->convert(Image::FORMAT_RGBAF);
-	} else {
+	} else if (src_format == Image::FORMAT_RGB8) {
+		const int64_t src_bytes = r_img->get_data_size();
+		const int64_t npixels = src_bytes / 3;
+		if (npixels > 0 && npixels * 3 == src_bytes) {
+			Vector<uint8_t> rgba_data;
+			rgba_data.resize(npixels * 4);
+			const uint8_t *sp = r_img->ptr();
+			uint8_t *dp = rgba_data.ptrw();
+			int64_t px = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+			const uint8x16_t alpha255 = vdupq_n_u8(255);
+			for (; px + 16 <= npixels; px += 16) {
+				uint8x16x3_t rgb = vld3q_u8(sp + px * 3);
+				uint8x16x4_t rgba;
+				rgba.val[0] = rgb.val[0];
+				rgba.val[1] = rgb.val[1];
+				rgba.val[2] = rgb.val[2];
+				rgba.val[3] = alpha255;
+				vst4q_u8(dp + px * 4, rgba);
+			}
+#endif
+			for (; px < npixels; px++) {
+				dp[px * 4 + 0] = sp[px * 3 + 0];
+				dp[px * 4 + 1] = sp[px * 3 + 1];
+				dp[px * 4 + 2] = sp[px * 3 + 2];
+				dp[px * 4 + 3] = 255;
+			}
+			r_img->set_data(r_img->get_width(), r_img->get_height(), r_img->has_mipmaps(), Image::FORMAT_RGBA8, rgba_data);
+		} else {
+			r_img->convert(Image::FORMAT_RGBA8);
+		}
+	} else if (src_format != Image::FORMAT_RGBA8) {
 		r_img->convert(Image::FORMAT_RGBA8);
 	}
 
@@ -199,7 +234,7 @@ void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 
 		const size_t pixel_bytes = (image.data_type == ASTCENC_TYPE_U8) ? 4 : ((image.data_type == ASTCENC_TYPE_F16) ? 8 : 16);
 		if (size_t(block_count_x) * size_t(block_count_y) >= 1024 && block_count_y >= 4 && LoadThreadPool::get_singleton()) {
-			const uint32_t chunks = MIN(uint32_t(block_count_y), 16u);
+			const uint32_t chunks = MIN(uint32_t(block_count_y), 24u);
 			std::atomic<int> strip_err{ int(ASTCENC_SUCCESS) };
 			LoadThreadPool::get_singleton()->parallel_for(chunks, [&](uint32_t ci) {
 				if (strip_err.load(std::memory_order_relaxed) != int(ASTCENC_SUCCESS)) {
