@@ -1313,6 +1313,9 @@ Error gltf_yyjson_populate_state(
 							if (authored_blocks) {
 								itex->set_meta(SNAME("_ange_authored_block_texture"), true);
 							}
+							if (p_state->get_additional_data(SNAME("_ange_want_packed_scene")).booleanize()) {
+								itex->set_meta(SNAME("_ange_transient_save_image"), job.decoded_img);
+							}
 							state_images.write[i] = itex;
 							state_src_images.write[i] = job.decoded_img;
 						}

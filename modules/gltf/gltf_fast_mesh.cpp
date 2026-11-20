@@ -598,6 +598,8 @@ Error gltf_build_fast_array_mesh(
 
 	TypedArray<Material> instance_materials;
 	const Vector<Ref<Material>> &state_materials = p_state->get_materials();
+	const bool want_transient_surfaces = p_state->get_additional_data(SNAME("_ange_want_packed_scene")).booleanize();
+	Array transient_surfaces;
 
 	for (uint32_t prim_i = 0; prim_i < p_prims.size(); prim_i++) {
 		const GLTFFastPrimSpec &prim = p_prims[prim_i];
@@ -1416,6 +1418,38 @@ Error gltf_build_fast_array_mesh(
 			}
 		}
 
+		if (want_transient_surfaces) {
+			Dictionary sdata;
+			sdata["format"] = format;
+			sdata["primitive"] = godot_prim;
+			sdata["vertex_data"] = vertex_array;
+			sdata["vertex_count"] = vertex_num;
+			if (!skin_array.is_empty()) {
+				sdata["skin_data"] = skin_array;
+			}
+			if (!attrib_array.is_empty()) {
+				sdata["attribute_data"] = attrib_array;
+			}
+			sdata["aabb"] = surface_aabb;
+			sdata["uv_scale"] = uv_scale;
+			if (index_count > 0) {
+				sdata["index_data"] = index_array;
+				sdata["index_count"] = index_count;
+			}
+			if (!bone_aabbs.is_empty()) {
+				Array ba;
+				ba.resize(bone_aabbs.size());
+				for (int bi = 0; bi < bone_aabbs.size(); bi++) {
+					ba[bi] = bone_aabbs[bi];
+				}
+				sdata["bone_aabbs"] = ba;
+			}
+			if (!blend_shape_data.is_empty()) {
+				sdata["blend_shapes"] = blend_shape_data;
+			}
+			transient_surfaces.push_back(sdata);
+		}
+
 		const int surf_idx = array_mesh->get_surface_count();
 		array_mesh->add_surface(
 				format,
@@ -1437,6 +1471,10 @@ Error gltf_build_fast_array_mesh(
 		if (mat.is_valid()) {
 			array_mesh->surface_set_material(surf_idx, mat);
 		}
+	}
+
+	if (want_transient_surfaces && !transient_surfaces.is_empty()) {
+		array_mesh->set_meta(SNAME("_ange_transient_surfaces"), transient_surfaces);
 	}
 
 	Vector<float> blend_weights;
