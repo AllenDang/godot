@@ -1514,32 +1514,6 @@ Array ArrayMesh::_get_surfaces() const {
 		return Array();
 	}
 
-	if (has_meta(SNAME("_ange_transient_surfaces"))) {
-		Array cached = get_meta(SNAME("_ange_transient_surfaces"));
-		if (cached.size() == surfaces.size()) {
-			Array ret;
-			ret.resize(surfaces.size());
-			for (int i = 0; i < surfaces.size(); i++) {
-				Dictionary data = Dictionary(cached[i]).duplicate(false);
-				if (surfaces[i].material.is_valid()) {
-					data["material"] = surfaces[i].material;
-				} else {
-					data.erase("material");
-				}
-				if (!surfaces[i].name.is_empty()) {
-					data["name"] = surfaces[i].name;
-				} else {
-					data.erase("name");
-				}
-				if (surfaces[i].is_2d) {
-					data["2d"] = true;
-				}
-				ret[i] = data;
-			}
-			return ret;
-		}
-	}
-
 	Array ret;
 	for (int i = 0; i < surfaces.size(); i++) {
 		RenderingServerTypes::SurfaceData surface = RS::get_singleton()->mesh_get_surface(mesh, i);

@@ -76,36 +76,59 @@ bool Skeleton3D::_set(const StringName &p_path, const Variant &p_value) {
 		return true;
 	}
 #endif // _DISABLE_DEPRECATED && PHYSICS_3D_DISABLED
-	String path = p_path;
-
-	if (!path.begins_with("bones/")) {
+	const String &path = p_path.operator String();
+	const char32_t *s = path.get_data();
+	const int len = path.length();
+	if (len < 8 || s[0] != 'b' || s[1] != 'o' || s[2] != 'n' || s[3] != 'e' || s[4] != 's' || s[5] != '/') {
 		return false;
 	}
 
-	uint32_t which = path.get_slicec('/', 1).to_int();
-	String what = path.get_slicec('/', 2);
+	uint32_t which = 0;
+	int pos = 6;
+	if (pos >= len || s[pos] < '0' || s[pos] > '9') {
+		return false;
+	}
+	while (pos < len && s[pos] >= '0' && s[pos] <= '9') {
+		which = which * 10u + uint32_t(s[pos] - '0');
+		pos++;
+	}
+	if (pos >= len || s[pos] != '/') {
+		return false;
+	}
+	pos++;
+	const char32_t *what_ptr = s + pos;
+	const int what_len = len - pos;
 
-	if (which == bones.size() && what == "name") {
+	if (which == bones.size() && what_len == 4 && what_ptr[0] == 'n' && what_ptr[1] == 'a' && what_ptr[2] == 'm' && what_ptr[3] == 'e') {
 		add_bone(p_value);
 		return true;
 	}
 
 	ERR_FAIL_UNSIGNED_INDEX_V(which, bones.size(), false);
 
-	if (what == "parent") {
+	if (what_len == 6 && what_ptr[0] == 'p' && what_ptr[1] == 'a' && what_ptr[2] == 'r' && what_ptr[3] == 'e' && what_ptr[4] == 'n' && what_ptr[5] == 't') {
 		set_bone_parent(which, p_value);
-	} else if (what == "rest") {
+		return true;
+	} else if (what_len == 4 && what_ptr[0] == 'r' && what_ptr[1] == 'e' && what_ptr[2] == 's' && what_ptr[3] == 't') {
 		set_bone_rest(which, p_value);
-	} else if (what == "enabled") {
+		return true;
+	} else if (what_len == 7 && what_ptr[0] == 'e' && what_ptr[1] == 'n' && what_ptr[2] == 'a' && what_ptr[3] == 'b' && what_ptr[4] == 'l' && what_ptr[5] == 'e' && what_ptr[6] == 'd') {
 		set_bone_enabled(which, p_value);
-	} else if (what == "position") {
+		return true;
+	} else if (what_len == 8 && what_ptr[0] == 'p' && what_ptr[1] == 'o' && what_ptr[2] == 's' && what_ptr[3] == 'i' && what_ptr[4] == 't' && what_ptr[5] == 'i' && what_ptr[6] == 'o' && what_ptr[7] == 'n') {
 		set_bone_pose_position(which, p_value);
-	} else if (what == "rotation") {
+		return true;
+	} else if (what_len == 8 && what_ptr[0] == 'r' && what_ptr[1] == 'o' && what_ptr[2] == 't' && what_ptr[3] == 'a' && what_ptr[4] == 't' && what_ptr[5] == 'i' && what_ptr[6] == 'o' && what_ptr[7] == 'n') {
 		set_bone_pose_rotation(which, p_value);
-	} else if (what == "scale") {
+		return true;
+	} else if (what_len == 5 && what_ptr[0] == 's' && what_ptr[1] == 'c' && what_ptr[2] == 'a' && what_ptr[3] == 'l' && what_ptr[4] == 'e') {
 		set_bone_pose_scale(which, p_value);
-	} else if (what == "bone_meta") {
-		set_bone_meta(which, path.get_slicec('/', 3), p_value);
+		return true;
+	}
+
+	String what = path.substr(pos);
+	if (what.begins_with("bone_meta/")) {
+		set_bone_meta(which, what.substr(10), p_value);
 #ifndef DISABLE_DEPRECATED
 	} else if (what == "pose" || what == "bound_children") {
 		// Kept for compatibility from 3.x to 4.x.

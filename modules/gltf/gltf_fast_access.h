@@ -28,6 +28,7 @@ struct GLTFFastAccess {
 	static _FORCE_INLINE_ bool discard_meshes_and_materials(const GLTFState *s) { return s->discard_meshes_and_materials; }
 	static _FORCE_INLINE_ bool force_generate_tangents(const GLTFState *s) { return s->force_generate_tangents; }
 	static _FORCE_INLINE_ bool force_disable_compression(const GLTFState *s) { return s->force_disable_compression; }
+	static _FORCE_INLINE_ bool use_named_skin_binds(const GLTFState *s) { return s->use_named_skin_binds; }
 	static _FORCE_INLINE_ GLTFState::HandleBinaryImageMode handle_binary_image_mode(const GLTFState *s) { return s->handle_binary_image_mode; }
 
 	static _FORCE_INLINE_ Vector<Vector<uint8_t>> &buffers(GLTFState *s) { return s->buffers; }
@@ -59,6 +60,13 @@ struct GLTFFastAccess {
 	static _FORCE_INLINE_ int &node_height(GLTFNode *n) { return n->height; }
 	static _FORCE_INLINE_ Transform3D &node_xform(GLTFNode *n) { return n->transform; }
 	static _FORCE_INLINE_ const Transform3D &node_xform(const GLTFNode *n) { return n->transform; }
+	static _FORCE_INLINE_ void set_node_rest_xform(GLTFNode *n, const Transform3D &xf) {
+		n->rest_transform = xf;
+		n->has_rest_transform = true;
+	}
+	static _FORCE_INLINE_ const Transform3D &node_rest_xform(const GLTFNode *n) { return n->has_rest_transform ? n->rest_transform : n->transform; }
+	static _FORCE_INLINE_ Vector<float> &node_weights(GLTFNode *n) { return n->node_weights; }
+	static _FORCE_INLINE_ const Vector<float> &node_weights(const GLTFNode *n) { return n->node_weights; }
 	static _FORCE_INLINE_ GLTFMeshIndex &node_mesh(GLTFNode *n) { return n->mesh; }
 	static _FORCE_INLINE_ GLTFMeshIndex node_mesh(const GLTFNode *n) { return n->mesh; }
 	static _FORCE_INLINE_ GLTFCameraIndex &node_camera(GLTFNode *n) { return n->camera; }
@@ -67,17 +75,24 @@ struct GLTFFastAccess {
 	static _FORCE_INLINE_ GLTFSkeletonIndex node_skeleton(const GLTFNode *n) { return n->skeleton; }
 	static _FORCE_INLINE_ GLTFLightIndex &node_light(GLTFNode *n) { return n->light; }
 	static _FORCE_INLINE_ bool &node_joint(GLTFNode *n) { return n->joint; }
+	static _FORCE_INLINE_ bool node_joint(const GLTFNode *n) { return n->joint; }
 	static _FORCE_INLINE_ bool &node_visible(GLTFNode *n) { return n->visible; }
 	static _FORCE_INLINE_ bool node_visible(const GLTFNode *n) { return n->visible; }
 	static _FORCE_INLINE_ Vector<int> &node_children(GLTFNode *n) { return n->children; }
 	static _FORCE_INLINE_ const Vector<int> &node_children(const GLTFNode *n) { return n->children; }
 
 	static _FORCE_INLINE_ GLTFNodeIndex &skin_root(GLTFSkin *sk) { return sk->skin_root; }
+	static _FORCE_INLINE_ GLTFSkeletonIndex skin_skeleton(const GLTFSkin *sk) { return sk->skeleton; }
 	static _FORCE_INLINE_ Vector<GLTFNodeIndex> &skin_joints(GLTFSkin *sk) { return sk->joints; }
 	static _FORCE_INLINE_ Vector<GLTFNodeIndex> &skin_joints_original(GLTFSkin *sk) { return sk->joints_original; }
+	static _FORCE_INLINE_ const Vector<GLTFNodeIndex> &skin_joints_original(const GLTFSkin *sk) { return sk->joints_original; }
 	static _FORCE_INLINE_ Vector<Transform3D> &skin_inverse_binds(GLTFSkin *sk) { return sk->inverse_binds; }
+	static _FORCE_INLINE_ HashMap<int, int> &skin_joint_to_bone(GLTFSkin *sk) { return sk->joint_i_to_bone_i; }
+	static _FORCE_INLINE_ Ref<Skin> &godot_skin(GLTFSkin *sk) { return sk->godot_skin; }
 
 	static _FORCE_INLINE_ Skeleton3D *godot_skeleton(GLTFSkeleton *sk) { return sk->godot_skeleton; }
+	static _FORCE_INLINE_ const Vector<GLTFNodeIndex> &skeleton_roots(const GLTFSkeleton *sk) { return sk->roots; }
+	static _FORCE_INLINE_ HashMap<int32_t, GLTFNodeIndex> &skeleton_bone_node(GLTFSkeleton *sk) { return sk->godot_bone_node; }
 
 	static _FORCE_INLINE_ String gen_unique_name(GLTFDocument *doc, Ref<GLTFState> s, const String &name) { return doc->_gen_unique_name(s, name); }
 	static _FORCE_INLINE_ String gen_unique_anim_name(GLTFDocument *doc, Ref<GLTFState> s, const String &name) { return doc->_gen_unique_animation_name(s, name); }

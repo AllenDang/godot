@@ -11,16 +11,21 @@
 #include "gltf_document.h"
 #include "gltf_fast_access.h"
 #include "gltf_state.h"
+#include "skin_tool.h"
 #include "structures/gltf_animation.h"
 #include "structures/gltf_mesh.h"
 #include "structures/gltf_node.h"
 #include "structures/gltf_skeleton.h"
+#include "structures/gltf_skin.h"
 
+#include "core/os/load_thread_pool.h"
 #include "scene/3d/importer_mesh_instance_3d.h"
 #include "scene/3d/mesh_instance_3d.h"
 #include "scene/3d/skeleton_3d.h"
 #include "scene/animation/animation_player.h"
 #include "scene/resources/animation_library.h"
+
+#include <cmath>
 
 namespace {
 
@@ -150,7 +155,14 @@ void eval_vec3_samples(
 				} else if (idx >= tlen - 1) {
 					dst[s] = vptr[tlen - 1];
 				} else {
-					dst[s] = vptr[idx] + (vptr[idx + 1] - vptr[idx]) * steps[s].frac;
+					const float f = steps[s].frac;
+					if (f <= 1e-6f) {
+						dst[s] = vptr[idx];
+					} else if (f >= 1.0f - 1e-6f) {
+						dst[s] = vptr[idx + 1];
+					} else {
+						dst[s] = vptr[idx] + (vptr[idx + 1] - vptr[idx]) * f;
+					}
 				}
 			}
 		} break;
@@ -226,10 +238,54 @@ void eval_quat_samples(
 	const SampleStep *steps = p_sched.steps.ptr();
 	Quaternion *dst = r_out.ptr();
 
-	auto safe_slerp = [](const Quaternion &p_a, const Quaternion &p_b, float p_c) -> Quaternion {
-		const Quaternion na = p_a.is_normalized() ? p_a : p_a.normalized();
-		const Quaternion nb = p_b.is_normalized() ? p_b : p_b.normalized();
-		return na.slerp(nb, p_c).normalized();
+	auto ensure_unit = [](const Quaternion &p_q) -> Quaternion {
+		const float l2 = p_q.x * p_q.x + p_q.y * p_q.y + p_q.z * p_q.z + p_q.w * p_q.w;
+		if (std::abs(l2 - 1.0f) <= 1e-5f) {
+			return p_q;
+		}
+		if (l2 > 0.0f) {
+			const float inv = 1.0f / std::sqrt(l2);
+			return Quaternion(p_q.x * inv, p_q.y * inv, p_q.z * inv, p_q.w * inv);
+		}
+		return Quaternion();
+	};
+
+	auto safe_slerp = [&](const Quaternion &p_a, const Quaternion &p_b, float p_c) -> Quaternion {
+		const Quaternion na = ensure_unit(p_a);
+		if (p_c <= 1e-6f) {
+			return na;
+		}
+		const Quaternion nb = ensure_unit(p_b);
+		if (p_c >= 1.0f - 1e-6f) {
+			return nb;
+		}
+		float cosom = na.x * nb.x + na.y * nb.y + na.z * nb.z + na.w * nb.w;
+		Quaternion to1 = nb;
+		if (cosom < 0.0f) {
+			cosom = -cosom;
+			to1 = -to1;
+		}
+		if (cosom >= 0.999999f) {
+			return na;
+		}
+		if (cosom > 0.9995f) {
+			const float s0 = 1.0f - p_c;
+			const float rx = s0 * na.x + p_c * to1.x;
+			const float ry = s0 * na.y + p_c * to1.y;
+			const float rz = s0 * na.z + p_c * to1.z;
+			const float rw = s0 * na.w + p_c * to1.w;
+			const float inv = 1.0f / std::sqrt(rx * rx + ry * ry + rz * rz + rw * rw);
+			return Quaternion(rx * inv, ry * inv, rz * inv, rw * inv);
+		}
+		const float omega = std::acos(CLAMP(cosom, -1.0f, 1.0f));
+		const float inv_sin = 1.0f / std::sin(omega);
+		const float s0 = std::sin((1.0f - p_c) * omega) * inv_sin;
+		const float s1 = std::sin(p_c * omega) * inv_sin;
+		return ensure_unit(Quaternion(
+				s0 * na.x + s1 * to1.x,
+				s0 * na.y + s1 * to1.y,
+				s0 * na.z + s1 * to1.z,
+				s0 * na.w + s1 * to1.w));
 	};
 
 	switch (p_interp) {
@@ -237,10 +293,9 @@ void eval_quat_samples(
 			for (uint32_t s = 0; s < scount; s++) {
 				const int32_t idx = steps[s].idx;
 				if (idx < 0) {
-					dst[s] = vptr[0].is_normalized() ? vptr[0] : vptr[0].normalized();
+					dst[s] = ensure_unit(vptr[0]);
 				} else if (idx >= tlen - 1) {
-					const Quaternion &q = vptr[tlen - 1];
-					dst[s] = q.is_normalized() ? q : q.normalized();
+					dst[s] = ensure_unit(vptr[tlen - 1]);
 				} else {
 					dst[s] = safe_slerp(vptr[idx], vptr[idx + 1], steps[s].frac);
 				}
@@ -250,7 +305,7 @@ void eval_quat_samples(
 			for (uint32_t s = 0; s < scount; s++) {
 				const int32_t idx = steps[s].idx;
 				const Quaternion &q = (idx < 0) ? vptr[0] : ((idx >= tlen - 1) ? vptr[tlen - 1] : vptr[idx]);
-				dst[s] = q.is_normalized() ? q : q.normalized();
+				dst[s] = ensure_unit(q);
 			}
 		} break;
 		case GLTFAnimation::INTERP_CATMULLROMSPLINE: {
@@ -258,10 +313,10 @@ void eval_quat_samples(
 				const int32_t idx = steps[s].idx;
 				if (idx < 0) {
 					const Quaternion &q = vlen > 1 ? vptr[1] : vptr[0];
-					dst[s] = q.is_normalized() ? q : q.normalized();
+					dst[s] = ensure_unit(q);
 				} else if (idx >= tlen - 1) {
 					const Quaternion &q = (1 + tlen - 1 < vlen) ? vptr[1 + tlen - 1] : vptr[vlen - 1];
-					dst[s] = q.is_normalized() ? q : q.normalized();
+					dst[s] = ensure_unit(q);
 				} else {
 					dst[s] = safe_slerp(vptr[idx], vptr[idx + 1], steps[s].frac);
 				}
@@ -271,11 +326,9 @@ void eval_quat_samples(
 			for (uint32_t s = 0; s < scount; s++) {
 				const int32_t idx = steps[s].idx;
 				if (idx < 0) {
-					const Quaternion &q = vptr[1];
-					dst[s] = q.is_normalized() ? q : q.normalized();
+					dst[s] = ensure_unit(vptr[1]);
 				} else if (idx >= tlen - 1) {
-					const Quaternion &q = vptr[(tlen - 1) * 3 + 1];
-					dst[s] = q.is_normalized() ? q : q.normalized();
+					dst[s] = ensure_unit(vptr[(tlen - 1) * 3 + 1]);
 				} else {
 					dst[s] = safe_slerp(vptr[idx * 3 + 1], vptr[idx * 3 + 4], steps[s].frac);
 				}
@@ -348,16 +401,46 @@ NodePath compute_direct_node_path(const Vector<Ref<GLTFNode>> &p_nodes, GLTFNode
 	return NodePath(names, false);
 }
 
-} // namespace
+struct NodeBaseTRS {
+	Vector3 pos;
+	Quaternion rot;
+	Vector3 scale = Vector3(1.0f, 1.0f, 1.0f);
+};
 
-Ref<Animation> gltf_build_animation_fast(
+struct DirectAnimContext {
+	LocalVector<NodeBaseTRS> base_trs;
+	LocalVector<Vector<StringName>> skel_paths;
+	LocalVector<Vector<StringName>> scene_paths;
+	LocalVector<Vector<StringName>> rmi_paths;
+	bool has_vnode_paths = false;
+};
+
+void build_node_base_trs(const Vector<Ref<GLTFNode>> &p_nodes, LocalVector<NodeBaseTRS> &r_out) {
+	const int n = p_nodes.size();
+	r_out.resize(uint32_t(n));
+	for (int i = 0; i < n; i++) {
+		NodeBaseTRS trs;
+		if (p_nodes[i].is_valid()) {
+			const Transform3D &xf = GLTFFastAccess::node_xform(p_nodes[i].ptr());
+			trs.pos = xf.origin;
+			if (xf.basis != Basis()) {
+				trs.rot = xf.basis.get_rotation_quaternion();
+				trs.scale = xf.basis.get_scale();
+			}
+		}
+		r_out[uint32_t(i)] = trs;
+	}
+}
+
+Ref<Animation> build_animation_fast_impl(
 		GLTFDocument *p_doc,
 		Ref<GLTFState> p_state,
 		Node *p_scene_root,
 		GLTFAnimationIndex p_index,
 		bool p_trimming,
 		bool p_remove_immutable_tracks,
-		int p_single_root_node_idx) {
+		int p_single_root_node_idx,
+		const DirectAnimContext *p_direct_ctx) {
 	ERR_FAIL_COND_V(p_state.is_null(), Ref<Animation>());
 	Vector<Ref<GLTFAnimation>> &anims = GLTFFastAccess::animations(p_state.ptr());
 	ERR_FAIL_INDEX_V(p_index, anims.size(), Ref<Animation>());
@@ -366,7 +449,7 @@ Ref<Animation> gltf_build_animation_fast(
 
 	String anim_name = anim->get_name();
 	if (anim_name.is_empty()) {
-		anim_name = GLTFFastAccess::gen_unique_name(p_doc, p_state, "Animation");
+		anim_name = p_direct_ctx ? (String("Animation_") + itos(p_index)) : GLTFFastAccess::gen_unique_name(p_doc, p_state, "Animation");
 	}
 
 	Ref<Animation> animation;
@@ -396,7 +479,6 @@ Ref<Animation> gltf_build_animation_fast(
 					anim_end = MAX(anim_end, tp[i]);
 				}
 			} else {
-				// Fast endpoint check + interior safety.
 				anim_end = MAX(anim_end, tp[n - 1]);
 				for (int i = 0; i < n - 1; i++) {
 					if (unlikely(tp[i] > anim_end)) {
@@ -444,7 +526,6 @@ Ref<Animation> gltf_build_animation_fast(
 	auto &scene_mesh_instances = GLTFFastAccess::scene_mesh_instances(p_state.ptr());
 	auto &scene_runtime_mesh_instances = GLTFFastAccess::scene_runtime_mesh_instances(p_state.ptr());
 
-	// CacheSkeleton NodePath strings so 68 bones don't call scene_root->get_path_to(sk) 68 times!
 	LocalVector<String> skel_path_cache;
 	if (p_scene_root && !skeletons.is_empty()) {
 		skel_path_cache.resize(uint32_t(skeletons.size()));
@@ -465,6 +546,7 @@ Ref<Animation> gltf_build_animation_fast(
 
 		NodePath node_path;
 		NodePath transform_node_path;
+		Vector<StringName> direct_mesh_path_names;
 		NodePath mesh_instance_node_path;
 
 		if (p_scene_root) {
@@ -496,6 +578,25 @@ Ref<Animation> gltf_build_animation_fast(
 					}
 				}
 			}
+		} else if (p_direct_ctx && p_direct_ctx->has_vnode_paths) {
+			const GLTFSkeletonIndex skel_idx = GLTFFastAccess::node_skeleton(gltf_node.ptr());
+			if (skel_idx >= 0 && uint32_t(skel_idx) < p_direct_ctx->skel_paths.size() && !p_direct_ctx->skel_paths[uint32_t(skel_idx)].is_empty()) {
+				Vector<StringName> sub;
+				sub.push_back(StringName(gltf_node->get_name()));
+				transform_node_path = NodePath(p_direct_ctx->skel_paths[uint32_t(skel_idx)], sub, false);
+			} else {
+				ERR_CONTINUE_MSG(uint32_t(node_index) >= p_direct_ctx->scene_paths.size() || p_direct_ctx->scene_paths[uint32_t(node_index)].is_empty(),
+						vformat("Unable to find node %d for animation.", node_index));
+				node_path = NodePath(p_direct_ctx->scene_paths[uint32_t(node_index)], false);
+				transform_node_path = node_path;
+			}
+			if (!track.weight_tracks.is_empty()) {
+				if (uint32_t(node_index) < p_direct_ctx->rmi_paths.size() && !p_direct_ctx->rmi_paths[uint32_t(node_index)].is_empty()) {
+					direct_mesh_path_names = p_direct_ctx->rmi_paths[uint32_t(node_index)];
+				} else if (uint32_t(node_index) < p_direct_ctx->scene_paths.size()) {
+					direct_mesh_path_names = p_direct_ctx->scene_paths[uint32_t(node_index)];
+				}
+			}
 		} else {
 			node_path = compute_direct_node_path(nodes, node_index, p_single_root_node_idx);
 			transform_node_path = node_path;
@@ -508,10 +609,11 @@ Ref<Animation> gltf_build_animation_fast(
 
 		if ((track.rotation_track.values.size() || track.position_track.values.size() || track.scale_track.values.size()) &&
 				!transform_affects_skinned_mesh_instance) {
+			const bool has_pre_trs = (p_direct_ctx && uint32_t(node_index) < p_direct_ctx->base_trs.size());
 			if (track.position_track.values.size() && track.position_track.times.size()) {
 				bool is_default = true;
 				if (p_remove_immutable_tracks) {
-					const Vector3 base_pos = gltf_node->get_position();
+					const Vector3 base_pos = has_pre_trs ? p_direct_ctx->base_trs[uint32_t(node_index)].pos : gltf_node->get_position();
 					const Vector3 *vp = track.position_track.values.ptr();
 					const int vcnt = track.position_track.values.size();
 					const int tcnt = track.position_track.times.size();
@@ -544,7 +646,7 @@ Ref<Animation> gltf_build_animation_fast(
 			if (track.rotation_track.values.size() && track.rotation_track.times.size()) {
 				bool is_default = true;
 				if (p_remove_immutable_tracks) {
-					const Quaternion base_rot = gltf_node->get_rotation();
+					const Quaternion base_rot = has_pre_trs ? p_direct_ctx->base_trs[uint32_t(node_index)].rot : gltf_node->get_rotation();
 					const Quaternion *vp = track.rotation_track.values.ptr();
 					const int vcnt = track.rotation_track.values.size();
 					const int tcnt = track.rotation_track.times.size();
@@ -552,7 +654,9 @@ Ref<Animation> gltf_build_animation_fast(
 					for (int i = 0; i < tcnt; i++) {
 						const int vi = cubic ? (1 + i * 3) : i;
 						ERR_BREAK(vi >= vcnt);
-						const Quaternion val = vp[vi].is_normalized() ? vp[vi] : vp[vi].normalized();
+						const Quaternion &q = vp[vi];
+						const float l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+						const Quaternion val = (std::abs(l2 - 1.0f) <= 1e-5f) ? q : q.normalized();
 						if (!val.is_equal_approx(base_rot)) {
 							is_default = false;
 							break;
@@ -578,7 +682,7 @@ Ref<Animation> gltf_build_animation_fast(
 			if (track.scale_track.values.size() && track.scale_track.times.size()) {
 				bool is_default = true;
 				if (p_remove_immutable_tracks) {
-					const Vector3 base_scale = gltf_node->get_scale();
+					const Vector3 base_scale = has_pre_trs ? p_direct_ctx->base_trs[uint32_t(node_index)].scale : gltf_node->get_scale();
 					const Vector3 *vp = track.scale_track.values.ptr();
 					const int vcnt = track.scale_track.values.size();
 					const int tcnt = track.scale_track.times.size();
@@ -615,19 +719,26 @@ Ref<Animation> gltf_build_animation_fast(
 			Ref<GLTFMesh> gmesh = meshes[mesh_idx];
 			ERR_CONTINUE(gmesh.is_null());
 
-			String bs_name;
+			StringName bs_sname;
 			if (gmesh->get_runtime_mesh().is_valid()) {
 				ERR_CONTINUE(i >= gmesh->get_runtime_mesh()->get_blend_shape_count());
-				bs_name = String(gmesh->get_runtime_mesh()->get_blend_shape_name(i));
+				bs_sname = gmesh->get_runtime_mesh()->get_blend_shape_name(i);
 			} else {
 				ERR_CONTINUE(gmesh->get_mesh().is_null() || i >= gmesh->get_mesh()->get_blend_shape_count());
-				bs_name = gmesh->get_mesh()->get_blend_shape_name(i);
+				bs_sname = StringName(gmesh->get_mesh()->get_blend_shape_name(i));
 			}
 
-			const String blend_path = String(mesh_instance_node_path) + ":" + bs_name;
+			NodePath blend_np;
+			if (!direct_mesh_path_names.is_empty()) {
+				Vector<StringName> sub;
+				sub.push_back(bs_sname);
+				blend_np = NodePath(direct_mesh_path_names, sub, false);
+			} else {
+				blend_np = NodePath(String(mesh_instance_node_path) + ":" + String(bs_sname));
+			}
 			const int track_idx = animation->get_track_count();
 			animation->add_track(Animation::TYPE_BLEND_SHAPE);
-			animation->track_set_path(track_idx, blend_path);
+			animation->track_set_path(track_idx, blend_np);
 			animation->track_set_imported(track_idx, true);
 
 			const GLTFAnimation::Channel<real_t> &wch = track.weight_tracks[i];
@@ -637,7 +748,6 @@ Ref<Animation> gltf_build_animation_fast(
 						wch.interpolation == GLTFAnimation::INTERP_STEP ? Animation::INTERPOLATION_NEAREST : Animation::INTERPOLATION_LINEAR);
 				const int kcnt = MIN(wch.times.size(), wch.values.size());
 				if (kcnt > 0) {
-					// Check if times are strictly sorted for O(N) bulk insert; otherwise fall back to per-key insert.
 					bool sorted_strict = true;
 					const double *tp = wch.times.ptr();
 					for (int k = 1; k < kcnt; k++) {
@@ -708,6 +818,58 @@ Ref<Animation> gltf_build_animation_fast(
 	return animation;
 }
 
+struct DirectBoneInfo {
+	String name;
+	int parent = -1;
+	Transform3D rest;
+	Vector3 pos;
+	Quaternion rot;
+	Vector3 scale = Vector3(1.0f, 1.0f, 1.0f);
+	Variant extras;
+	bool has_extras = false;
+};
+
+struct DirectSkelInfo {
+	LocalVector<DirectBoneInfo> bones;
+	HashMap<String, int> bone_name_to_idx;
+};
+
+enum VirtNodeKind : uint8_t {
+	VKIND_NODE3D = 0,
+	VKIND_MESH = 1,
+	VKIND_SKELETON = 2,
+	VKIND_BONE_ATTACHMENT = 3,
+};
+
+struct VirtNode {
+	VirtNodeKind kind = VKIND_NODE3D;
+	bool use_node_xform = false;
+	bool use_node_vis = false;
+	bool is_skinned_mesh = false;
+	int parent_vidx = -1;
+	int gltf_node_idx = -1;
+	int skel_idx = -1;
+	int skin_idx = -1;
+	int bone_attach_idx = -1;
+	int merge_meta_node = -1;
+	String name;
+	String bone_name;
+	LocalVector<int> children;
+};
+
+} // namespace
+
+Ref<Animation> gltf_build_animation_fast(
+		GLTFDocument *p_doc,
+		Ref<GLTFState> p_state,
+		Node *p_scene_root,
+		GLTFAnimationIndex p_index,
+		bool p_trimming,
+		bool p_remove_immutable_tracks,
+		int p_single_root_node_idx) {
+	return build_animation_fast_impl(p_doc, p_state, p_scene_root, p_index, p_trimming, p_remove_immutable_tracks, p_single_root_node_idx, nullptr);
+}
+
 void gltf_import_animation_fast(
 		GLTFDocument *p_doc,
 		Ref<GLTFState> p_state,
@@ -718,7 +880,7 @@ void gltf_import_animation_fast(
 	ERR_FAIL_NULL(p_animation_player);
 	Node *scene_root = p_animation_player->get_parent();
 	ERR_FAIL_NULL(scene_root);
-	Ref<Animation> animation = gltf_build_animation_fast(p_doc, p_state, scene_root, p_index, p_trimming, p_remove_immutable_tracks, -1);
+	Ref<Animation> animation = build_animation_fast_impl(p_doc, p_state, scene_root, p_index, p_trimming, p_remove_immutable_tracks, -1, nullptr);
 	ERR_FAIL_COND(animation.is_null());
 
 	Ref<AnimationLibrary> library;
@@ -744,6 +906,8 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 	p_state->set_bake_fps(p_bake_fps);
 	Vector<Ref<GLTFNode>> &nodes = GLTFFastAccess::nodes(p_state.ptr());
 	Vector<Ref<GLTFMesh>> &meshes = GLTFFastAccess::meshes(p_state.ptr());
+	Vector<Ref<GLTFSkin>> &skins = GLTFFastAccess::skins(p_state.ptr());
+	Vector<Ref<GLTFSkeleton>> &skeletons = GLTFFastAccess::skeletons(p_state.ptr());
 	Vector<Ref<GLTFAnimation>> &anims = GLTFFastAccess::animations(p_state.ptr());
 
 	bool has_pointer_tracks = false;
@@ -757,7 +921,6 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 	const bool can_use_direct_state =
 			!p_has_custom_extensions &&
 			p_doc->get_naming_version() >= 2 &&
-			GLTFFastAccess::skeletons(p_state.ptr()).is_empty() &&
 			GLTFFastAccess::cameras(p_state.ptr()).is_empty() &&
 			GLTFFastAccess::lights(p_state.ptr()).is_empty() &&
 			!has_pointer_tracks;
@@ -773,11 +936,14 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 		return packed;
 	}
 
-	// Zero-Node* direct SceneState builder.
+	// Zero-Node* direct SceneState builder (handles both static hierarchies and full Skeleton3D + Skin + BoneAttachment3D rigs).
 	Ref<SceneState> ss;
 	ss.instantiate();
 	HashMap<StringName, int> name_map;
-	HashMap<Variant, int> variant_map;
+	if (nodes.size() > 32) {
+		name_map.reserve(uint32_t(nodes.size() + 64));
+	}
+	HashMap<Variant, int> resource_val_map;
 
 	auto intern_name = [&](const StringName &p_sname) -> int {
 		HashMap<StringName, int>::Iterator E = name_map.find(p_sname);
@@ -789,13 +955,13 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 		return idx;
 	};
 
-	auto intern_val = [&](const Variant &p_val) -> int {
-		HashMap<Variant, int>::Iterator E = variant_map.find(p_val);
+	auto intern_shared_val = [&](const Variant &p_val) -> int {
+		HashMap<Variant, int>::Iterator E = resource_val_map.find(p_val);
 		if (E) {
 			return E->value;
 		}
 		const int idx = ss->add_value(p_val);
-		variant_map.insert(p_val, idx);
+		resource_val_map.insert(p_val, idx);
 		return idx;
 	};
 
@@ -804,16 +970,10 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 	const int prop_transform = intern_name(SNAME("transform"));
 	const int prop_visible = intern_name(SNAME("visible"));
 	const int prop_mesh = intern_name(SNAME("mesh"));
+	const int val_false = intern_shared_val(false);
 	int32_t next_unique_id = 1;
 
-	auto emit_gltf_node_props = [&](int p_ss_node_idx, const Ref<GLTFNode> &p_gnode) {
-		const Transform3D &xf = GLTFFastAccess::node_xform(p_gnode.ptr());
-		if (xf != Transform3D()) {
-			ss->add_node_property(p_ss_node_idx, prop_transform, intern_val(xf));
-		}
-		if (!GLTFFastAccess::node_visible(p_gnode.ptr())) {
-			ss->add_node_property(p_ss_node_idx, prop_visible, intern_val(false));
-		}
+	auto emit_mesh_and_blend_props = [&](int p_ss_node_idx, const Ref<GLTFNode> &p_gnode) {
 		const GLTFMeshIndex midx = GLTFFastAccess::node_mesh(p_gnode.ptr());
 		if (midx >= 0 && midx < meshes.size() && meshes[midx].is_valid()) {
 			Ref<GLTFMesh> gmesh = meshes[midx];
@@ -825,9 +985,14 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 				if (gmesh->has_meta("extras")) {
 					mres->set_meta("extras", gmesh->get_meta("extras"));
 				}
-				ss->add_node_property(p_ss_node_idx, prop_mesh, intern_val(mres));
+				ss->add_node_property(p_ss_node_idx, prop_mesh, intern_shared_val(mres));
 				Vector<float> weights = gmesh->get_blend_weights();
-				if (const_cast<GLTFNode *>(p_gnode.ptr())->has_additional_data(SNAME("_gltf_node_weights"))) {
+				const Vector<float> &nw_fast = GLTFFastAccess::node_weights(p_gnode.ptr());
+				if (!nw_fast.is_empty()) {
+					for (int w = 0; w < MIN(nw_fast.size(), weights.size()); w++) {
+						weights.write[w] = nw_fast[w];
+					}
+				} else if (const_cast<GLTFNode *>(p_gnode.ptr())->has_additional_data(SNAME("_gltf_node_weights"))) {
 					Vector<float> nw = const_cast<GLTFNode *>(p_gnode.ptr())->get_additional_data(SNAME("_gltf_node_weights"));
 					for (int w = 0; w < MIN(nw.size(), weights.size()); w++) {
 						weights.write[w] = nw[w];
@@ -837,91 +1002,618 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 				for (int b = 0; b < bs_cnt; b++) {
 					if (weights[b] != 0.0f) {
 						const StringName bprop(String("blend_shapes/") + String(mres->get_blend_shape_name(b)));
-						ss->add_node_property(p_ss_node_idx, intern_name(bprop), intern_val(weights[b]));
+						ss->add_node_property(p_ss_node_idx, intern_name(bprop), ss->add_value(weights[b]));
 					}
 				}
 			}
 		}
+	};
+
+	auto emit_node_meta = [&](int p_ss_node_idx, const Ref<GLTFNode> &p_gnode) {
 		List<StringName> meta_list;
 		p_gnode->get_meta_list(&meta_list);
 		for (const StringName &mk : meta_list) {
 			const StringName mprop(String("metadata/") + String(mk));
-			ss->add_node_property(p_ss_node_idx, intern_name(mprop), intern_val(p_gnode->get_meta(mk)));
+			ss->add_node_property(p_ss_node_idx, intern_name(mprop), ss->add_value(p_gnode->get_meta(mk)));
 		}
 	};
-
-	struct StackEntry {
-		GLTFNodeIndex gltf_idx = -1;
-		int parent_ss_idx = -1;
-	};
-	LocalVector<StackEntry> stack;
 
 	const bool use_single_root = GLTFFastAccess::extensions_used(p_state.ptr()).has("GODOT_single_root");
 	int single_root_gltf_idx = -1;
+	DirectAnimContext anim_ctx;
 
-	if (use_single_root) {
-		ERR_FAIL_COND_V(nodes.is_empty(), Ref<PackedScene>());
-		single_root_gltf_idx = 0;
-		Ref<GLTFNode> root_gnode = nodes[0];
-		String rname = root_gnode->get_name();
-		if (rname.is_empty()) {
-			rname = p_state->get_scene_name().is_empty() ? String("Node3D") : GLTFFastAccess::gen_unique_name(p_doc, p_state, p_state->get_scene_name());
+	if (skeletons.is_empty()) {
+		// Ultra-lean zero-allocation stack walk for static / morph / node-animated scenes (e.g. nodes_10000).
+		auto emit_static_props = [&](int p_ss_node_idx, const Ref<GLTFNode> &p_gnode) {
+			const Transform3D &xf = GLTFFastAccess::node_xform(p_gnode.ptr());
+			if (xf != Transform3D()) {
+				ss->add_node_property(p_ss_node_idx, prop_transform, ss->add_value(xf));
+			}
+			if (!GLTFFastAccess::node_visible(p_gnode.ptr())) {
+				ss->add_node_property(p_ss_node_idx, prop_visible, val_false);
+			}
+			emit_mesh_and_blend_props(p_ss_node_idx, p_gnode);
+			emit_node_meta(p_ss_node_idx, p_gnode);
+		};
+
+		struct StackEntry {
+			GLTFNodeIndex gltf_idx = -1;
+			int parent_ss_idx = -1;
+		};
+		LocalVector<StackEntry> stack;
+
+		if (use_single_root) {
+			ERR_FAIL_COND_V(nodes.is_empty(), Ref<PackedScene>());
+			single_root_gltf_idx = 0;
+			Ref<GLTFNode> root_gnode = nodes[0];
+			String rname = root_gnode->get_name();
+			if (rname.is_empty()) {
+				rname = p_state->get_scene_name().is_empty() ? String("Node3D") : GLTFFastAccess::gen_unique_name(p_doc, p_state, p_state->get_scene_name());
+			}
+			const int rtype = GLTFFastAccess::node_mesh(root_gnode.ptr()) >= 0 ? type_mesh_instance : type_node3d;
+			const int root_ss_idx = ss->add_node(-1, -1, rtype, intern_name(StringName(rname)), -1, -1, next_unique_id++);
+			emit_static_props(root_ss_idx, root_gnode);
+			const Vector<int> &rchildren = GLTFFastAccess::node_children(root_gnode.ptr());
+			for (int c = rchildren.size() - 1; c >= 0; c--) {
+				stack.push_back(StackEntry{ rchildren[c], root_ss_idx });
+			}
+		} else {
+			String sname = p_state->get_scene_name();
+			if (sname.is_empty()) {
+				sname = "Node3D";
+			} else {
+				sname = GLTFFastAccess::gen_unique_name(p_doc, p_state, sname);
+			}
+			const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(sname)), -1, -1, next_unique_id++);
+			const Vector<int> &rnodes = GLTFFastAccess::root_nodes(p_state.ptr());
+			for (int r = rnodes.size() - 1; r >= 0; r--) {
+				stack.push_back(StackEntry{ rnodes[r], root_ss_idx });
+			}
 		}
-		const int rtype = GLTFFastAccess::node_mesh(root_gnode.ptr()) >= 0 ? type_mesh_instance : type_node3d;
-		const int root_ss_idx = ss->add_node(-1, -1, rtype, intern_name(StringName(rname)), -1, -1, next_unique_id++);
-		emit_gltf_node_props(root_ss_idx, root_gnode);
-		const Vector<int> &rchildren = GLTFFastAccess::node_children(root_gnode.ptr());
-		for (int c = rchildren.size() - 1; c >= 0; c--) {
-			stack.push_back(StackEntry{ rchildren[c], root_ss_idx });
+
+		while (!stack.is_empty()) {
+			const StackEntry item = stack[stack.size() - 1];
+			stack.resize(stack.size() - 1);
+			ERR_CONTINUE(item.gltf_idx < 0 || item.gltf_idx >= nodes.size());
+			Ref<GLTFNode> gnode = nodes[item.gltf_idx];
+			const int ntype = GLTFFastAccess::node_mesh(gnode.ptr()) >= 0 ? type_mesh_instance : type_node3d;
+			String nname = gnode->get_name();
+			if (nname.is_empty()) {
+				nname = GLTFFastAccess::gen_unique_name(p_doc, p_state, "Node");
+			}
+			const int ss_idx = ss->add_node(item.parent_ss_idx, 0, ntype, intern_name(StringName(nname)), -1, -1, next_unique_id++);
+			emit_static_props(ss_idx, gnode);
+
+			const Vector<int> &children = GLTFFastAccess::node_children(gnode.ptr());
+			for (int c = children.size() - 1; c >= 0; c--) {
+				stack.push_back(StackEntry{ children[c], ss_idx });
+			}
 		}
 	} else {
-		String sname = p_state->get_scene_name();
-		if (sname.is_empty()) {
-			sname = "Node3D";
+		// Direct Skeleton3D + Skin + BoneAttachment3D SceneState builder (zero Node* instantiation or ClassDB reflection).
+		HashSet<String> &unique_names = GLTFFastAccess::unique_names(p_state.ptr());
+		HashSet<String> unique_node_names(unique_names);
+		LocalVector<DirectSkelInfo> direct_skels;
+		direct_skels.resize(uint32_t(skeletons.size()));
+
+		for (int skel_i = 0; skel_i < skeletons.size(); skel_i++) {
+			Ref<GLTFSkeleton> gltf_skel = skeletons.write[skel_i];
+			ERR_FAIL_COND_V(gltf_skel.is_null(), Ref<PackedScene>());
+			DirectSkelInfo &dskel = direct_skels[uint32_t(skel_i)];
+			HashSet<String> skel_unique_names(unique_node_names);
+
+			Vector<GLTFNodeIndex> roots_sorted = GLTFFastAccess::skeleton_roots(gltf_skel.ptr());
+			roots_sorted.sort();
+			LocalVector<GLTFNodeIndex> bone_stack;
+			for (int r = roots_sorted.size() - 1; r >= 0; r--) {
+				bone_stack.push_back(roots_sorted[r]);
+			}
+
+			while (!bone_stack.is_empty()) {
+				const GLTFNodeIndex node_i = bone_stack[bone_stack.size() - 1];
+				bone_stack.resize(bone_stack.size() - 1);
+				Ref<GLTFNode> node = nodes[node_i];
+				ERR_FAIL_COND_V(GLTFFastAccess::node_skeleton(node.ptr()) != skel_i, Ref<PackedScene>());
+
+				const Vector<int> &ch = GLTFFastAccess::node_children(node.ptr());
+				if (!ch.is_empty()) {
+					Vector<GLTFNodeIndex> child_bones;
+					for (int c = 0; c < ch.size(); c++) {
+						if (GLTFFastAccess::node_skeleton(nodes[ch[c]].ptr()) == skel_i) {
+							child_bones.push_back(ch[c]);
+						}
+					}
+					child_bones.sort();
+					for (int c = child_bones.size() - 1; c >= 0; c--) {
+						bone_stack.push_back(child_bones[c]);
+					}
+				}
+
+				if (node->get_name().is_empty()) {
+					node->set_name("bone");
+				}
+				const String unique_bone_name = SkinTool::_gen_unique_bone_name(skel_unique_names, node->get_name());
+				unique_names.insert(unique_bone_name);
+				node->set_name(unique_bone_name);
+
+				const int bone_idx = int(dskel.bones.size());
+				dskel.bone_name_to_idx.insert(unique_bone_name, bone_idx);
+				GLTFFastAccess::skeleton_bone_node(gltf_skel.ptr()).insert(bone_idx, node_i);
+
+				DirectBoneInfo binfo;
+				binfo.name = unique_bone_name;
+				binfo.rest = GLTFFastAccess::node_rest_xform(node.ptr());
+				const Transform3D &xf = GLTFFastAccess::node_xform(node.ptr());
+				binfo.pos = xf.origin;
+				if (xf.basis != Basis()) {
+					binfo.rot = xf.basis.get_rotation_quaternion();
+					binfo.scale = xf.basis.get_scale();
+				}
+				if (node->has_meta("extras")) {
+					binfo.extras = node->get_meta("extras");
+					binfo.has_extras = true;
+				}
+				const GLTFNodeIndex par_ni = GLTFFastAccess::node_parent(node.ptr());
+				if (par_ni >= 0 && GLTFFastAccess::node_skeleton(nodes[par_ni].ptr()) == skel_i) {
+					const int *p_ptr = dskel.bone_name_to_idx.getptr(nodes[par_ni]->get_name());
+					ERR_FAIL_COND_V(!p_ptr, Ref<PackedScene>());
+					binfo.parent = *p_ptr;
+				}
+				dskel.bones.push_back(binfo);
+			}
+		}
+
+		// Map skin joint indices to skeleton bone indices in O(1) and build Godot Skin resources.
+		for (int skin_i = 0; skin_i < skins.size(); skin_i++) {
+			Ref<GLTFSkin> gskin = skins.write[skin_i];
+			ERR_CONTINUE(gskin.is_null());
+			const int skel_i = GLTFFastAccess::skin_skeleton(gskin.ptr());
+			ERR_FAIL_INDEX_V(skel_i, int(direct_skels.size()), Ref<PackedScene>());
+			const DirectSkelInfo &dskel = direct_skels[uint32_t(skel_i)];
+			const Vector<GLTFNodeIndex> &j_orig = GLTFFastAccess::skin_joints_original(gskin.ptr());
+			HashMap<int, int> &j_to_b = GLTFFastAccess::skin_joint_to_bone(gskin.ptr());
+			for (int ji = 0; ji < j_orig.size(); ji++) {
+				const int *b_ptr = dskel.bone_name_to_idx.getptr(nodes[j_orig[ji]]->get_name());
+				ERR_FAIL_COND_V(!b_ptr, Ref<PackedScene>());
+				j_to_b.insert(ji, *b_ptr);
+			}
+		}
+		ERR_FAIL_COND_V(SkinTool::_create_skins(skins, nodes, GLTFFastAccess::use_named_skin_binds(p_state.ptr()), unique_names) != OK, Ref<PackedScene>());
+
+		// Build virtual scene tree mirroring GLTFDocument::_generate_scene_node + _process_mesh_instances.
+		LocalVector<VirtNode> vnodes;
+		vnodes.reserve(uint32_t(nodes.size() + skeletons.size() + 4));
+
+		auto alloc_vnode = [&](VirtNodeKind p_kind, int p_gltf_idx, const String &p_name) -> int {
+			const int idx = int(vnodes.size());
+			VirtNode vn;
+			vn.kind = p_kind;
+			vn.gltf_node_idx = p_gltf_idx;
+			vn.name = p_name;
+			vnodes.push_back(vn);
+			return idx;
+		};
+
+		auto attach_vchild = [&](int p_parent_vidx, int p_child_vidx) {
+			String cname = vnodes[uint32_t(p_child_vidx)].name.validate_node_name();
+			if (cname.is_empty()) {
+				cname = "Node3D";
+			}
+			const LocalVector<int> &sibs = vnodes[uint32_t(p_parent_vidx)].children;
+			String final_name = cname;
+			int suffix = 2;
+			while (true) {
+				bool clash = false;
+				for (uint32_t s = 0; s < sibs.size(); s++) {
+					if (vnodes[uint32_t(sibs[s])].name == final_name) {
+						clash = true;
+						break;
+					}
+				}
+				if (!clash) {
+					break;
+				}
+				final_name = cname + itos(suffix++);
+			}
+			vnodes[uint32_t(p_child_vidx)].name = final_name;
+			vnodes[uint32_t(p_child_vidx)].parent_vidx = p_parent_vidx;
+			vnodes[uint32_t(p_parent_vidx)].children.push_back(p_child_vidx);
+		};
+
+		auto detach_vchild = [&](int p_child_vidx) {
+			const int pv = vnodes[uint32_t(p_child_vidx)].parent_vidx;
+			if (pv >= 0) {
+				LocalVector<int> &sibs = vnodes[uint32_t(pv)].children;
+				for (uint32_t i = 0; i < sibs.size(); i++) {
+					if (sibs[i] == p_child_vidx) {
+						sibs.remove_at(i);
+						break;
+					}
+				}
+				vnodes[uint32_t(p_child_vidx)].parent_vidx = -1;
+			}
+		};
+
+		LocalVector<int> skel_vidx;
+		skel_vidx.resize(uint32_t(skeletons.size()));
+		LocalVector<int> scene_vidx;
+		scene_vidx.resize(uint32_t(nodes.size()));
+		LocalVector<int> rmi_vidx;
+		rmi_vidx.resize(uint32_t(nodes.size()));
+		for (int i = 0; i < nodes.size(); i++) {
+			scene_vidx[uint32_t(i)] = -1;
+			rmi_vidx[uint32_t(i)] = -1;
+		}
+		for (int s_i = 0; s_i < skeletons.size(); s_i++) {
+			const int sv = alloc_vnode(VKIND_SKELETON, -1, "Skeleton3D");
+			vnodes[uint32_t(sv)].skel_idx = s_i;
+			skel_vidx[uint32_t(s_i)] = sv;
+			for (const KeyValue<int32_t, GLTFNodeIndex> &kv : GLTFFastAccess::skeleton_bone_node(skeletons.write[s_i].ptr())) {
+				if (kv.value >= 0 && kv.value < nodes.size()) {
+					scene_vidx[uint32_t(kv.value)] = sv;
+				}
+			}
+		}
+
+		int root_vidx = -1;
+
+		auto skel_has_parent = [&](int p_sk_i) -> bool {
+			const int sv = skel_vidx[uint32_t(p_sk_i)];
+			return vnodes[uint32_t(sv)].parent_vidx >= 0 || root_vidx == sv;
+		};
+
+		auto needs_skinned_placeholder = [&](const Ref<GLTFNode> &p_gn) -> bool {
+			if (GLTFFastAccess::node_skin(p_gn.ptr()) < 0) {
+				return false;
+			}
+			const Vector<int> &ch = GLTFFastAccess::node_children(p_gn.ptr());
+			for (int i = 0; i < ch.size(); i++) {
+				const Ref<GLTFNode> &cn = nodes[ch[i]];
+				if (!GLTFFastAccess::node_joint(cn.ptr())) {
+					return true;
+				}
+				const int csk = GLTFFastAccess::node_skeleton(cn.ptr());
+				if (csk >= 0 && csk < skeletons.size() && !skel_has_parent(csk)) {
+					return true;
+				}
+			}
+			return false;
+		};
+
+		auto gen_vnode = [&](auto &self, GLTFNodeIndex p_ni, int p_parent_vidx) -> void {
+			ERR_FAIL_INDEX(p_ni, nodes.size());
+			Ref<GLTFNode> gn = nodes[p_ni];
+			int cur_v = -1;
+
+			auto attach_to_skel = [&](auto &att_self, GLTFNodeIndex p_ani, int p_cur_v, int p_sk_v, GLTFNodeIndex p_bone_ni) -> void {
+				Ref<GLTFNode> agn = nodes[p_ani];
+				if (p_cur_v >= 0 && vnodes[uint32_t(p_cur_v)].kind == VKIND_MESH && GLTFFastAccess::node_skin(agn.ptr()) >= 0) {
+					attach_vchild(p_sk_v, p_cur_v);
+				} else if (p_cur_v >= 0 || !GLTFFastAccess::node_joint(agn.ptr())) {
+					const GLTFNodeIndex attach_ni = (p_bone_ni == -1)
+							? (GLTFFastAccess::node_joint(agn.ptr()) ? p_ani : GLTFFastAccess::node_parent(agn.ptr()))
+							: p_bone_ni;
+					ERR_FAIL_INDEX(attach_ni, nodes.size());
+					int attach_v = scene_vidx[uint32_t(attach_ni)];
+					ERR_FAIL_COND(attach_v < 0);
+					if (vnodes[uint32_t(attach_v)].kind == VKIND_SKELETON) {
+						const int sk_i = vnodes[uint32_t(attach_v)].skel_idx;
+						const String &bname = nodes[attach_ni]->get_name();
+						const int ba_v = alloc_vnode(VKIND_BONE_ATTACHMENT, attach_ni, bname);
+						vnodes[uint32_t(ba_v)].bone_name = bname;
+						const int *bidx_p = direct_skels[uint32_t(sk_i)].bone_name_to_idx.getptr(bname);
+						vnodes[uint32_t(ba_v)].bone_attach_idx = bidx_p ? *bidx_p : -1;
+						vnodes[uint32_t(ba_v)].merge_meta_node = attach_ni;
+						attach_vchild(p_sk_v, ba_v);
+						scene_vidx[uint32_t(attach_ni)] = ba_v;
+						attach_v = ba_v;
+					}
+					if (p_cur_v < 0) {
+						p_cur_v = alloc_vnode(VKIND_NODE3D, p_ani, agn->get_name());
+					} else if (!agn->get_name().is_empty()) {
+						vnodes[uint32_t(p_cur_v)].name = agn->get_name();
+					}
+					if (!GLTFFastAccess::node_joint(agn.ptr())) {
+						vnodes[uint32_t(p_cur_v)].use_node_xform = true;
+					}
+					attach_vchild(attach_v, p_cur_v);
+				} else {
+					p_cur_v = p_sk_v;
+				}
+				if (vnodes[uint32_t(p_cur_v)].kind != VKIND_SKELETON) {
+					vnodes[uint32_t(p_cur_v)].merge_meta_node = p_ani;
+				}
+				scene_vidx[uint32_t(p_ani)] = p_cur_v;
+				const Vector<int> &ch = GLTFFastAccess::node_children(agn.ptr());
+				for (int i = 0; i < ch.size(); i++) {
+					self(self, ch[i], p_cur_v);
+				}
+			};
+
+			if (GLTFFastAccess::node_mesh(gn.ptr()) >= 0) {
+				const int mv = alloc_vnode(VKIND_MESH, p_ni, gn->get_name());
+				rmi_vidx[uint32_t(p_ni)] = mv;
+				cur_v = mv;
+				if (needs_skinned_placeholder(gn)) {
+					const int sk_i = GLTFFastAccess::node_skeleton(gn.ptr());
+					int ph_v = -1;
+					if (sk_i >= 0 && sk_i < skeletons.size() && !skel_has_parent(sk_i)) {
+						ph_v = skel_vidx[uint32_t(sk_i)];
+					} else {
+						ph_v = alloc_vnode(VKIND_NODE3D, p_ni, gn->get_name());
+					}
+					attach_vchild(ph_v, cur_v);
+					cur_v = ph_v;
+				}
+			}
+
+			if (cur_v < 0 || vnodes[uint32_t(cur_v)].kind != VKIND_SKELETON) {
+				if (cur_v >= 0 && !gn->get_name().is_empty()) {
+					vnodes[uint32_t(cur_v)].name = gn->get_name();
+				}
+				const int sk_i = GLTFFastAccess::node_skeleton(gn.ptr());
+				if (sk_i >= 0) {
+					const int sk_v = skel_vidx[uint32_t(sk_i)];
+					if (!skel_has_parent(sk_i)) {
+						if (root_vidx >= 0) {
+							if (p_parent_vidx >= 0 && vnodes[uint32_t(p_parent_vidx)].kind == VKIND_SKELETON) {
+								attach_to_skel(attach_to_skel, p_ni, sk_v, p_parent_vidx, GLTFFastAccess::node_parent(gn.ptr()));
+							} else if (p_parent_vidx >= 0) {
+								attach_vchild(p_parent_vidx, sk_v);
+							}
+						} else {
+							root_vidx = sk_v;
+						}
+					}
+					attach_to_skel(attach_to_skel, p_ni, cur_v, sk_v, -1);
+					return;
+				}
+			}
+
+			if (p_parent_vidx >= 0 && vnodes[uint32_t(p_parent_vidx)].kind == VKIND_SKELETON) {
+				attach_to_skel(attach_to_skel, p_ni, cur_v, p_parent_vidx, -1);
+				return;
+			}
+
+			if (cur_v < 0) {
+				cur_v = alloc_vnode(VKIND_NODE3D, p_ni, gn->get_name());
+			}
+			if (p_parent_vidx >= 0) {
+				attach_vchild(p_parent_vidx, cur_v);
+			}
+			if (root_vidx < 0) {
+				root_vidx = cur_v;
+			}
+			vnodes[uint32_t(cur_v)].use_node_xform = true;
+			vnodes[uint32_t(cur_v)].use_node_vis = true;
+			vnodes[uint32_t(cur_v)].merge_meta_node = p_ni;
+			scene_vidx[uint32_t(p_ni)] = cur_v;
+
+			const Vector<int> &ch = GLTFFastAccess::node_children(gn.ptr());
+			for (int i = 0; i < ch.size(); i++) {
+				self(self, ch[i], cur_v);
+			}
+		};
+
+		if (use_single_root) {
+			ERR_FAIL_COND_V(nodes.is_empty(), Ref<PackedScene>());
+			single_root_gltf_idx = 0;
+			gen_vnode(gen_vnode, 0, -1);
+			if (scene_vidx[0] >= 0 && root_vidx < 0) {
+				root_vidx = scene_vidx[0];
+			}
 		} else {
-			sname = GLTFFastAccess::gen_unique_name(p_doc, p_state, sname);
+			root_vidx = alloc_vnode(VKIND_NODE3D, -1, "");
+			const Vector<int> &rnodes = GLTFFastAccess::root_nodes(p_state.ptr());
+			for (int r = 0; r < rnodes.size(); r++) {
+				gen_vnode(gen_vnode, rnodes[r], root_vidx);
+			}
 		}
-		const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(sname)), -1, -1, next_unique_id++);
-		const Vector<int> &rnodes = GLTFFastAccess::root_nodes(p_state.ptr());
-		for (int r = rnodes.size() - 1; r >= 0; r--) {
-			stack.push_back(StackEntry{ rnodes[r], root_ss_idx });
-		}
-	}
+		ERR_FAIL_COND_V(root_vidx < 0, Ref<PackedScene>());
 
-	while (!stack.is_empty()) {
-		const StackEntry item = stack[stack.size() - 1];
-		stack.resize(stack.size() - 1);
-		ERR_CONTINUE(item.gltf_idx < 0 || item.gltf_idx >= nodes.size());
-		Ref<GLTFNode> gnode = nodes[item.gltf_idx];
-		const int ntype = GLTFFastAccess::node_mesh(gnode.ptr()) >= 0 ? type_mesh_instance : type_node3d;
-		String nname = gnode->get_name();
-		if (nname.is_empty()) {
-			nname = GLTFFastAccess::gen_unique_name(p_doc, p_state, "Node");
+		if (p_state->get_scene_name().is_empty()) {
+			GLTFFastAccess::scene_name(p_state.ptr()) = vnodes[uint32_t(root_vidx)].name;
+		} else if (vnodes[uint32_t(root_vidx)].name.is_empty()) {
+			vnodes[uint32_t(root_vidx)].name = GLTFFastAccess::gen_unique_name(p_doc, p_state, p_state->get_scene_name());
 		}
-		const int ss_idx = ss->add_node(item.parent_ss_idx, 0, ntype, intern_name(StringName(nname)), -1, -1, next_unique_id++);
-		emit_gltf_node_props(ss_idx, gnode);
+		if (vnodes[uint32_t(root_vidx)].name.is_empty()) {
+			vnodes[uint32_t(root_vidx)].name = "Node3D";
+		}
 
-		const Vector<int> &children = GLTFFastAccess::node_children(gnode.ptr());
-		for (int c = children.size() - 1; c >= 0; c--) {
-			stack.push_back(StackEntry{ children[c], ss_idx });
+		// Reparent skinned MeshInstance3D nodes directly under their Skeleton3D (_process_mesh_instances).
+		for (int node_i = 0; node_i < nodes.size(); node_i++) {
+			Ref<GLTFNode> gn = nodes[node_i];
+			const int skin_i = GLTFFastAccess::node_skin(gn.ptr());
+			if (skin_i >= 0 && GLTFFastAccess::node_mesh(gn.ptr()) >= 0) {
+				ERR_FAIL_INDEX_V(skin_i, skins.size(), Ref<PackedScene>());
+				const int skel_i = GLTFFastAccess::skin_skeleton(skins[skin_i].ptr());
+				ERR_FAIL_INDEX_V(skel_i, skeletons.size(), Ref<PackedScene>());
+				const int sk_v = skel_vidx[uint32_t(skel_i)];
+				const int mi_v = rmi_vidx[uint32_t(node_i)];
+				ERR_FAIL_COND_V(mi_v < 0 || !vnodes[uint32_t(mi_v)].children.is_empty(), Ref<PackedScene>());
+				if (vnodes[uint32_t(mi_v)].parent_vidx != sk_v) {
+					detach_vchild(mi_v);
+					attach_vchild(sk_v, mi_v);
+				}
+				vnodes[uint32_t(mi_v)].skin_idx = skin_i;
+				vnodes[uint32_t(mi_v)].is_skinned_mesh = true;
+				vnodes[uint32_t(mi_v)].use_node_xform = false;
+			}
+		}
+
+		// Emit vnodes in topological pre-order into SceneState.
+		const int type_skeleton3d = intern_name(SNAME("Skeleton3D"));
+		const int type_bone_attach = intern_name(SNAME("BoneAttachment3D"));
+		const int prop_skin = intern_name(SNAME("skin"));
+		const int prop_skeleton = intern_name(SNAME("skeleton"));
+		const int prop_bone_name = intern_name(SNAME("bone_name"));
+		const int prop_bone_idx = intern_name(SNAME("bone_idx"));
+		const int val_parent_np = intern_shared_val(NodePath(".."));
+
+		LocalVector<Vector<StringName>> vnode_paths;
+		vnode_paths.resize(vnodes.size());
+
+		struct EmitItem {
+			int vidx = -1;
+			int parent_ss_idx = -1;
+		};
+		LocalVector<EmitItem> emit_stack;
+		emit_stack.push_back(EmitItem{ root_vidx, -1 });
+
+		while (!emit_stack.is_empty()) {
+			const EmitItem item = emit_stack[emit_stack.size() - 1];
+			emit_stack.resize(emit_stack.size() - 1);
+			const VirtNode &vn = vnodes[uint32_t(item.vidx)];
+
+			int ntype = type_node3d;
+			if (vn.kind == VKIND_MESH) {
+				ntype = type_mesh_instance;
+			} else if (vn.kind == VKIND_SKELETON) {
+				ntype = type_skeleton3d;
+			} else if (vn.kind == VKIND_BONE_ATTACHMENT) {
+				ntype = type_bone_attach;
+			}
+
+			const StringName sname(vn.name);
+			const int owner_ss = (item.parent_ss_idx < 0) ? -1 : 0;
+			const int ss_idx = ss->add_node(item.parent_ss_idx, owner_ss, ntype, intern_name(sname), -1, -1, next_unique_id++);
+
+			if (item.parent_ss_idx < 0) {
+				Vector<StringName> dot_p;
+				dot_p.push_back(SNAME("."));
+				vnode_paths[uint32_t(item.vidx)] = dot_p;
+			} else {
+				Vector<StringName> p = vnode_paths[uint32_t(vn.parent_vidx)];
+				if (p.size() == 1 && p[0] == SNAME(".")) {
+					p.clear();
+				}
+				p.push_back(sname);
+				vnode_paths[uint32_t(item.vidx)] = p;
+			}
+
+			if (vn.kind == VKIND_SKELETON) {
+				const DirectSkelInfo &dskel = direct_skels[uint32_t(vn.skel_idx)];
+				const uint32_t bcnt = dskel.bones.size();
+				for (uint32_t b = 0; b < bcnt; b++) {
+					const DirectBoneInfo &bi = dskel.bones[b];
+					const String prefix = String("bones/") + itos(b) + "/";
+					ss->add_node_property(ss_idx, intern_name(StringName(prefix + "name")), ss->add_value(bi.name));
+					if (bi.parent >= 0) {
+						ss->add_node_property(ss_idx, intern_name(StringName(prefix + "parent")), ss->add_value(bi.parent));
+					}
+					if (bi.rest != Transform3D()) {
+						ss->add_node_property(ss_idx, intern_name(StringName(prefix + "rest")), ss->add_value(bi.rest));
+					}
+					if (bi.pos != Vector3()) {
+						ss->add_node_property(ss_idx, intern_name(StringName(prefix + "position")), ss->add_value(bi.pos));
+					}
+					if (bi.rot != Quaternion()) {
+						ss->add_node_property(ss_idx, intern_name(StringName(prefix + "rotation")), ss->add_value(bi.rot));
+					}
+					if (!bi.scale.is_equal_approx(Vector3(1.0f, 1.0f, 1.0f))) {
+						ss->add_node_property(ss_idx, intern_name(StringName(prefix + "scale")), ss->add_value(bi.scale));
+					}
+					if (bi.has_extras) {
+						ss->add_node_property(ss_idx, intern_name(StringName(prefix + "bone_meta/extras")), ss->add_value(bi.extras));
+					}
+				}
+			} else if (vn.kind == VKIND_BONE_ATTACHMENT) {
+				ss->add_node_property(ss_idx, prop_bone_name, ss->add_value(StringName(vn.bone_name)));
+				if (vn.bone_attach_idx >= 0) {
+					ss->add_node_property(ss_idx, prop_bone_idx, ss->add_value(vn.bone_attach_idx));
+				}
+			}
+
+			if (vn.gltf_node_idx >= 0) {
+				Ref<GLTFNode> gn = nodes[vn.gltf_node_idx];
+				if (vn.use_node_xform) {
+					const Transform3D &xf = GLTFFastAccess::node_xform(gn.ptr());
+					if (xf != Transform3D()) {
+						ss->add_node_property(ss_idx, prop_transform, ss->add_value(xf));
+					}
+				}
+				if (vn.use_node_vis && !GLTFFastAccess::node_visible(gn.ptr())) {
+					ss->add_node_property(ss_idx, prop_visible, val_false);
+				}
+				if (vn.kind == VKIND_MESH) {
+					emit_mesh_and_blend_props(ss_idx, gn);
+					if (vn.is_skinned_mesh && vn.skin_idx >= 0) {
+						Ref<Skin> gskin = GLTFFastAccess::godot_skin(skins.write[vn.skin_idx].ptr());
+						if (gskin.is_valid()) {
+							ss->add_node_property(ss_idx, prop_skin, intern_shared_val(gskin));
+						}
+						ss->add_node_property(ss_idx, prop_skeleton, val_parent_np);
+					}
+				}
+			}
+			if (vn.merge_meta_node >= 0) {
+				emit_node_meta(ss_idx, nodes[vn.merge_meta_node]);
+			}
+
+			for (int c = int(vn.children.size()) - 1; c >= 0; c--) {
+				emit_stack.push_back(EmitItem{ vn.children[uint32_t(c)], ss_idx });
+			}
+		}
+
+		if (p_state->get_create_animations() && !anims.is_empty()) {
+			anim_ctx.has_vnode_paths = true;
+			anim_ctx.skel_paths.resize(uint32_t(skeletons.size()));
+			for (int s_i = 0; s_i < skeletons.size(); s_i++) {
+				const int sv = skel_vidx[uint32_t(s_i)];
+				if (sv >= 0 && uint32_t(sv) < vnode_paths.size()) {
+					anim_ctx.skel_paths[uint32_t(s_i)] = vnode_paths[uint32_t(sv)];
+				}
+			}
+			anim_ctx.scene_paths.resize(uint32_t(nodes.size()));
+			anim_ctx.rmi_paths.resize(uint32_t(nodes.size()));
+			for (int ni = 0; ni < nodes.size(); ni++) {
+				const int sv = scene_vidx[uint32_t(ni)];
+				if (sv >= 0 && uint32_t(sv) < vnode_paths.size()) {
+					anim_ctx.scene_paths[uint32_t(ni)] = vnode_paths[uint32_t(sv)];
+				}
+				const int rv = rmi_vidx[uint32_t(ni)];
+				if (rv >= 0 && uint32_t(rv) < vnode_paths.size()) {
+					anim_ctx.rmi_paths[uint32_t(ni)] = vnode_paths[uint32_t(rv)];
+				}
+			}
 		}
 	}
 
 	if (p_state->get_create_animations() && !anims.is_empty()) {
+		if (p_remove_immutable_tracks) {
+			build_node_base_trs(nodes, anim_ctx.base_trs);
+		}
+		for (int a_i = 0; a_i < anims.size(); a_i++) {
+			if (anims[a_i].is_valid() && anims[a_i]->get_name().is_empty()) {
+				anims.write[a_i]->set_name(GLTFFastAccess::gen_unique_name(p_doc, p_state, "Animation"));
+			}
+		}
+		LocalVector<Ref<Animation>> built_anims;
+		built_anims.resize(uint32_t(anims.size()));
+		if (anims.size() >= 2 && LoadThreadPool::get_singleton()) {
+			LoadThreadPool::get_singleton()->parallel_for(uint32_t(anims.size()), [&](uint32_t a_i) {
+				built_anims[a_i] = build_animation_fast_impl(
+						p_doc, p_state, nullptr, int(a_i), p_trimming, p_remove_immutable_tracks, single_root_gltf_idx, &anim_ctx);
+			});
+		} else {
+			for (int a_i = 0; a_i < anims.size(); a_i++) {
+				built_anims[uint32_t(a_i)] = build_animation_fast_impl(
+						p_doc, p_state, nullptr, a_i, p_trimming, p_remove_immutable_tracks, single_root_gltf_idx, &anim_ctx);
+			}
+		}
+
 		Ref<AnimationLibrary> lib;
 		lib.instantiate();
-		for (int a_i = 0; a_i < anims.size(); a_i++) {
-			Ref<Animation> godot_anim = gltf_build_animation_fast(
-					p_doc, p_state, nullptr, a_i, p_trimming, p_remove_immutable_tracks, single_root_gltf_idx);
-			if (godot_anim.is_valid()) {
-				lib->add_animation(godot_anim->get_name(), godot_anim);
+		for (uint32_t a_i = 0; a_i < built_anims.size(); a_i++) {
+			if (built_anims[a_i].is_valid()) {
+				lib->add_animation(built_anims[a_i]->get_name(), built_anims[a_i]);
 			}
 		}
 		const String ap_name = GLTFFastAccess::unique_names(p_state.ptr()).has("AnimationPlayer")
 				? GLTFFastAccess::gen_unique_name(p_doc, p_state, "AnimationPlayer")
 				: String("AnimationPlayer");
 		const int ap_ss_idx = ss->add_node(0, 0, intern_name(SNAME("AnimationPlayer")), intern_name(StringName(ap_name)), -1, -1, next_unique_id++);
-		ss->add_node_property(ap_ss_idx, intern_name(SNAME("libraries/")), intern_val(lib));
+		ss->add_node_property(ap_ss_idx, intern_name(SNAME("libraries/")), intern_shared_val(lib));
 	}
 
 	Ref<PackedScene> packed;

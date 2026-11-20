@@ -483,6 +483,181 @@ int encode_directions_neon(uint8_t *r_dst, const float *p_normals, const float *
 	}
 	return n;
 }
+
+// NEON 4-wide compressed TBN axis-angle + AABB-relative uint16x4 vertex encoder.
+// Matches Basis::get_axis_angle() + octahedron_encode() to < 1e-6 rad (< 0.01 LSB of uint16),
+// falling back to exact scalar compute_tbn_axis_angle on rare singular TBN frames (theta == 0 or PI).
+void pack_compressed_tbn_range_neon(
+		uint8_t *r_vw,
+		uint32_t p_vtx_offset,
+		uint32_t p_nrm_offset,
+		const float *p_positions,
+		const float *p_normals,
+		const float *p_tangents,
+		const Vector3 &p_aabb_pos,
+		const Vector3 &p_inv_aabb_size,
+		uint32_t p_begin,
+		uint32_t p_end) {
+	const float32x4_t zero = vdupq_n_f32(0.0f);
+	const float32x4_t one = vdupq_n_f32(1.0f);
+	const float32x4_t neg_one = vdupq_n_f32(-1.0f);
+	const float32x4_t half = vdupq_n_f32(0.5f);
+	const float32x4_t eps = vdupq_n_f32(CMP_EPSILON);
+	const float32x4_t pi_v = vdupq_n_f32(float(Math::PI));
+	const float32x4_t inv_pi_v = vdupq_n_f32(1.0f / float(Math::PI));
+	const float32x4_t aabb_px = vdupq_n_f32(p_aabb_pos.x);
+	const float32x4_t aabb_py = vdupq_n_f32(p_aabb_pos.y);
+	const float32x4_t aabb_pz = vdupq_n_f32(p_aabb_pos.z);
+	const float32x4_t inv_sx = vdupq_n_f32(p_inv_aabb_size.x);
+	const float32x4_t inv_sy = vdupq_n_f32(p_inv_aabb_size.y);
+	const float32x4_t inv_sz = vdupq_n_f32(p_inv_aabb_size.z);
+
+	auto pack_u16 = [&](float32x4_t f) {
+		const float32x4_t clamped = vminq_f32(vmaxq_f32(f, zero), one);
+		return vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(clamped, 65535.0f)));
+	};
+
+	uint32_t i = p_begin;
+	for (; i + 4 <= p_end; i += 4) {
+		const float32x4x3_t pos = vld3q_f32(p_positions + 3 * size_t(i));
+		const float32x4x3_t n_raw = vld3q_f32(p_normals + 3 * size_t(i));
+
+		// Normalize normal.
+		const float32x4_t nl2 = vfmaq_f32(vfmaq_f32(vmulq_f32(n_raw.val[0], n_raw.val[0]), n_raw.val[1], n_raw.val[1]), n_raw.val[2], n_raw.val[2]);
+		const float32x4_t n_inv = vbslq_f32(vcgtq_f32(nl2, zero), vdivq_f32(one, vsqrtq_f32(vbslq_f32(vcgtq_f32(nl2, zero), nl2, one))), zero);
+		const float32x4_t nx = vmulq_f32(n_raw.val[0], n_inv);
+		const float32x4_t ny = vmulq_f32(n_raw.val[1], n_inv);
+		const float32x4_t nz = vmulq_f32(n_raw.val[2], n_inv);
+
+		float32x4_t tx, ty, tz, tw;
+		if (p_tangents) {
+			const float32x4x4_t t_raw = vld4q_f32(p_tangents + 4 * size_t(i));
+			const float32x4_t tl2 = vfmaq_f32(vfmaq_f32(vmulq_f32(t_raw.val[0], t_raw.val[0]), t_raw.val[1], t_raw.val[1]), t_raw.val[2], t_raw.val[2]);
+			const float32x4_t t_inv = vbslq_f32(vcgtq_f32(tl2, zero), vdivq_f32(one, vsqrtq_f32(vbslq_f32(vcgtq_f32(tl2, zero), tl2, one))), zero);
+			tx = vmulq_f32(t_raw.val[0], t_inv);
+			ty = vmulq_f32(t_raw.val[1], t_inv);
+			tz = vmulq_f32(t_raw.val[2], t_inv);
+			tw = t_raw.val[3];
+		} else {
+			// Vector3(n.z, -n.x, n.y).cross(n) = (-nx*nz - ny*ny, ny*nx - nz*nz, nz*ny + nx*nx)
+			const float32x4_t cx = vnegq_f32(vfmaq_f32(vmulq_f32(nx, nz), ny, ny));
+			const float32x4_t cy = vfmsq_f32(vmulq_f32(ny, nx), nz, nz);
+			const float32x4_t cz = vfmaq_f32(vmulq_f32(nz, ny), nx, nx);
+			const float32x4_t tl2 = vfmaq_f32(vfmaq_f32(vmulq_f32(cx, cx), cy, cy), cz, cz);
+			const float32x4_t t_inv = vbslq_f32(vcgtq_f32(tl2, zero), vdivq_f32(one, vsqrtq_f32(vbslq_f32(vcgtq_f32(tl2, zero), tl2, one))), zero);
+			tx = vmulq_f32(cx, t_inv);
+			ty = vmulq_f32(cy, t_inv);
+			tz = vmulq_f32(cz, t_inv);
+			tw = one;
+		}
+
+		// binormal = cross(n, t).normalized()
+		const float32x4_t bcx = vfmsq_f32(vmulq_f32(ny, tz), nz, ty);
+		const float32x4_t bcy = vfmsq_f32(vmulq_f32(nz, tx), nx, tz);
+		const float32x4_t bcz = vfmsq_f32(vmulq_f32(nx, ty), ny, tx);
+		const float32x4_t bl2 = vfmaq_f32(vfmaq_f32(vmulq_f32(bcx, bcx), bcy, bcy), bcz, bcz);
+		const float32x4_t b_inv = vbslq_f32(vcgtq_f32(bl2, zero), vdivq_f32(one, vsqrtq_f32(vbslq_f32(vcgtq_f32(bl2, zero), bl2, one))), zero);
+		const float32x4_t bx = vmulq_f32(bcx, b_inv);
+		const float32x4_t by = vmulq_f32(bcy, b_inv);
+		const float32x4_t bz = vmulq_f32(bcz, b_inv);
+
+		// Off-diagonal skew of TBN rows = [t; b; n].
+		const float32x4_t dx = vsubq_f32(ny, bz); // rows[2][1] - rows[1][2]
+		const float32x4_t dy = vsubq_f32(tz, nx); // rows[0][2] - rows[2][0]
+		const float32x4_t dz = vsubq_f32(bx, ty); // rows[1][0] - rows[0][1]
+		const float32x4_t r01_r10 = vabsq_f32(vsubq_f32(ty, bx));
+		const float32x4_t r02_r20 = vabsq_f32(vsubq_f32(tz, nx));
+		const float32x4_t r12_r21 = vabsq_f32(vsubq_f32(bz, ny));
+		const uint32x4_t sing = vandq_u32(vandq_u32(vcltq_f32(r01_r10, eps), vcltq_f32(r02_r20, eps)), vcltq_f32(r12_r21, eps));
+
+		if (unlikely(vmaxvq_u32(sing) != 0)) {
+			for (uint32_t k = 0; k < 4; k++) {
+				const uint32_t vi = i + k;
+				const Vector3 pv(p_positions[3 * size_t(vi) + 0], p_positions[3 * size_t(vi) + 1], p_positions[3 * size_t(vi) + 2]);
+				const Vector3 nv(p_normals[3 * size_t(vi) + 0], p_normals[3 * size_t(vi) + 1], p_normals[3 * size_t(vi) + 2]);
+				Vector4 tv;
+				if (p_tangents) {
+					tv = Vector4(p_tangents[4 * size_t(vi) + 0], p_tangents[4 * size_t(vi) + 1], p_tangents[4 * size_t(vi) + 2], p_tangents[4 * size_t(vi) + 3]);
+				} else {
+					const Vector3 c = Vector3(nv.z, -nv.x, nv.y).cross(nv.normalized()).normalized();
+					tv = Vector4(c.x, c.y, c.z, 1.0f);
+				}
+				float angle = 0.0f;
+				Vector3 axis;
+				compute_tbn_axis_angle(nv, tv, angle, axis);
+				pack_oct_direction(r_vw + p_nrm_offset + vi * 4, axis.octahedron_encode(), false);
+				const Vector3 rel = (pv - p_aabb_pos) * p_inv_aabb_size;
+				const uint16_t xyza[4] = { pack_unorm16(rel.x), pack_unorm16(rel.y), pack_unorm16(rel.z), pack_unorm16(angle) };
+				std::memcpy(r_vw + p_vtx_offset + vi * 8, xyza, 8);
+			}
+			continue;
+		}
+
+		const float32x4_t s2 = vfmaq_f32(vfmaq_f32(vmulq_f32(dx, dx), dy, dy), dz, dz);
+		const float32x4_t inv_s = vbslq_f32(vcgtq_f32(s2, vdupq_n_f32(CMP_EPSILON * CMP_EPSILON)), vdivq_f32(one, vsqrtq_f32(s2)), one);
+		const float32x4_t ax = vmulq_f32(dx, inv_s);
+		const float32x4_t ay = vmulq_f32(dy, inv_s);
+		const float32x4_t az = vmulq_f32(dz, inv_s);
+
+		// Degree-7 minimax acos(|c|), max error < 2e-7 rad across [-1, 1].
+		const float32x4_t cos_v = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(vaddq_f32(vaddq_f32(tx, by), nz), one), half), neg_one), one);
+		const float32x4_t u = vabsq_f32(cos_v);
+		float32x4_t poly = vdupq_n_f32(-0.0012624911f);
+		poly = vfmaq_f32(vdupq_n_f32(0.0066700901f), poly, u);
+		poly = vfmaq_f32(vdupq_n_f32(-0.0170881256f), poly, u);
+		poly = vfmaq_f32(vdupq_n_f32(0.0308918810f), poly, u);
+		poly = vfmaq_f32(vdupq_n_f32(-0.0501743046f), poly, u);
+		poly = vfmaq_f32(vdupq_n_f32(0.0889789874f), poly, u);
+		poly = vfmaq_f32(vdupq_n_f32(-0.2145988016f), poly, u);
+		poly = vfmaq_f32(vdupq_n_f32(1.5707963050f), poly, u);
+		const float32x4_t acos_u = vmulq_f32(vsqrtq_f32(vmaxq_f32(vsubq_f32(one, u), zero)), poly);
+		const float32x4_t angle = vbslq_f32(vcltq_f32(cos_v, zero), vsubq_f32(pi_v, acos_u), acos_u);
+		const float32x4_t norm_ang = vmulq_f32(angle, inv_pi_v);
+
+		const float32x4_t ang_neg = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(one, norm_ang), half), zero), vdupq_n_f32(0.49999f));
+		const float32x4_t ang_pos = vminq_f32(vmaxq_f32(vaddq_f32(vmulq_f32(norm_ang, half), half), vdupq_n_f32(0.500008f)), one);
+		const float32x4_t r_ang = vbslq_f32(vcltq_f32(tw, zero), ang_neg, ang_pos);
+
+		// Octahedral encode axis -> uint16x2.
+		const float32x4_t scale = vaddq_f32(vaddq_f32(vabsq_f32(ax), vabsq_f32(ay)), vabsq_f32(az));
+		const float32x4_t safe_scale = vbslq_f32(vcgtq_f32(scale, zero), scale, one);
+		const float32x4_t px = vdivq_f32(ax, safe_scale);
+		const float32x4_t py = vdivq_f32(ay, safe_scale);
+		const uint32x4_t above = vcgeq_f32(az, zero);
+		const float32x4_t fold_x = vmulq_f32(vsubq_f32(one, vabsq_f32(py)), vbslq_f32(vcgeq_f32(px, zero), one, neg_one));
+		const float32x4_t fold_y = vmulq_f32(vsubq_f32(one, vabsq_f32(px)), vbslq_f32(vcgeq_f32(py, zero), one, neg_one));
+		const float32x4_t oct_x = vaddq_f32(vmulq_f32(vbslq_f32(above, px, fold_x), half), half);
+		const float32x4_t oct_y = vaddq_f32(vmulq_f32(vbslq_f32(above, py, fold_y), half), half);
+		const uint16x4x2_t oct_u16 = { pack_u16(oct_x), pack_u16(oct_y) };
+		vst2_u16(reinterpret_cast<uint16_t *>(r_vw + p_nrm_offset + i * 4), oct_u16);
+
+		// Relative position + r_angle -> uint16x4.
+		const float32x4_t rx = vmulq_f32(vsubq_f32(pos.val[0], aabb_px), inv_sx);
+		const float32x4_t ry = vmulq_f32(vsubq_f32(pos.val[1], aabb_py), inv_sy);
+		const float32x4_t rz = vmulq_f32(vsubq_f32(pos.val[2], aabb_pz), inv_sz);
+		const uint16x4x4_t xyza_u16 = { pack_u16(rx), pack_u16(ry), pack_u16(rz), pack_u16(r_ang) };
+		vst4_u16(reinterpret_cast<uint16_t *>(r_vw + p_vtx_offset + i * 8), xyza_u16);
+	}
+
+	for (; i < p_end; i++) {
+		const Vector3 pv(p_positions[3 * size_t(i) + 0], p_positions[3 * size_t(i) + 1], p_positions[3 * size_t(i) + 2]);
+		const Vector3 nv(p_normals[3 * size_t(i) + 0], p_normals[3 * size_t(i) + 1], p_normals[3 * size_t(i) + 2]);
+		Vector4 tv;
+		if (p_tangents) {
+			tv = Vector4(p_tangents[4 * size_t(i) + 0], p_tangents[4 * size_t(i) + 1], p_tangents[4 * size_t(i) + 2], p_tangents[4 * size_t(i) + 3]);
+		} else {
+			const Vector3 c = Vector3(nv.z, -nv.x, nv.y).cross(nv.normalized()).normalized();
+			tv = Vector4(c.x, c.y, c.z, 1.0f);
+		}
+		float angle = 0.0f;
+		Vector3 axis;
+		compute_tbn_axis_angle(nv, tv, angle, axis);
+		pack_oct_direction(r_vw + p_nrm_offset + i * 4, axis.octahedron_encode(), false);
+		const Vector3 rel = (pv - p_aabb_pos) * p_inv_aabb_size;
+		const uint16_t xyza[4] = { pack_unorm16(rel.x), pack_unorm16(rel.y), pack_unorm16(rel.z), pack_unorm16(angle) };
+		std::memcpy(r_vw + p_vtx_offset + i * 8, xyza, 8);
+	}
+}
 #endif
 
 struct MikktFastContext {
@@ -598,8 +773,6 @@ Error gltf_build_fast_array_mesh(
 
 	TypedArray<Material> instance_materials;
 	const Vector<Ref<Material>> &state_materials = p_state->get_materials();
-	const bool want_transient_surfaces = p_state->get_additional_data(SNAME("_ange_want_packed_scene")).booleanize();
-	Array transient_surfaces;
 
 	for (uint32_t prim_i = 0; prim_i < p_prims.size(); prim_i++) {
 		const GLTFFastPrimSpec &prim = p_prims[prim_i];
@@ -652,6 +825,8 @@ Error gltf_build_fast_array_mesh(
 		Mesh::PrimitiveType godot_prim = Mesh::PRIMITIVE_TRIANGLES;
 		LocalVector<uint32_t> expanded_indices;
 		bool has_index_buffer = false;
+		bool defer_direct_tri_indices = false;
+		int32_t direct_index_count = 0;
 
 		auto read_raw_index = [&](const FastAccessorView *p_idx_acc, int64_t k) -> uint32_t {
 			return p_idx_acc ? p_idx_acc->read_index(k) : uint32_t(k);
@@ -665,6 +840,11 @@ Error gltf_build_fast_array_mesh(
 			idx_acc_ptr = &idx_acc;
 			raw_topo_count = idx_acc.count;
 		}
+
+		const bool tight_tri_u16 = (prim.mode == 4 && idx_acc_ptr && !idx_acc.is_materialized_u32 && !idx_acc.is_zero && idx_acc.data &&
+				idx_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_SHORT && idx_acc.stride == 2);
+		const bool tight_tri_u32 = (prim.mode == 4 && idx_acc_ptr && !idx_acc.is_materialized_u32 && !idx_acc.is_zero && idx_acc.data &&
+				idx_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_INT && idx_acc.stride == 4);
 
 		switch (prim.mode) {
 			case 0: { // POINTS
@@ -715,18 +895,21 @@ Error gltf_build_fast_array_mesh(
 				godot_prim = Mesh::PRIMITIVE_TRIANGLES;
 				ERR_FAIL_COND_V(raw_topo_count < 3 || (raw_topo_count % 3) != 0, ERR_PARSE_ERROR);
 				has_index_buffer = true;
-				expanded_indices.resize(uint32_t(raw_topo_count));
-				uint32_t *iw = expanded_indices.ptr();
-				if (idx_acc_ptr) {
-					if (!idx_acc.is_materialized_u32 && !idx_acc.is_zero && idx_acc.data) {
-						if (idx_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_SHORT && idx_acc.stride == 2) {
+				if ((tight_tri_u16 || tight_tri_u32) && !p_force_generate_tangents) {
+					defer_direct_tri_indices = true;
+					direct_index_count = int32_t(raw_topo_count);
+				} else {
+					expanded_indices.resize(uint32_t(raw_topo_count));
+					uint32_t *iw = expanded_indices.ptr();
+					if (idx_acc_ptr) {
+						if (tight_tri_u16) {
 							const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
 							for (int64_t k = 0; k < raw_topo_count; k += 3) {
 								iw[k + 0] = src16[k + 0];
 								iw[k + 1] = src16[k + 2];
 								iw[k + 2] = src16[k + 1];
 							}
-						} else if (idx_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_INT && idx_acc.stride == 4) {
+						} else if (tight_tri_u32) {
 							const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
 							for (int64_t k = 0; k < raw_topo_count; k += 3) {
 								iw[k + 0] = src32[k + 0];
@@ -742,16 +925,10 @@ Error gltf_build_fast_array_mesh(
 						}
 					} else {
 						for (int64_t k = 0; k < raw_topo_count; k += 3) {
-							iw[k + 0] = idx_acc.read_index(k + 0);
-							iw[k + 1] = idx_acc.read_index(k + 2);
-							iw[k + 2] = idx_acc.read_index(k + 1);
+							iw[k + 0] = uint32_t(k + 0);
+							iw[k + 1] = uint32_t(k + 2);
+							iw[k + 2] = uint32_t(k + 1);
 						}
-					}
-				} else {
-					for (int64_t k = 0; k < raw_topo_count; k += 3) {
-						iw[k + 0] = uint32_t(k + 0);
-						iw[k + 1] = uint32_t(k + 2);
-						iw[k + 2] = uint32_t(k + 1);
 					}
 				}
 			} break;
@@ -767,12 +944,10 @@ Error gltf_build_fast_array_mesh(
 					const uint32_t i1 = read_raw_index(idx_acc_ptr, t + 1);
 					const uint32_t i2 = read_raw_index(idx_acc_ptr, t + 2);
 					if ((t & 1) == 0) {
-						// Even glTF CCW (i0, i1, i2) -> Godot CW (i0, i2, i1)
 						iw[t * 3 + 0] = i0;
 						iw[t * 3 + 1] = i2;
 						iw[t * 3 + 2] = i1;
 					} else {
-						// Odd glTF CCW (i1, i0, i2) -> Godot CW (i0, i1, i2)
 						iw[t * 3 + 0] = i0;
 						iw[t * 3 + 1] = i1;
 						iw[t * 3 + 2] = i2;
@@ -790,7 +965,6 @@ Error gltf_build_fast_array_mesh(
 				for (int64_t t = 0; t < tri_cnt; t++) {
 					const uint32_t i1 = read_raw_index(idx_acc_ptr, t + 1);
 					const uint32_t i2 = read_raw_index(idx_acc_ptr, t + 2);
-					// glTF CCW (center, i1, i2) -> Godot CW (center, i2, i1)
 					iw[t * 3 + 0] = center;
 					iw[t * 3 + 1] = i2;
 					iw[t * 3 + 2] = i1;
@@ -810,17 +984,45 @@ Error gltf_build_fast_array_mesh(
 			std::memset(used_bits.ptr(), 0, word_count * sizeof(uint64_t));
 
 			int32_t unique_used = 0;
-			const uint32_t idx_cnt = expanded_indices.size();
-			const uint32_t *ir = expanded_indices.ptr();
 			uint64_t *bw = used_bits.ptr();
-			for (uint32_t k = 0; k < idx_cnt; k++) {
-				const uint32_t vi = ir[k];
-				ERR_FAIL_COND_V(vi >= uint32_t(orig_vertex_num), ERR_INVALID_DATA);
-				const uint64_t mask = 1ULL << (vi & 63u);
-				uint64_t &word = bw[vi >> 6];
-				if ((word & mask) == 0) {
-					word |= mask;
-					unique_used++;
+			if (defer_direct_tri_indices) {
+				if (tight_tri_u16) {
+					const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
+					for (int32_t k = 0; k < direct_index_count; k++) {
+						const uint32_t vi = src16[k];
+						ERR_FAIL_COND_V(vi >= uint32_t(orig_vertex_num), ERR_INVALID_DATA);
+						const uint64_t mask = 1ULL << (vi & 63u);
+						uint64_t &word = bw[vi >> 6];
+						if ((word & mask) == 0) {
+							word |= mask;
+							unique_used++;
+						}
+					}
+				} else {
+					const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
+					for (int32_t k = 0; k < direct_index_count; k++) {
+						const uint32_t vi = src32[k];
+						ERR_FAIL_COND_V(vi >= uint32_t(orig_vertex_num), ERR_INVALID_DATA);
+						const uint64_t mask = 1ULL << (vi & 63u);
+						uint64_t &word = bw[vi >> 6];
+						if ((word & mask) == 0) {
+							word |= mask;
+							unique_used++;
+						}
+					}
+				}
+			} else {
+				const uint32_t idx_cnt = expanded_indices.size();
+				const uint32_t *ir = expanded_indices.ptr();
+				for (uint32_t k = 0; k < idx_cnt; k++) {
+					const uint32_t vi = ir[k];
+					ERR_FAIL_COND_V(vi >= uint32_t(orig_vertex_num), ERR_INVALID_DATA);
+					const uint64_t mask = 1ULL << (vi & 63u);
+					uint64_t &word = bw[vi >> 6];
+					if ((word & mask) == 0) {
+						word |= mask;
+						unique_used++;
+					}
 				}
 			}
 			ERR_FAIL_COND_V(unique_used <= 0, ERR_INVALID_DECLARATION);
@@ -839,9 +1041,31 @@ Error gltf_build_fast_array_mesh(
 						out_v++;
 					}
 				}
-				uint32_t *iw = expanded_indices.ptr();
-				for (uint32_t k = 0; k < idx_cnt; k++) {
-					iw[k] = old_to_new[iw[k]];
+				if (defer_direct_tri_indices) {
+					defer_direct_tri_indices = false;
+					expanded_indices.resize(uint32_t(direct_index_count));
+					uint32_t *iw = expanded_indices.ptr();
+					if (tight_tri_u16) {
+						const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
+						for (int32_t k = 0; k < direct_index_count; k += 3) {
+							iw[k + 0] = old_to_new[src16[k + 0]];
+							iw[k + 1] = old_to_new[src16[k + 2]];
+							iw[k + 2] = old_to_new[src16[k + 1]];
+						}
+					} else {
+						const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
+						for (int32_t k = 0; k < direct_index_count; k += 3) {
+							iw[k + 0] = old_to_new[src32[k + 0]];
+							iw[k + 1] = old_to_new[src32[k + 2]];
+							iw[k + 2] = old_to_new[src32[k + 1]];
+						}
+					}
+				} else {
+					const uint32_t idx_cnt = expanded_indices.size();
+					uint32_t *iw = expanded_indices.ptr();
+					for (uint32_t k = 0; k < idx_cnt; k++) {
+						iw[k] = old_to_new[iw[k]];
+					}
 				}
 			}
 		}
@@ -873,22 +1097,45 @@ Error gltf_build_fast_array_mesh(
 		const bool has_weights_1 = has_weights_0 && prim.weights_1 >= 0 && w1_acc.init(p_state.ptr(), prim.weights_1, false) && w1_acc.count >= orig_vertex_num;
 		const bool use_8_bones = has_joints_0 && has_joints_1 && has_weights_0 && has_weights_1;
 
-		// Gather positions into a contiguous array for AABB, optional MikkTSpace, and morph deltas.
-		LocalVector<Vector3> positions;
-		positions.resize(uint32_t(vertex_num));
+		// Zero-copy position span when tight float32 & identity mapping; materialize only otherwise.
+		LocalVector<Vector3> positions_owned;
+		const Vector3 *pos_ptr = nullptr;
 		if (identity_mapping && pos_acc.is_tight_f32(3) && sizeof(Vector3) == 12) {
-			std::memcpy(positions.ptr(), pos_acc.data, size_t(vertex_num) * 12);
+			pos_ptr = reinterpret_cast<const Vector3 *>(pos_acc.data);
 		} else {
+			positions_owned.resize(uint32_t(vertex_num));
 			for (int32_t i = 0; i < vertex_num; i++) {
 				const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
-				positions[uint32_t(i)] = pos_acc.read_vec3(src_v);
+				positions_owned[uint32_t(i)] = pos_acc.read_vec3(src_v);
 			}
+			pos_ptr = positions_owned.ptr();
 		}
 
-		Vector3 aabb_min = positions[0];
-		Vector3 aabb_max = positions[0];
-		for (int32_t i = 1; i < vertex_num; i++) {
-			const Vector3 &p = positions[uint32_t(i)];
+		Vector3 aabb_min = pos_ptr[0];
+		Vector3 aabb_max = pos_ptr[0];
+		int32_t aabb_i = 1;
+#if defined(__aarch64__) || defined(_M_ARM64)
+		if (sizeof(Vector3) == 12 && vertex_num >= 16) {
+			const float *pf = reinterpret_cast<const float *>(pos_ptr);
+			float32x4_t min_x = vdupq_n_f32(aabb_min.x), max_x = min_x;
+			float32x4_t min_y = vdupq_n_f32(aabb_min.y), max_y = min_y;
+			float32x4_t min_z = vdupq_n_f32(aabb_min.z), max_z = min_z;
+			aabb_i = 0;
+			for (; aabb_i + 4 <= vertex_num; aabb_i += 4) {
+				const float32x4x3_t v = vld3q_f32(pf + 3 * size_t(aabb_i));
+				min_x = vminq_f32(min_x, v.val[0]);
+				max_x = vmaxq_f32(max_x, v.val[0]);
+				min_y = vminq_f32(min_y, v.val[1]);
+				max_y = vmaxq_f32(max_y, v.val[1]);
+				min_z = vminq_f32(min_z, v.val[2]);
+				max_z = vmaxq_f32(max_z, v.val[2]);
+			}
+			aabb_min = Vector3(vminvq_f32(min_x), vminvq_f32(min_y), vminvq_f32(min_z));
+			aabb_max = Vector3(vmaxvq_f32(max_x), vmaxvq_f32(max_y), vmaxvq_f32(max_z));
+		}
+#endif
+		for (; aabb_i < vertex_num; aabb_i++) {
+			const Vector3 &p = pos_ptr[uint32_t(aabb_i)];
 			aabb_min = aabb_min.min(p);
 			aabb_max = aabb_max.max(p);
 		}
@@ -901,10 +1148,13 @@ Error gltf_build_fast_array_mesh(
 		LocalVector<Vector3> cached_normals;
 		LocalVector<Vector2> cached_uv0;
 		LocalVector<Vector4> generated_tangents;
-		if (want_mikkt_tangents || (mesh_target_count > 0 && has_normal)) {
+		const Vector3 *norm_ptr_direct = (identity_mapping && has_normal && norm_acc.is_tight_f32(3) && sizeof(Vector3) == 12)
+				? reinterpret_cast<const Vector3 *>(norm_acc.data)
+				: nullptr;
+		if (want_mikkt_tangents || (mesh_target_count > 0 && has_normal && !norm_ptr_direct)) {
 			cached_normals.resize(uint32_t(vertex_num));
-			if (identity_mapping && norm_acc.is_tight_f32(3) && sizeof(Vector3) == 12) {
-				std::memcpy(cached_normals.ptr(), norm_acc.data, size_t(vertex_num) * 12);
+			if (norm_ptr_direct) {
+				std::memcpy(cached_normals.ptr(), norm_ptr_direct, size_t(vertex_num) * 12);
 			} else {
 				for (int32_t i = 0; i < vertex_num; i++) {
 					const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
@@ -923,7 +1173,7 @@ Error gltf_build_fast_array_mesh(
 				generated_tangents[uint32_t(i)] = Vector4(1.0f, 0.0f, 0.0f, 1.0f);
 			}
 			MikktFastContext mctx;
-			mctx.positions = positions.ptr();
+			mctx.positions = pos_ptr;
 			mctx.normals = cached_normals.ptr();
 			mctx.uvs = cached_uv0.ptr();
 			mctx.indices = expanded_indices.ptr();
@@ -953,7 +1203,7 @@ Error gltf_build_fast_array_mesh(
 		if (use_compressed && has_effective_tangent) {
 			for (int32_t i = 0; i < vertex_num; i++) {
 				const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
-				const Vector3 n = cached_normals.is_empty() ? norm_acc.read_vec3(src_v) : cached_normals[uint32_t(i)];
+				const Vector3 n = norm_ptr_direct ? norm_ptr_direct[i] : (cached_normals.is_empty() ? norm_acc.read_vec3(src_v) : cached_normals[uint32_t(i)]);
 				const Vector4 t = !generated_tangents.is_empty() ? generated_tangents[uint32_t(i)] : tan_acc.read_vec4(src_v, 1.0f);
 				if (std::abs(Vector3(t.x, t.y, t.z).dot(n)) > 0.0001f) {
 					use_compressed = false;
@@ -1000,7 +1250,7 @@ Error gltf_build_fast_array_mesh(
 		if (use_8_bones) {
 			format |= RSE::ARRAY_FLAG_USE_8_BONE_WEIGHTS;
 		}
-		const int32_t index_count = has_index_buffer ? int32_t(expanded_indices.size()) : 0;
+		const int32_t index_count = has_index_buffer ? (defer_direct_tri_indices ? direct_index_count : int32_t(expanded_indices.size())) : 0;
 		if (index_count > 0) {
 			format |= RSE::ARRAY_FORMAT_INDEX;
 		}
@@ -1062,18 +1312,108 @@ Error gltf_build_fast_array_mesh(
 		}
 		const bool has_nonzero_uv_scale = !uv_scale.is_zero_approx();
 
-		// Pack vertex + normal + tangent buffers (parallelized across LoadThreadPool <= 3 threads for large meshes).
+		const bool fast_memcpy_uv0 = (attrib_elem_size == 8 && !valid_color && !has_uv1 && custom_channels[0] == 0 &&
+				has_uv0 && !use_compressed && identity_mapping && uv0_acc.is_tight_f32(2));
+		if (fast_memcpy_uv0) {
+			std::memcpy(aw, uv0_acc.data, size_t(vertex_num) * 8);
+		}
+
+		auto pack_attrib_range = [&](uint32_t p_begin, uint32_t p_end) {
+			if (attrib_elem_size == 0 || fast_memcpy_uv0) {
+				return;
+			}
+			for (uint32_t i = p_begin; i < p_end; i++) {
+				const int32_t src_v = identity_mapping ? int32_t(i) : source_vertices[i];
+				uint8_t *dst_a = aw + i * attrib_elem_size;
+				if (valid_color) {
+					const Vector4 c = col_acc.read_vec4(src_v, 1.0f);
+					const uint8_t rgba[4] = {
+						uint8_t(CLAMP(c.x * 255.0f, 0.0f, 255.0f)),
+						uint8_t(CLAMP(c.y * 255.0f, 0.0f, 255.0f)),
+						uint8_t(CLAMP(c.z * 255.0f, 0.0f, 255.0f)),
+						uint8_t(CLAMP(c.w * 255.0f, 0.0f, 255.0f)),
+					};
+					std::memcpy(dst_a + offsets[RSE::ARRAY_COLOR], rgba, 4);
+				}
+				if (has_uv0) {
+					Vector2 uv = cached_uv0.is_empty() ? uv0_acc.read_vec2(src_v) : cached_uv0[i];
+					if (use_compressed) {
+						if (has_nonzero_uv_scale) {
+							uv.x = uv_scale.x > 0.0f ? (uv.x / uv_scale.x + 0.5f) : 0.5f;
+							uv.y = uv_scale.y > 0.0f ? (uv.y / uv_scale.y + 0.5f) : 0.5f;
+						}
+						const uint16_t uv16[2] = { pack_unorm16(uv.x), pack_unorm16(uv.y) };
+						std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV], uv16, 4);
+					} else {
+						const float uvf[2] = { float(uv.x), float(uv.y) };
+						std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV], uvf, 8);
+					}
+				}
+				if (has_uv1) {
+					Vector2 uv2 = uv1_acc.read_vec2(src_v);
+					if (use_compressed) {
+						if (has_nonzero_uv_scale) {
+							uv2.x = uv_scale.z > 0.0f ? (uv2.x / uv_scale.z + 0.5f) : 0.5f;
+							uv2.y = uv_scale.w > 0.0f ? (uv2.y / uv_scale.w + 0.5f) : 0.5f;
+						}
+						const uint16_t uv16[2] = { pack_unorm16(uv2.x), pack_unorm16(uv2.y) };
+						std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV2], uv16, 4);
+					} else {
+						const float uvf[2] = { float(uv2.x), float(uv2.y) };
+						std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV2], uvf, 8);
+					}
+				}
+				for (int ci = 0; ci < 3 && custom_channels[ci] > 0; ci++) {
+					const Vector2 first_uv = has_extra_uv[ci * 2] ? extra_uv_acc[ci * 2].read_vec2(src_v) : Vector2();
+					if (custom_channels[ci] == 2) {
+						const float f2[2] = { float(first_uv.x), float(first_uv.y) };
+						std::memcpy(dst_a + offsets[RSE::ARRAY_CUSTOM0 + ci], f2, 8);
+					} else {
+						const Vector2 second_uv = has_extra_uv[ci * 2 + 1] ? extra_uv_acc[ci * 2 + 1].read_vec2(src_v) : Vector2();
+						const float f4[4] = { float(first_uv.x), float(first_uv.y), float(second_uv.x), float(second_uv.y) };
+						std::memcpy(dst_a + offsets[RSE::ARRAY_CUSTOM0 + ci], f4, 16);
+					}
+				}
+			}
+		};
+
+		// Pack vertex + normal + tangent + attribute buffers (parallelized across LoadThreadPool <= 3 threads).
 		if (use_compressed) {
 			const Vector3 aabb_pos = surface_aabb.position;
 			const Vector3 inv_aabb_size(
 					1.0f / surface_aabb.size.x,
 					1.0f / surface_aabb.size.y,
 					1.0f / surface_aabb.size.z);
+#if defined(__aarch64__) || defined(_M_ARM64)
+			const bool can_neon_compressed = identity_mapping && sizeof(Vector3) == 12 &&
+					norm_ptr_direct != nullptr && vertex_elem_size == 8 && normal_elem_size == 4 &&
+					(!has_effective_tangent || (!generated_tangents.is_empty() && sizeof(Vector4) == 16) || tan_acc.is_tight_f32(4));
+			const float *tan_ptr_neon = !generated_tangents.is_empty()
+					? reinterpret_cast<const float *>(generated_tangents.ptr())
+					: (has_src_tangent ? reinterpret_cast<const float *>(tan_acc.data) : nullptr);
+#endif
 			auto pack_compressed_range = [&](uint32_t p_begin, uint32_t p_end) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+				if (can_neon_compressed) {
+					pack_compressed_tbn_range_neon(
+							vw,
+							offsets[RSE::ARRAY_VERTEX],
+							offsets[RSE::ARRAY_NORMAL],
+							reinterpret_cast<const float *>(pos_ptr),
+							reinterpret_cast<const float *>(norm_ptr_direct),
+							tan_ptr_neon,
+							aabb_pos,
+							inv_aabb_size,
+							p_begin,
+							p_end);
+					pack_attrib_range(p_begin, p_end);
+					return;
+				}
+#endif
 				for (uint32_t i = p_begin; i < p_end; i++) {
 					const int32_t src_v = identity_mapping ? int32_t(i) : source_vertices[i];
-					const Vector3 &p = positions[i];
-					const Vector3 n = cached_normals.is_empty() ? norm_acc.read_vec3(src_v) : cached_normals[i];
+					const Vector3 &p = pos_ptr[i];
+					const Vector3 n = norm_ptr_direct ? norm_ptr_direct[i] : (cached_normals.is_empty() ? norm_acc.read_vec3(src_v) : cached_normals[i]);
 					Vector4 t(0.0f, 0.0f, 0.0f, 1.0f);
 					if (!generated_tangents.is_empty()) {
 						t = generated_tangents[i];
@@ -1097,10 +1437,11 @@ Error gltf_build_fast_array_mesh(
 					};
 					std::memcpy(vw + offsets[RSE::ARRAY_VERTEX] + i * vertex_elem_size, xyza, 8);
 				}
+				pack_attrib_range(p_begin, p_end);
 			};
-			if (vertex_num >= 32768 && LoadThreadPool::get_singleton()) {
+			if (vertex_num >= 16384 && LoadThreadPool::get_singleton()) {
 				const uint32_t chunks = 3;
-				const uint32_t step = (uint32_t(vertex_num) + chunks - 1) / chunks;
+				const uint32_t step = ((uint32_t(vertex_num) + chunks - 1) / chunks + 3u) & ~3u;
 				LoadThreadPool::get_singleton()->parallel_for(chunks, [&](uint32_t c) {
 					const uint32_t b = c * step;
 					const uint32_t e = MIN(b + step, uint32_t(vertex_num));
@@ -1112,231 +1453,288 @@ Error gltf_build_fast_array_mesh(
 				pack_compressed_range(0, uint32_t(vertex_num));
 			}
 		} else {
-			// Uncompressed float3 positions.
+			// Uncompressed float3 positions + normals/tangents + attributes (parallelized for >= 8192 vertices).
 			if (sizeof(Vector3) == 12) {
-				std::memcpy(vw + offsets[RSE::ARRAY_VERTEX], positions.ptr(), size_t(vertex_num) * 12);
+				std::memcpy(vw + offsets[RSE::ARRAY_VERTEX], pos_ptr, size_t(vertex_num) * 12);
 			} else {
 				for (int32_t i = 0; i < vertex_num; i++) {
-					const float xyz[3] = { float(positions[uint32_t(i)].x), float(positions[uint32_t(i)].y), float(positions[uint32_t(i)].z) };
+					const float xyz[3] = { float(pos_ptr[uint32_t(i)].x), float(pos_ptr[uint32_t(i)].y), float(pos_ptr[uint32_t(i)].z) };
 					std::memcpy(vw + offsets[RSE::ARRAY_VERTEX] + uint32_t(i) * vertex_elem_size, xyz, 12);
 				}
 			}
 
-			int32_t dir_start = 0;
+			auto pack_uncompressed_dir_and_attrib_range = [&](uint32_t p_begin, uint32_t p_end) {
+				uint32_t cur = p_begin;
 #if defined(__aarch64__) || defined(_M_ARM64)
-			if (has_normal && has_src_tangent && generated_tangents.is_empty() && identity_mapping &&
-					norm_acc.is_tight_f32(3) && tan_acc.is_tight_f32(4) && normal_elem_size == 8) {
-				dir_start = encode_directions_neon(
-						vw + offsets[RSE::ARRAY_NORMAL],
-						reinterpret_cast<const float *>(norm_acc.data),
-						reinterpret_cast<const float *>(tan_acc.data),
-						vertex_num);
-			}
+				if (has_normal && has_src_tangent && generated_tangents.is_empty() && identity_mapping &&
+						norm_acc.is_tight_f32(3) && tan_acc.is_tight_f32(4) && normal_elem_size == 8) {
+					const int done = encode_directions_neon(
+							vw + offsets[RSE::ARRAY_NORMAL] + cur * 8,
+							reinterpret_cast<const float *>(norm_acc.data) + 3 * size_t(cur),
+							reinterpret_cast<const float *>(tan_acc.data) + 4 * size_t(cur),
+							int(p_end - cur));
+					cur += uint32_t(done);
+				}
 #endif
-			if (has_normal || has_effective_tangent) {
-				for (int32_t i = dir_start; i < vertex_num; i++) {
-					const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
-					Vector3 n(0.0f, 1.0f, 0.0f);
-					if (has_normal) {
-						n = cached_normals.is_empty() ? norm_acc.read_vec3(src_v) : cached_normals[uint32_t(i)];
-						pack_oct_direction(vw + offsets[RSE::ARRAY_NORMAL] + uint32_t(i) * normal_elem_size, n.octahedron_encode(), false);
-					}
-					if (format & RSE::ARRAY_FORMAT_TANGENT) {
-						Vector4 t(1.0f, 0.0f, 0.0f, 1.0f);
-						if (!generated_tangents.is_empty()) {
-							t = generated_tangents[uint32_t(i)];
-						} else if (has_src_tangent) {
-							t = tan_acc.read_vec4(src_v, 1.0f);
-						} else {
-							const Vector3 tv = Vector3(n.z, -n.x, n.y).cross(n.normalized()).normalized();
-							t = Vector4(tv.x, tv.y, tv.z, 1.0f);
+				if (has_normal || has_effective_tangent) {
+					for (uint32_t i = cur; i < p_end; i++) {
+						const int32_t src_v = identity_mapping ? int32_t(i) : source_vertices[i];
+						Vector3 n(0.0f, 1.0f, 0.0f);
+						if (has_normal) {
+							n = norm_ptr_direct ? norm_ptr_direct[i] : (cached_normals.is_empty() ? norm_acc.read_vec3(src_v) : cached_normals[i]);
+							pack_oct_direction(vw + offsets[RSE::ARRAY_NORMAL] + i * normal_elem_size, n.octahedron_encode(), false);
 						}
-						const Vector3 tv(t.x, t.y, t.z);
-						pack_oct_direction(vw + offsets[RSE::ARRAY_TANGENT] + uint32_t(i) * normal_elem_size, tv.octahedron_tangent_encode(t.w), true);
+						if (format & RSE::ARRAY_FORMAT_TANGENT) {
+							Vector4 t(1.0f, 0.0f, 0.0f, 1.0f);
+							if (!generated_tangents.is_empty()) {
+								t = generated_tangents[i];
+							} else if (has_src_tangent) {
+								t = tan_acc.read_vec4(src_v, 1.0f);
+							} else {
+								const Vector3 tv = Vector3(n.z, -n.x, n.y).cross(n.normalized()).normalized();
+								t = Vector4(tv.x, tv.y, tv.z, 1.0f);
+							}
+							const Vector3 tv(t.x, t.y, t.z);
+							pack_oct_direction(vw + offsets[RSE::ARRAY_TANGENT] + i * normal_elem_size, tv.octahedron_tangent_encode(t.w), true);
+						}
 					}
 				}
-			}
-		}
+				pack_attrib_range(p_begin, p_end);
+			};
 
-		// Pack attribute stream (COLOR_0, UV0, UV1, CUSTOM0..2).
-		if (attrib_elem_size > 0) {
-			if (!valid_color && !has_uv1 && custom_channels[0] == 0 && has_uv0 && !use_compressed &&
-					identity_mapping && uv0_acc.is_tight_f32(2) && attrib_elem_size == 8) {
-				std::memcpy(aw, uv0_acc.data, size_t(vertex_num) * 8);
+			if (vertex_num >= 8192 && LoadThreadPool::get_singleton()) {
+				const uint32_t chunks = 3;
+				const uint32_t step = ((uint32_t(vertex_num) + chunks - 1) / chunks + 3u) & ~3u;
+				LoadThreadPool::get_singleton()->parallel_for(chunks, [&](uint32_t c) {
+					const uint32_t b = c * step;
+					const uint32_t e = MIN(b + step, uint32_t(vertex_num));
+					if (b < e) {
+						pack_uncompressed_dir_and_attrib_range(b, e);
+					}
+				});
 			} else {
-				for (int32_t i = 0; i < vertex_num; i++) {
-					const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
-					uint8_t *dst_a = aw + uint32_t(i) * attrib_elem_size;
-					if (valid_color) {
-						const Vector4 c = col_acc.read_vec4(src_v, 1.0f);
-						const uint8_t rgba[4] = {
-							uint8_t(CLAMP(c.x * 255.0f, 0.0f, 255.0f)),
-							uint8_t(CLAMP(c.y * 255.0f, 0.0f, 255.0f)),
-							uint8_t(CLAMP(c.z * 255.0f, 0.0f, 255.0f)),
-							uint8_t(CLAMP(c.w * 255.0f, 0.0f, 255.0f)),
-						};
-						std::memcpy(dst_a + offsets[RSE::ARRAY_COLOR], rgba, 4);
-					}
-					if (has_uv0) {
-						Vector2 uv = cached_uv0.is_empty() ? uv0_acc.read_vec2(src_v) : cached_uv0[uint32_t(i)];
-						if (use_compressed) {
-							if (has_nonzero_uv_scale) {
-								uv.x = uv_scale.x > 0.0f ? (uv.x / uv_scale.x + 0.5f) : 0.5f;
-								uv.y = uv_scale.y > 0.0f ? (uv.y / uv_scale.y + 0.5f) : 0.5f;
-							}
-							const uint16_t uv16[2] = { pack_unorm16(uv.x), pack_unorm16(uv.y) };
-							std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV], uv16, 4);
-						} else {
-							const float uvf[2] = { float(uv.x), float(uv.y) };
-							std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV], uvf, 8);
-						}
-					}
-					if (has_uv1) {
-						Vector2 uv2 = uv1_acc.read_vec2(src_v);
-						if (use_compressed) {
-							if (has_nonzero_uv_scale) {
-								uv2.x = uv_scale.z > 0.0f ? (uv2.x / uv_scale.z + 0.5f) : 0.5f;
-								uv2.y = uv_scale.w > 0.0f ? (uv2.y / uv_scale.w + 0.5f) : 0.5f;
-							}
-							const uint16_t uv16[2] = { pack_unorm16(uv2.x), pack_unorm16(uv2.y) };
-							std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV2], uv16, 4);
-						} else {
-							const float uvf[2] = { float(uv2.x), float(uv2.y) };
-							std::memcpy(dst_a + offsets[RSE::ARRAY_TEX_UV2], uvf, 8);
-						}
-					}
-					for (int ci = 0; ci < 3 && custom_channels[ci] > 0; ci++) {
-						const Vector2 first_uv = has_extra_uv[ci * 2] ? extra_uv_acc[ci * 2].read_vec2(src_v) : Vector2();
-						if (custom_channels[ci] == 2) {
-							const float f2[2] = { float(first_uv.x), float(first_uv.y) };
-							std::memcpy(dst_a + offsets[RSE::ARRAY_CUSTOM0 + ci], f2, 8);
-						} else {
-							const Vector2 second_uv = has_extra_uv[ci * 2 + 1] ? extra_uv_acc[ci * 2 + 1].read_vec2(src_v) : Vector2();
-							const float f4[4] = { float(first_uv.x), float(first_uv.y), float(second_uv.x), float(second_uv.y) };
-							std::memcpy(dst_a + offsets[RSE::ARRAY_CUSTOM0 + ci], f4, 16);
-						}
-					}
-				}
+				pack_uncompressed_dir_and_attrib_range(0, uint32_t(vertex_num));
 			}
 		}
 
-		// Pack skin stream (4 or 8 bone indices & normalized weights) + compute bone AABBs in one pass.
+		// Pack skin stream (4 or 8 bone indices & normalized weights) + compute bone AABBs (parallelized for >= 8192 vertices).
 		Vector<AABB> bone_aabbs;
 		if (skin_elem_size > 0) {
 			const uint32_t bone_cnt = use_8_bones ? 8u : 4u;
-			LocalVector<AABB> bounds;
 			const AABB empty_bone_box(Vector3(), Vector3(-1.0f, -1.0f, -1.0f));
-			if (has_joints_0 && j0_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_BYTE && !use_8_bones) {
-				bounds.resize(256);
-				for (uint32_t b = 0; b < 256; b++) {
-					bounds[b] = empty_bone_box;
+
+			auto pack_skin_slice = [&](uint32_t p_begin, uint32_t p_end, LocalVector<AABB> &r_bounds, int &r_max_bone, bool &r_any_valid) {
+				if (has_joints_0 && j0_acc.comp_type == GLTFAccessor::COMPONENT_TYPE_UNSIGNED_BYTE && !use_8_bones) {
+					r_bounds.resize(256);
+					for (uint32_t b = 0; b < 256; b++) {
+						r_bounds[b] = empty_bone_box;
+					}
 				}
-			}
-			int max_bone = -1;
-			bool any_valid_bone_weight = false;
+				r_max_bone = -1;
+				r_any_valid = false;
+				for (uint32_t i = p_begin; i < p_end; i++) {
+					const int32_t src_v = identity_mapping ? int32_t(i) : source_vertices[i];
+					uint8_t *dst_s = sw + i * skin_elem_size;
 
-			for (int32_t i = 0; i < vertex_num; i++) {
-				const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
-				uint8_t *dst_s = sw + uint32_t(i) * skin_elem_size;
-
-				uint16_t joints16[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-				if (has_joints_0) {
-					j0_acc.read_joints4(src_v, joints16);
-					if (use_8_bones) {
-						j1_acc.read_joints4(src_v, joints16 + 4);
-					}
-					for (uint32_t b = 0; b < bone_cnt; b++) {
-						if (int(joints16[b]) > max_bone) {
-							max_bone = int(joints16[b]);
-						}
-					}
-					std::memcpy(dst_s + offsets[RSE::ARRAY_BONES], joints16, bone_cnt * sizeof(uint16_t));
-				}
-
-				float wf[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-				if (has_weights_0) {
-					const Vector4 w0 = w0_acc.read_vec4(src_v, 0.0f);
-					wf[0] = w0.x;
-					wf[1] = w0.y;
-					wf[2] = w0.z;
-					wf[3] = w0.w;
-					if (use_8_bones) {
-						const Vector4 w1 = w1_acc.read_vec4(src_v, 0.0f);
-						wf[4] = w1.x;
-						wf[5] = w1.y;
-						wf[6] = w1.z;
-						wf[7] = w1.w;
-					}
-					float total = 0.0f;
-					for (uint32_t b = 0; b < bone_cnt; b++) {
-						total += wf[b];
-					}
-					uint16_t weights16[8];
-#if defined(__aarch64__) || defined(_M_ARM64)
-					if (!use_8_bones) {
-						float32x4_t wvec = vld1q_f32(wf);
-						if (total > 0.0f && total != 1.0f) {
-							wvec = vdivq_f32(wvec, vdupq_n_f32(total));
-							vst1q_f32(wf, wvec);
-						}
-						const float32x4_t clamped = vminq_f32(vmaxq_f32(wvec, vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f));
-						vst1_u16(weights16, vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(clamped, 65535.0f))));
-					} else
-#endif
-					{
-						if (total > 0.0f) {
-							const float inv_total = 1.0f / total;
-							for (uint32_t b = 0; b < bone_cnt; b++) {
-								wf[b] *= inv_total;
-							}
+					uint16_t joints16[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+					if (has_joints_0) {
+						j0_acc.read_joints4(src_v, joints16);
+						if (use_8_bones) {
+							j1_acc.read_joints4(src_v, joints16 + 4);
 						}
 						for (uint32_t b = 0; b < bone_cnt; b++) {
-							weights16[b] = pack_unorm16(wf[b]);
+							if (int(joints16[b]) > r_max_bone) {
+								r_max_bone = int(joints16[b]);
+							}
 						}
+						std::memcpy(dst_s + offsets[RSE::ARRAY_BONES], joints16, bone_cnt * sizeof(uint16_t));
 					}
-					std::memcpy(dst_s + offsets[RSE::ARRAY_WEIGHTS], weights16, bone_cnt * sizeof(uint16_t));
-				}
 
-				if (has_joints_0 && has_weights_0) {
-					if (max_bone >= int(bounds.size())) {
-						const uint32_t old_sz = bounds.size();
-						bounds.resize(uint32_t(max_bone + 1));
-						for (uint32_t b = old_sz; b < bounds.size(); b++) {
-							bounds[b] = empty_bone_box;
+					float wf[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+					if (has_weights_0) {
+						const Vector4 w0 = w0_acc.read_vec4(src_v, 0.0f);
+						wf[0] = w0.x;
+						wf[1] = w0.y;
+						wf[2] = w0.z;
+						wf[3] = w0.w;
+						if (use_8_bones) {
+							const Vector4 w1 = w1_acc.read_vec4(src_v, 0.0f);
+							wf[4] = w1.x;
+							wf[5] = w1.y;
+							wf[6] = w1.z;
+							wf[7] = w1.w;
 						}
+						float total = 0.0f;
+						for (uint32_t b = 0; b < bone_cnt; b++) {
+							total += wf[b];
+						}
+						uint16_t weights16[8];
+#if defined(__aarch64__) || defined(_M_ARM64)
+						if (!use_8_bones) {
+							float32x4_t wvec = vld1q_f32(wf);
+							if (total > 0.0f && total != 1.0f) {
+								wvec = vdivq_f32(wvec, vdupq_n_f32(total));
+								vst1q_f32(wf, wvec);
+							}
+							const float32x4_t clamped = vminq_f32(vmaxq_f32(wvec, vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f));
+							vst1_u16(weights16, vqmovn_u32(vcvtq_u32_f32(vmulq_n_f32(clamped, 65535.0f))));
+						} else
+#endif
+						{
+							if (total > 0.0f) {
+								const float inv_total = 1.0f / total;
+								for (uint32_t b = 0; b < bone_cnt; b++) {
+									wf[b] *= inv_total;
+								}
+							}
+							for (uint32_t b = 0; b < bone_cnt; b++) {
+								weights16[b] = pack_unorm16(wf[b]);
+							}
+						}
+						std::memcpy(dst_s + offsets[RSE::ARRAY_WEIGHTS], weights16, bone_cnt * sizeof(uint16_t));
 					}
-					const Vector3 &p = positions[uint32_t(i)];
-					for (uint32_t b = 0; b < bone_cnt; b++) {
-						if (wf[b] > 0.0f) {
-							AABB &box = bounds[joints16[b]];
-							if (box.size.x < 0.0f) {
-								box = AABB(p, small_vec3);
-								any_valid_bone_weight = true;
-							} else {
-								box.expand_to(p);
+
+					if (has_joints_0 && has_weights_0) {
+						if (r_max_bone >= int(r_bounds.size())) {
+							const uint32_t old_sz = r_bounds.size();
+							r_bounds.resize(uint32_t(r_max_bone + 1));
+							for (uint32_t b = old_sz; b < r_bounds.size(); b++) {
+								r_bounds[b] = empty_bone_box;
+							}
+						}
+						const Vector3 &p = pos_ptr[i];
+						for (uint32_t b = 0; b < bone_cnt; b++) {
+							if (wf[b] > 0.0f) {
+								AABB &box = r_bounds[joints16[b]];
+								if (box.size.x < 0.0f) {
+									box = AABB(p, small_vec3);
+									r_any_valid = true;
+								} else {
+									box.expand_to(p);
+								}
 							}
 						}
 					}
 				}
-			}
+			};
 
-			if (has_joints_0 && any_valid_bone_weight && max_bone >= 0) {
-				bone_aabbs.resize(max_bone + 1);
-				std::memcpy(bone_aabbs.ptrw(), bounds.ptr(), size_t(max_bone + 1) * sizeof(AABB));
+			if (vertex_num >= 8192 && LoadThreadPool::get_singleton()) {
+				constexpr uint32_t kSkinChunks = 3;
+				LocalVector<AABB> chunk_bounds[kSkinChunks];
+				int chunk_max[kSkinChunks] = { -1, -1, -1 };
+				bool chunk_valid[kSkinChunks] = { false, false, false };
+				const uint32_t step = (uint32_t(vertex_num) + kSkinChunks - 1) / kSkinChunks;
+				LoadThreadPool::get_singleton()->parallel_for(kSkinChunks, [&](uint32_t c) {
+					const uint32_t b = c * step;
+					const uint32_t e = MIN(b + step, uint32_t(vertex_num));
+					if (b < e) {
+						pack_skin_slice(b, e, chunk_bounds[c], chunk_max[c], chunk_valid[c]);
+					}
+				});
+				int max_bone = -1;
+				bool any_valid = false;
+				for (uint32_t c = 0; c < kSkinChunks; c++) {
+					if (chunk_max[c] > max_bone) {
+						max_bone = chunk_max[c];
+					}
+					any_valid = any_valid || chunk_valid[c];
+				}
+				if (has_joints_0 && any_valid && max_bone >= 0) {
+					bone_aabbs.resize(max_bone + 1);
+					AABB *dst_b = bone_aabbs.ptrw();
+					for (int b = 0; b <= max_bone; b++) {
+						dst_b[b] = empty_bone_box;
+					}
+					for (uint32_t c = 0; c < kSkinChunks; c++) {
+						const int lim = MIN(max_bone + 1, int(chunk_bounds[c].size()));
+						for (int b = 0; b < lim; b++) {
+							const AABB &sb = chunk_bounds[c][uint32_t(b)];
+							if (sb.size.x >= 0.0f) {
+								if (dst_b[b].size.x < 0.0f) {
+									dst_b[b] = sb;
+								} else {
+									dst_b[b].merge_with(sb);
+								}
+							}
+						}
+					}
+				}
+			} else {
+				LocalVector<AABB> bounds;
+				int max_bone = -1;
+				bool any_valid = false;
+				pack_skin_slice(0, uint32_t(vertex_num), bounds, max_bone, any_valid);
+				if (has_joints_0 && any_valid && max_bone >= 0) {
+					bone_aabbs.resize(max_bone + 1);
+					std::memcpy(bone_aabbs.ptrw(), bounds.ptr(), size_t(max_bone + 1) * sizeof(AABB));
+				}
 			}
 		}
 
 		// Pack index buffer (16-bit when vertex_num <= 65536, else 32-bit).
 		if (index_count > 0) {
 			uint8_t *iw = index_array.ptrw();
-			const uint32_t *src_idx = expanded_indices.ptr();
-			if (vertex_num <= 65536) {
-				uint16_t *dst16 = reinterpret_cast<uint16_t *>(iw);
-				for (int32_t k = 0; k < index_count; k++) {
-					dst16[k] = uint16_t(src_idx[uint32_t(k)]);
+			if (defer_direct_tri_indices) {
+				auto write_direct_tris = [&](int32_t k_begin, int32_t k_end) {
+					if (vertex_num <= 65536) {
+						uint16_t *dst16 = reinterpret_cast<uint16_t *>(iw);
+						if (tight_tri_u16) {
+							const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
+							for (int32_t k = k_begin; k < k_end; k += 3) {
+								dst16[k + 0] = src16[k + 0];
+								dst16[k + 1] = src16[k + 2];
+								dst16[k + 2] = src16[k + 1];
+							}
+						} else {
+							const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
+							for (int32_t k = k_begin; k < k_end; k += 3) {
+								dst16[k + 0] = uint16_t(src32[k + 0]);
+								dst16[k + 1] = uint16_t(src32[k + 2]);
+								dst16[k + 2] = uint16_t(src32[k + 1]);
+							}
+						}
+					} else {
+						uint32_t *dst32 = reinterpret_cast<uint32_t *>(iw);
+						if (tight_tri_u32) {
+							const uint32_t *src32 = reinterpret_cast<const uint32_t *>(idx_acc.data);
+							for (int32_t k = k_begin; k < k_end; k += 3) {
+								dst32[k + 0] = src32[k + 0];
+								dst32[k + 1] = src32[k + 2];
+								dst32[k + 2] = src32[k + 1];
+							}
+						} else {
+							const uint16_t *src16 = reinterpret_cast<const uint16_t *>(idx_acc.data);
+							for (int32_t k = k_begin; k < k_end; k += 3) {
+								dst32[k + 0] = src16[k + 0];
+								dst32[k + 1] = src16[k + 2];
+								dst32[k + 2] = src16[k + 1];
+							}
+						}
+					}
+				};
+				if (index_count >= 98304 && LoadThreadPool::get_singleton()) {
+					const int32_t tri_total = index_count / 3;
+					const int32_t tri_step = (tri_total + 2) / 3;
+					LoadThreadPool::get_singleton()->parallel_for(3, [&](uint32_t c) {
+						const int32_t tb = int32_t(c) * tri_step;
+						const int32_t te = MIN(tb + tri_step, tri_total);
+						if (tb < te) {
+							write_direct_tris(tb * 3, te * 3);
+						}
+					});
+				} else {
+					write_direct_tris(0, index_count);
 				}
 			} else {
-				std::memcpy(iw, src_idx, size_t(index_count) * sizeof(uint32_t));
+				const uint32_t *src_idx = expanded_indices.ptr();
+				if (vertex_num <= 65536) {
+					uint16_t *dst16 = reinterpret_cast<uint16_t *>(iw);
+					for (int32_t k = 0; k < index_count; k++) {
+						dst16[k] = uint16_t(src_idx[uint32_t(k)]);
+					}
+				} else {
+					std::memcpy(iw, src_idx, size_t(index_count) * sizeof(uint32_t));
+				}
 			}
 		}
 
@@ -1362,7 +1760,7 @@ Error gltf_build_fast_array_mesh(
 					Vector3 m_min, m_max;
 					for (int32_t i = 0; i < vertex_num; i++) {
 						const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
-						Vector3 mp = positions[uint32_t(i)];
+						Vector3 mp = pos_ptr[uint32_t(i)];
 						if (src_v < m_pos.count) {
 							mp += m_pos.read_vec3(src_v);
 						}
@@ -1390,7 +1788,7 @@ Error gltf_build_fast_array_mesh(
 							const int32_t src_v = identity_mapping ? i : source_vertices[uint32_t(i)];
 							Vector3 mn(0.0f, 1.0f, 0.0f);
 							if (format & RSE::ARRAY_FORMAT_NORMAL) {
-								mn = cached_normals[uint32_t(i)];
+								mn = norm_ptr_direct ? norm_ptr_direct[i] : cached_normals[uint32_t(i)];
 								if (has_m_norm && src_v < m_norm.count) {
 									mn += m_norm.read_vec3(src_v);
 								}
@@ -1418,38 +1816,6 @@ Error gltf_build_fast_array_mesh(
 			}
 		}
 
-		if (want_transient_surfaces) {
-			Dictionary sdata;
-			sdata["format"] = format;
-			sdata["primitive"] = godot_prim;
-			sdata["vertex_data"] = vertex_array;
-			sdata["vertex_count"] = vertex_num;
-			if (!skin_array.is_empty()) {
-				sdata["skin_data"] = skin_array;
-			}
-			if (!attrib_array.is_empty()) {
-				sdata["attribute_data"] = attrib_array;
-			}
-			sdata["aabb"] = surface_aabb;
-			sdata["uv_scale"] = uv_scale;
-			if (index_count > 0) {
-				sdata["index_data"] = index_array;
-				sdata["index_count"] = index_count;
-			}
-			if (!bone_aabbs.is_empty()) {
-				Array ba;
-				ba.resize(bone_aabbs.size());
-				for (int bi = 0; bi < bone_aabbs.size(); bi++) {
-					ba[bi] = bone_aabbs[bi];
-				}
-				sdata["bone_aabbs"] = ba;
-			}
-			if (!blend_shape_data.is_empty()) {
-				sdata["blend_shapes"] = blend_shape_data;
-			}
-			transient_surfaces.push_back(sdata);
-		}
-
 		const int surf_idx = array_mesh->get_surface_count();
 		array_mesh->add_surface(
 				format,
@@ -1471,10 +1837,6 @@ Error gltf_build_fast_array_mesh(
 		if (mat.is_valid()) {
 			array_mesh->surface_set_material(surf_idx, mat);
 		}
-	}
-
-	if (want_transient_surfaces && !transient_surfaces.is_empty()) {
-		array_mesh->set_meta(SNAME("_ange_transient_surfaces"), transient_surfaces);
 	}
 
 	Vector<float> blend_weights;

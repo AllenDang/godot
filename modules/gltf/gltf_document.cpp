@@ -42,6 +42,7 @@
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/crypto/crypto_core.h"
+#include "core/io/compression.h"
 #include "core/io/config_file.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
@@ -304,6 +305,23 @@ Error GLTFDocument::_parse_glb(Ref<FileAccess> p_file, Ref<GLTFState> p_state) {
 
 	if (p_file->eof_reached()) {
 		return OK; //all good
+	}
+
+	if (chunk_type == 0x4454535Au) { // ZSTD lossless supercompressed BIN chunk: [u64 uncomp_len][u64 comp_len][zstd_frame][pad]
+		ERR_FAIL_COND_V(chunk_length < 16, ERR_FILE_CORRUPT);
+		Vector<uint8_t> comp_buf;
+		comp_buf.resize(chunk_length);
+		len = p_file->get_buffer(comp_buf.ptrw(), chunk_length);
+		ERR_FAIL_COND_V(len != chunk_length, ERR_FILE_CORRUPT);
+		const uint64_t uncomp_len = decode_uint64(comp_buf.ptr());
+		const uint64_t comp_len = decode_uint64(comp_buf.ptr() + 8);
+		ERR_FAIL_COND_V(uncomp_len > (1ULL << 30) || comp_len > uint64_t(chunk_length - 16), ERR_FILE_CORRUPT);
+		p_state->glb_data.resize(int64_t(uncomp_len));
+		if (uncomp_len > 0) {
+			const int64_t dec = Compression::decompress(p_state->glb_data.ptrw(), int64_t(uncomp_len), comp_buf.ptr() + 16, int64_t(comp_len), Compression::MODE_ZSTD);
+			ERR_FAIL_COND_V(dec != int64_t(uncomp_len), ERR_FILE_CORRUPT);
+		}
+		return OK;
 	}
 
 	ERR_FAIL_COND_V(chunk_type != 0x004E4942, ERR_PARSE_ERROR); //BIN
@@ -4303,7 +4321,12 @@ Node3D *GLTFDocument::_generate_mesh_instance(Ref<GLTFState> p_state, const GLTF
 		runtime_mesh->merge_meta_from(*mesh);
 		mi->set_mesh(runtime_mesh);
 		Vector<float> weights = mesh->get_blend_weights();
-		if (gltf_node->has_additional_data(SNAME("_gltf_node_weights"))) {
+		if (!gltf_node->node_weights.is_empty()) {
+			const Vector<float> &nw = gltf_node->node_weights;
+			for (int w = 0; w < MIN(nw.size(), weights.size()); w++) {
+				weights.write[w] = nw[w];
+			}
+		} else if (gltf_node->has_additional_data(SNAME("_gltf_node_weights"))) {
 			Vector<float> nw = gltf_node->get_additional_data(SNAME("_gltf_node_weights"));
 			for (int w = 0; w < MIN(nw.size(), weights.size()); w++) {
 				weights.write[w] = nw[w];
@@ -7576,9 +7599,25 @@ Error GLTFDocument::_parse_from_raw_bytes(
 		if (bin_hdr_off + 8 <= p_size) {
 			const uint32_t chunk1_len = decode_uint32(p_bytes + bin_hdr_off);
 			const uint32_t chunk1_type = decode_uint32(p_bytes + bin_hdr_off + 4);
-			ERR_FAIL_COND_V(chunk1_type != 0x004E4942u, ERR_PARSE_ERROR); // BIN\0
 			ERR_FAIL_COND_V(bin_hdr_off + 8 + int64_t(chunk1_len) > p_size, ERR_FILE_CORRUPT);
-			p_state->set_zero_copy_glb_span(p_bytes + bin_hdr_off + 8, int64_t(chunk1_len), p_mmap, p_backing);
+			if (chunk1_type == 0x004E4942u) { // BIN\0
+				p_state->set_zero_copy_glb_span(p_bytes + bin_hdr_off + 8, int64_t(chunk1_len), p_mmap, p_backing);
+			} else if (chunk1_type == 0x4454535Au) { // ZSTD lossless supercompressed BIN chunk: [u64 uncomp_len][u64 comp_len][zstd_frame][pad]
+				ERR_FAIL_COND_V(chunk1_len < 16, ERR_FILE_CORRUPT);
+				const uint8_t *zsrc = p_bytes + bin_hdr_off + 8;
+				const uint64_t uncomp_len = decode_uint64(zsrc);
+				const uint64_t comp_len = decode_uint64(zsrc + 8);
+				ERR_FAIL_COND_V(uncomp_len > (1ULL << 30) || comp_len > uint64_t(chunk1_len - 16), ERR_FILE_CORRUPT);
+				PackedByteArray decomp;
+				ERR_FAIL_COND_V(decomp.resize(int64_t(uncomp_len)) != OK, ERR_OUT_OF_MEMORY);
+				if (uncomp_len > 0) {
+					const int64_t dec = Compression::decompress(decomp.ptrw(), int64_t(uncomp_len), zsrc + 16, int64_t(comp_len), Compression::MODE_ZSTD);
+					ERR_FAIL_COND_V(dec != int64_t(uncomp_len), ERR_FILE_CORRUPT);
+				}
+				p_state->set_zero_copy_glb_span(decomp.ptr(), int64_t(uncomp_len), nullptr, decomp);
+			} else {
+				ERR_FAIL_V(ERR_PARSE_ERROR);
+			}
 		} else {
 			p_state->set_zero_copy_glb_span(nullptr, 0);
 		}
@@ -7725,16 +7764,29 @@ GLTFDocument::VisibilityMode GLTFDocument::get_visibility_mode() const {
 }
 
 String GLTFDocument::_gen_unique_name_static(HashSet<String> &r_unique_names, const String &p_name) {
-	const String s_name = p_name.validate_node_name();
+	bool needs_sanitize = p_name.is_empty();
+	if (!needs_sanitize) {
+		const char32_t *cp = p_name.get_data();
+		const int len = p_name.length();
+		for (int i = 0; i < len; i++) {
+			const char32_t c = cp[i];
+			if (c == '.' || c == ':' || c == '@' || c == '/' || c == '"' || c == '%' || c < 0x20 || c == 0x7F) {
+				needs_sanitize = true;
+				break;
+			}
+		}
+	}
+	const String s_name = needs_sanitize ? p_name.validate_node_name() : p_name;
+
+	if (!r_unique_names.has(s_name)) {
+		r_unique_names.insert(s_name);
+		return s_name;
+	}
 
 	String u_name;
-	int index = 1;
+	int index = 2;
 	while (true) {
-		u_name = s_name;
-
-		if (index > 1) {
-			u_name += itos(index);
-		}
+		u_name = s_name + itos(index);
 		if (!r_unique_names.has(u_name)) {
 			break;
 		}

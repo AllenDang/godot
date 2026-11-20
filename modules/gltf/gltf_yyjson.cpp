@@ -668,7 +668,15 @@ bool fast_decode_accessor_quat(const Ref<GLTFState> &p_state, int p_acc_idx, Vec
 					for (int64_t i = 0; i < cnt; i++) {
 						float f[4];
 						std::memcpy(f, vptr + off + i * stride, 16);
-						dst[i] = Quaternion(f[0], f[1], f[2], f[3]).normalized();
+						const float l2 = f[0] * f[0] + f[1] * f[1] + f[2] * f[2] + f[3] * f[3];
+						if (std::abs(l2 - 1.0f) <= 1e-5f) {
+							dst[i] = Quaternion(f[0], f[1], f[2], f[3]);
+						} else if (l2 > 0.0f) {
+							const float inv_l = 1.0f / std::sqrt(l2);
+							dst[i] = Quaternion(f[0] * inv_l, f[1] * inv_l, f[2] * inv_l, f[3] * inv_l);
+						} else {
+							dst[i] = Quaternion();
+						}
 					}
 					return true;
 				}
@@ -1078,11 +1086,11 @@ Error gltf_yyjson_populate_state(
 					GLTFFastAccess::node_xform(node.ptr()) = xf;
 				}
 			}
-			node->set_additional_data(SNAME("GODOT_rest_transform"), GLTFFastAccess::node_xform(node.ptr()));
+			GLTFFastAccess::set_node_rest_xform(node.ptr(), GLTFFastAccess::node_xform(node.ptr()));
 
 			if (yyjson_val *w_arr = yyjson_obj_get(nobj, "weights")) {
 				if (yyjson_is_arr(w_arr) && yyjson_arr_size(w_arr) > 0) {
-					Vector<float> nw;
+					Vector<float> &nw = GLTFFastAccess::node_weights(node.ptr());
 					nw.resize(int(yyjson_arr_size(w_arr)));
 					yyjson_arr_iter wit = yyjson_arr_iter_with(w_arr);
 					int wi = 0;
@@ -1090,7 +1098,6 @@ Error gltf_yyjson_populate_state(
 					while ((wv = yyjson_arr_iter_next(&wit)) != nullptr) {
 						nw.write[wi++] = float(yj_num(wv, 0.0));
 					}
-					node->set_additional_data(SNAME("_gltf_node_weights"), nw);
 				}
 			}
 
@@ -1740,6 +1747,9 @@ Error gltf_yyjson_populate_state(
 		ERR_FAIL_COND_V(SkinTool::_determine_skeletons(state_skins, state_nodes, state_skeletons, rnodes, true) != OK, ERR_PARSE_ERROR);
 	} else {
 		ERR_FAIL_COND_V(SkinTool::_determine_skeletons(state_skins, state_nodes, state_skeletons, Vector<GLTFNodeIndex>(), p_doc->get_naming_version() < 2) != OK, ERR_PARSE_ERROR);
+	}
+	if (state_nodes.size() > 16) {
+		GLTFFastAccess::unique_names(p_state.ptr()).reserve(uint32_t(state_nodes.size() + 16));
 	}
 	GLTFFastAccess::assign_node_names(p_doc, p_state);
 
