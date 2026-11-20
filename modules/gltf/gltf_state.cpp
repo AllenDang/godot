@@ -32,7 +32,9 @@
 #include "gltf_state.compat.inc"
 
 #include "gltf_template_convert.h"
+#include "gltf_yyjson.h"
 
+#include "core/io/file_access_mmap.h"
 #include "core/object/class_db.h"
 
 void GLTFState::_bind_methods() {
@@ -167,11 +169,65 @@ void GLTFState::add_used_extension(const String &p_extension_name, bool p_requir
 }
 
 Dictionary GLTFState::get_json() const {
+	if (!json_materialized) {
+		json_materialized = true;
+		if (!raw_json_utf8.is_empty()) {
+			Variant v = gltf_yyjson_parse_to_variant(reinterpret_cast<const char *>(raw_json_utf8.ptr()), raw_json_utf8.size());
+			if (v.get_type() == Variant::DICTIONARY) {
+				json = v;
+			}
+		}
+	}
 	return Dictionary(json);
 }
 
 void GLTFState::set_json(const Dictionary &p_json) {
 	json = Dictionary(p_json);
+	raw_json_utf8.clear();
+	json_materialized = true;
+}
+
+void GLTFState::set_lazy_json_utf8(const uint8_t *p_ptr, size_t p_len) {
+	json.clear();
+	raw_json_utf8.resize(static_cast<int64_t>(p_len));
+	if (p_len > 0 && p_ptr) {
+		memcpy(raw_json_utf8.ptrw(), p_ptr, p_len);
+	}
+	json_materialized = false;
+}
+
+void GLTFState::set_zero_copy_glb_span(const uint8_t *p_ptr, int64_t p_len, std::shared_ptr<FileAccessMMapView> p_mmap, const PackedByteArray &p_backing) {
+	mmap_view = std::move(p_mmap);
+	glb_backing_bytes = p_backing;
+	glb_bin_ptr = p_ptr;
+	glb_bin_len = p_len;
+	glb_data.clear();
+}
+
+bool GLTFState::get_raw_buffer_span(GLTFBufferIndex p_index, const uint8_t *&r_ptr, int64_t &r_len) const {
+	r_ptr = nullptr;
+	r_len = 0;
+	if (p_index == 0 && buffer0_uses_glb_span && glb_bin_ptr != nullptr) {
+		r_ptr = glb_bin_ptr;
+		r_len = glb_bin_len;
+		return true;
+	}
+	if (p_index < 0 || p_index >= buffers.size()) {
+		return false;
+	}
+	r_ptr = buffers[p_index].ptr();
+	r_len = buffers[p_index].size();
+	return true;
+}
+
+const Vector<PackedByteArray> &GLTFState::get_buffers() const {
+	if (buffer0_uses_glb_span && buffers.size() > 0 && buffers[0].is_empty() && glb_bin_ptr != nullptr && glb_bin_len > 0) {
+		PackedByteArray b0;
+		b0.resize(glb_bin_len);
+		memcpy(b0.ptrw(), glb_bin_ptr, static_cast<size_t>(glb_bin_len));
+		buffers.write[0] = b0;
+	}
+	return buffers;
 }
 
 int GLTFState::get_major_version() const {
@@ -199,11 +255,17 @@ void GLTFState::set_copyright(const String &p_copyright) {
 }
 
 Vector<uint8_t> GLTFState::get_glb_data() const {
+	if (glb_data.is_empty() && glb_bin_ptr != nullptr && glb_bin_len > 0) {
+		glb_data.resize(glb_bin_len);
+		memcpy(glb_data.ptrw(), glb_bin_ptr, static_cast<size_t>(glb_bin_len));
+	}
 	return Vector<uint8_t>(glb_data);
 }
 
 void GLTFState::set_glb_data(const Vector<uint8_t> &p_glb_data) {
 	glb_data = Vector<uint8_t>(p_glb_data);
+	glb_bin_ptr = glb_data.ptr();
+	glb_bin_len = glb_data.size();
 }
 
 bool GLTFState::get_use_named_skin_binds() const {
@@ -223,7 +285,7 @@ void GLTFState::set_nodes_bind(const TypedArray<GLTFNode> &p_nodes) {
 }
 
 TypedArray<PackedByteArray> GLTFState::get_buffers_bind() const {
-	return GLTFTemplateConvert::to_array(buffers);
+	return GLTFTemplateConvert::to_array(get_buffers());
 }
 
 void GLTFState::set_buffers_bind(const TypedArray<PackedByteArray> &p_buffers) {

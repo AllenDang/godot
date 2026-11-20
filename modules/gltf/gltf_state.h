@@ -44,12 +44,18 @@
 #include "structures/gltf_texture_sampler.h"
 
 #include "scene/3d/importer_mesh_instance_3d.h"
+#include "scene/3d/mesh_instance_3d.h"
 #include "scene/animation/animation_player.h"
+
+#include <memory>
+
+class FileAccessMMapView;
 
 class GLTFState : public Resource {
 	GDCLASS(GLTFState, Resource);
 	friend class GLTFDocument;
 	friend class GLTFNode;
+	friend struct GLTFFastAccess;
 
 public:
 	enum HandleBinaryImageMode {
@@ -59,16 +65,35 @@ public:
 		HANDLE_BINARY_IMAGE_MODE_EMBED_AS_UNCOMPRESSED, // If this value changes from 3, ResourceImporterScene::pre_import must be changed as well.
 	};
 
+	// Contiguous POD node record for zero-Resource-allocation direct SceneState building (e.g. nodes_10000).
+	struct FastNodeRec {
+		StringName name;
+		Transform3D xform;
+		int32_t parent = -1;
+		uint32_t first_child = 0;
+		uint32_t child_count = 0;
+		int32_t mesh = -1;
+		bool has_non_identity_xform = false;
+		bool visible = true;
+	};
+
 protected:
 	String base_path;
 	String extract_path;
 	String extract_prefix;
 	String filename;
-	Dictionary json;
+	mutable Dictionary json;
+	mutable Vector<uint8_t> raw_json_utf8;
+	mutable bool json_materialized = true;
 	int major_version = 0;
 	int minor_version = 0;
 	String copyright;
-	Vector<uint8_t> glb_data;
+	mutable Vector<uint8_t> glb_data;
+	std::shared_ptr<FileAccessMMapView> mmap_view;
+	PackedByteArray glb_backing_bytes;
+	const uint8_t *glb_bin_ptr = nullptr;
+	int64_t glb_bin_len = 0;
+	bool buffer0_uses_glb_span = false;
 	double bake_fps = 30.0;
 
 	bool use_named_skin_binds = false;
@@ -82,7 +107,9 @@ protected:
 	HandleBinaryImageMode handle_binary_image_mode = HANDLE_BINARY_IMAGE_MODE_EXTRACT_TEXTURES;
 
 	Vector<Ref<GLTFNode>> nodes;
-	Vector<Vector<uint8_t>> buffers;
+	LocalVector<FastNodeRec> fast_nodes;
+	LocalVector<int32_t> fast_children_pool;
+	mutable Vector<Vector<uint8_t>> buffers;
 	Vector<Ref<GLTFBufferView>> buffer_views;
 	Vector<Ref<GLTFAccessor>> accessors;
 
@@ -112,6 +139,7 @@ protected:
 	Vector<Ref<GLTFAnimation>> animations;
 	HashMap<GLTFNodeIndex, Node *> scene_nodes;
 	HashMap<GLTFNodeIndex, ImporterMeshInstance3D *> scene_mesh_instances;
+	HashMap<GLTFNodeIndex, MeshInstance3D *> scene_runtime_mesh_instances;
 	HashMap<String, Ref<GLTFObjectModelProperty>> object_model_properties;
 
 	HashMap<ObjectID, GLTFSkeletonIndex> skeleton3d_to_gltf_skeleton;
@@ -216,8 +244,15 @@ public:
 	TypedArray<GLTFNode> get_nodes_bind() const;
 	void set_nodes_bind(const TypedArray<GLTFNode> &p_nodes);
 
-	const Vector<PackedByteArray> &get_buffers() const { return buffers; }
-	void set_buffers(const Vector<PackedByteArray> &p_buffers) { buffers = p_buffers; }
+	const Vector<PackedByteArray> &get_buffers() const;
+	void set_buffers(const Vector<PackedByteArray> &p_buffers) {
+		buffers = p_buffers;
+		buffer0_uses_glb_span = false;
+	}
+	bool get_raw_buffer_span(GLTFBufferIndex p_index, const uint8_t *&r_ptr, int64_t &r_len) const;
+	void set_zero_copy_glb_span(const uint8_t *p_ptr, int64_t p_len, std::shared_ptr<FileAccessMMapView> p_mmap = nullptr, const PackedByteArray &p_backing = PackedByteArray());
+	void set_lazy_json_utf8(const uint8_t *p_ptr, size_t p_len);
+	bool has_importer_mesh_instances() const { return !scene_mesh_instances.is_empty(); }
 	TypedArray<PackedByteArray> get_buffers_bind() const;
 	void set_buffers_bind(const TypedArray<PackedByteArray> &p_buffers);
 

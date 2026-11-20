@@ -42,6 +42,7 @@ class Image;
 class GLTFSpecGloss : public Resource {
 	GDCLASS(GLTFSpecGloss, Resource);
 	friend class GLTFDocument;
+	friend struct GLTFFastAccess;
 
 private:
 	Ref<Image> diffuse_img = nullptr;

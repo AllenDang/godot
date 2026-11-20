@@ -522,7 +522,11 @@ void Object::get_property_list(List<PropertyInfo> *p_list, bool p_reversed) cons
 	}
 
 	for (const KeyValue<StringName, Variant> &K : metadata) {
-		PropertyInfo pi = PropertyInfo(K.value.get_type(), "metadata/" + K.key.operator String());
+		const String meta_key = K.key.operator String();
+		if (meta_key.begins_with("_ange_transient_")) {
+			continue;
+		}
+		PropertyInfo pi = PropertyInfo(K.value.get_type(), "metadata/" + meta_key);
 		if (K.value.get_type() == Variant::OBJECT) {
 			pi.hint = PROPERTY_HINT_RESOURCE_TYPE;
 			Object *obj = K.value;

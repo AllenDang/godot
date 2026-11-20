@@ -30,14 +30,351 @@
 
 #include "texture_loader_ktx.h"
 
+#include "core/io/compression.h"
 #include "core/io/file_access.h"
 #include "core/io/file_access_memory.h"
+#include "core/io/file_access_mmap.h"
+#include "core/math/math_funcs.h"
 #include "core/object/class_db.h"
+#include "core/os/load_thread_pool.h"
+#include "core/templates/local_vector.h"
 #include "scene/resources/image_texture.h"
 #include "servers/rendering/rendering_server.h"
 
 #include <ktx.h>
 #include <vk_format.h>
+
+GODOT_GCC_WARNING_PUSH
+GODOT_GCC_WARNING_IGNORE("-Wenum-conversion")
+GODOT_GCC_WARNING_IGNORE("-Wshadow")
+GODOT_GCC_WARNING_IGNORE("-Wunused-value")
+#include <transcoder/basisu_transcoder.h>
+GODOT_GCC_WARNING_POP
+
+#include <atomic>
+#include <cmath>
+#include <cstring>
+
+namespace {
+
+constexpr uint8_t kKtx2Magic[12] = {
+	0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
+};
+
+// Direct zero-stream KTX2 BasisU (UASTC / ETC1S / UASTC HDR) transcoder path.
+// Preserves native GPU block compression for sRGB Color, 11-bit EAC_RG11 / BC5 Normal,
+// and 11-bit 4-bpp EAC_R11 / BC4 Scalar maps, and slices large UASTC mip levels into
+// 24 even block-row strips across LoadThreadPool (<= 3 low-priority utility threads)
+// with cDecodeFlagsHighQuality enabled for zero source degradation.
+Ref<Image> try_load_basis_ktx2_direct(const uint8_t *p_data, size_t p_size, Error *r_error) {
+	if (!p_data || p_size < sizeof(basist::ktx2_header) || std::memcmp(p_data, kKtx2Magic, 12) != 0) {
+		return Ref<Image>();
+	}
+	uint32_t vk_format = 0;
+	std::memcpy(&vk_format, p_data + 12, 4);
+	if (vk_format != VK_FORMAT_UNDEFINED) {
+		return Ref<Image>();
+	}
+	if (p_size > UINT32_MAX) {
+		return Ref<Image>();
+	}
+
+	basist::ktx2_transcoder transcoder;
+	if (!transcoder.init(p_data, static_cast<uint32_t>(p_size))) {
+		return Ref<Image>();
+	}
+	if (transcoder.get_faces() != 1 || transcoder.get_layers() != 0 || transcoder.is_video()) {
+		return Ref<Image>();
+	}
+
+	const uint32_t width = transcoder.get_width();
+	const uint32_t height = transcoder.get_height();
+	if (width == 0 || height == 0) {
+		return Ref<Image>();
+	}
+
+	RS *rs = RS::get_singleton();
+	const bool astc_supported = rs && rs->has_os_feature("astc");
+	const bool astc_hdr_supported = rs && rs->has_os_feature("astc_hdr");
+	const bool bptc_supported = rs && rs->has_os_feature("bptc");
+	const bool rgtc_supported = rs && rs->has_os_feature("rgtc");
+	const bool s3tc_supported = rs && rs->has_os_feature("s3tc");
+	const bool etc2_supported = rs && rs->has_os_feature("etc2");
+
+	const bool block_aligned = (width % 4 == 0) && (height % 4 == 0);
+	const bool is_srgb = (transcoder.get_dfd_transfer_func() == basist::KTX2_KHR_DF_TRANSFER_SRGB);
+	const bool has_alpha = transcoder.get_has_alpha();
+	const basist::ktx2_df_channel_id ch0 = transcoder.get_dfd_channel_id0();
+	const basist::ktx2_df_channel_id ch1 = transcoder.get_dfd_channel_id1();
+	const uint32_t samples = transcoder.get_dfd_total_samples();
+
+	basist::transcoder_texture_format basisu_format = basist::transcoder_texture_format::cTFRGBA32;
+	Image::Format image_format = Image::FORMAT_RGBA8;
+	bool custom_uastc_rg_slice = false;
+
+	if (transcoder.is_hdr()) {
+		if (!transcoder.is_hdr_4x4()) {
+			return Ref<Image>();
+		}
+		if (block_aligned && bptc_supported) {
+			basisu_format = basist::transcoder_texture_format::cTFBC6H;
+			image_format = Image::FORMAT_BPTC_RGBFU;
+		} else if (block_aligned && astc_hdr_supported) {
+			basisu_format = basist::transcoder_texture_format::cTFASTC_HDR_4x4_RGBA;
+			image_format = Image::FORMAT_ASTC_4x4_HDR;
+		} else {
+			basisu_format = basist::transcoder_texture_format::cTFRGB_9E5;
+			image_format = Image::FORMAT_RGBE9995;
+		}
+	} else if (block_aligned) {
+		// Detect 1-channel linear scalar (4 bpp EAC_R11 / BC4_R) and 2-channel linear normal/RG.
+		// On ASTC GPUs (iOS/macOS Metal, modern Android Vulkan), UASTC_RG (R=X, G=Y) transcodes directly
+		// to ASTC_4x4 (same 8 bpp VRAM, 100% lossless bit-repack of dual-plane UASTC, ~35x faster & lower power
+		// than brute-force EAC_RG11 re-quantization, and .xy == (X, Y) in scene_forward_mobile.glsl).
+		const bool is_single_r = !is_srgb && !has_alpha && samples == 1 &&
+				(ch0 == basist::KTX2_DF_CHANNEL_ETC1S_RRR || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRR);
+		const bool is_dual_rg = !is_srgb &&
+				((samples == 1 && ((ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG && !astc_supported) || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG)) ||
+						(samples == 2 && ch0 == basist::KTX2_DF_CHANNEL_ETC1S_RRR && ch1 == basist::KTX2_DF_CHANNEL_ETC1S_GGG));
+
+		if (is_single_r && (rgtc_supported || etc2_supported)) {
+			if (rgtc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFBC4_R;
+				image_format = Image::FORMAT_RGTC_R;
+			} else {
+				basisu_format = basist::transcoder_texture_format::cTFETC2_EAC_R11;
+				image_format = Image::FORMAT_ETC2_R11;
+			}
+		} else if (is_dual_rg && (rgtc_supported || etc2_supported)) {
+			if (rgtc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFBC5_RG;
+				image_format = Image::FORMAT_RGTC_RG;
+			} else {
+				basisu_format = basist::transcoder_texture_format::cTFETC2_EAC_RG11;
+				image_format = Image::FORMAT_ETC2_RG11;
+			}
+			custom_uastc_rg_slice = (transcoder.is_uastc() && ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG);
+		} else if (has_alpha) {
+			if (astc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
+				image_format = Image::FORMAT_ASTC_4x4;
+			} else if (bptc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFBC7_RGBA;
+				image_format = Image::FORMAT_BPTC_RGBA;
+			} else if (s3tc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFBC3_RGBA;
+				image_format = Image::FORMAT_DXT5;
+			} else if (etc2_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFETC2_RGBA;
+				image_format = Image::FORMAT_ETC2_RGBA8;
+			}
+		} else {
+			if (astc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFASTC_4x4_RGBA;
+				image_format = Image::FORMAT_ASTC_4x4;
+			} else if (bptc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFBC7_M6_OPAQUE_ONLY;
+				image_format = Image::FORMAT_BPTC_RGBA;
+			} else if (s3tc_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFBC1_RGB;
+				image_format = Image::FORMAT_DXT1;
+			} else if (etc2_supported) {
+				basisu_format = basist::transcoder_texture_format::cTFETC1_RGB;
+				image_format = Image::FORMAT_ETC2_RGB8;
+			}
+		}
+	}
+
+	if (!transcoder.start_transcoding()) {
+		return Ref<Image>();
+	}
+
+	const uint32_t expected_full_levels = static_cast<uint32_t>(Image::get_image_required_mipmaps(width, height, image_format)) + 1u;
+	const uint32_t authored_levels = transcoder.get_levels();
+	const bool use_mipmaps = authored_levels >= expected_full_levels && expected_full_levels > 1u;
+	const uint32_t levels_to_load = use_mipmaps ? expected_full_levels : 1u;
+
+	Vector<uint8_t> out_data;
+	const int64_t out_size = Image::get_image_data_size(width, height, image_format, use_mipmaps);
+	if (out_data.resize(out_size) != OK) {
+		return Ref<Image>();
+	}
+	uint8_t *dst = out_data.ptrw();
+	const bool compressed_out = Image::is_format_compressed(image_format);
+	const uint32_t dst_block_bytes = compressed_out
+			? ((image_format == Image::FORMAT_DXT1 || image_format == Image::FORMAT_RGTC_R ||
+					   image_format == Image::FORMAT_ETC || image_format == Image::FORMAT_ETC2_RGB8 ||
+					   image_format == Image::FORMAT_ETC2_R11)
+							  ? 8u
+							  : 16u)
+			: 4u;
+
+	const basist::ktx2_header *hdr = reinterpret_cast<const basist::ktx2_header *>(p_data);
+	const uint32_t supercomp = hdr->m_supercompression_scheme;
+	const size_t level_table_end = sizeof(basist::ktx2_header) + size_t(MAX(1u, authored_levels)) * sizeof(basist::ktx2_level_index);
+	const basist::ktx2_level_index *level_table = (level_table_end <= p_size)
+			? reinterpret_cast<const basist::ktx2_level_index *>(p_data + sizeof(basist::ktx2_header))
+			: nullptr;
+
+	const bool is_uastc_ldr = transcoder.is_uastc();
+	basist::basisu_lowlevel_uastc_ldr_4x4_transcoder uastc_tc;
+	LocalVector<uint8_t> zstd_scratch;
+	std::atomic<bool> failed{ false };
+
+	const uint32_t uastc_decode_flags =
+			(basisu_format == basist::transcoder_texture_format::cTFETC2_EAC_R11 ||
+					basisu_format == basist::transcoder_texture_format::cTFETC2_EAC_RG11)
+			? 0u
+			: uint32_t(basist::cDecodeFlagsHighQuality);
+
+	auto run_uastc_strip = [&](uint8_t *p_dst_strip, uint32_t p_blocks_x, uint32_t p_blocks_y,
+								   const uint8_t *p_src_strip, uint32_t p_src_bytes,
+								   uint32_t p_level_w, uint32_t p_strip_h_px, uint32_t p_level_idx) -> bool {
+		if (custom_uastc_rg_slice) {
+			const basist::block_format bfmt = (basisu_format == basist::transcoder_texture_format::cTFBC5_RG)
+					? basist::block_format::cBC5
+					: basist::block_format::cETC2_EAC_RG11;
+			return uastc_tc.transcode_slice(
+					p_dst_strip, p_blocks_x, p_blocks_y, p_src_strip, p_src_bytes, bfmt,
+					16u, false, has_alpha, p_level_w, p_strip_h_px, 0, nullptr, 0,
+					0, 1, uastc_decode_flags);
+		}
+		const uint32_t out_units = compressed_out ? (p_blocks_x * p_blocks_y) : (p_level_w * p_strip_h_px);
+		return uastc_tc.transcode_image(
+				basisu_format, p_dst_strip, out_units, p_src_strip, p_src_bytes,
+				p_blocks_x, p_blocks_y, p_level_w, p_strip_h_px, p_level_idx,
+				0, p_src_bytes, uastc_decode_flags, has_alpha, false, 0, nullptr, 0, -1, -1);
+	};
+
+	if (is_uastc_ldr && level_table && (supercomp == basist::KTX2_SS_NONE || supercomp == basist::KTX2_SS_ZSTANDARD)) {
+		LoadThreadPool *pool = LoadThreadPool::get_singleton();
+		for (uint32_t lv = 0; lv < levels_to_load; lv++) {
+			const uint32_t lw = MAX(1u, width >> lv);
+			const uint32_t lh = MAX(1u, height >> lv);
+			const uint32_t bx = (lw + 3u) >> 2;
+			const uint32_t by = (lh + 3u) >> 2;
+			const uint64_t expected_uastc_bytes = uint64_t(bx) * uint64_t(by) * 16ULL;
+
+			const uint64_t comp_ofs = level_table[lv].m_byte_offset.get_uint64();
+			const uint64_t comp_len = level_table[lv].m_byte_length.get_uint64();
+			const uint64_t uncomp_len = level_table[lv].m_uncompressed_byte_length.get_uint64();
+			if (comp_ofs + comp_len > p_size || uncomp_len < expected_uastc_bytes || expected_uastc_bytes > UINT32_MAX) {
+				failed.store(true, std::memory_order_relaxed);
+				break;
+			}
+
+			const uint8_t *uastc_ptr = nullptr;
+			if (supercomp == basist::KTX2_SS_ZSTANDARD) {
+				if (zstd_scratch.size() < uncomp_len) {
+					zstd_scratch.resize(uint32_t(uncomp_len));
+				}
+				const int64_t dec = Compression::decompress(
+						zstd_scratch.ptr(), int64_t(uncomp_len),
+						p_data + comp_ofs, int64_t(comp_len), Compression::MODE_ZSTD);
+				if (dec != int64_t(uncomp_len)) {
+					failed.store(true, std::memory_order_relaxed);
+					break;
+				}
+				uastc_ptr = zstd_scratch.ptr();
+			} else {
+				uastc_ptr = p_data + comp_ofs;
+			}
+
+			uint8_t *dst_lv = dst + Image::get_image_mipmap_offset(width, height, image_format, lv);
+			if (pool && uint64_t(bx) * uint64_t(by) >= 1024ULL && by >= 4u) {
+				const uint32_t strips = MIN(48u, by);
+				pool->parallel_for(strips, [&](uint32_t s) {
+					if (failed.load(std::memory_order_relaxed)) {
+						return;
+					}
+					const uint32_t r0 = (s * by) / strips;
+					const uint32_t r1 = ((s + 1u) * by) / strips;
+					if (r0 >= r1) {
+						return;
+					}
+					const uint32_t sb_y = r1 - r0;
+					const uint32_t sp_h = MIN(sb_y * 4u, lh - r0 * 4u);
+					const uint32_t src_ofs = r0 * bx * 16u;
+					const uint32_t src_bytes = sb_y * bx * 16u;
+					uint8_t *out_ptr = compressed_out
+							? (dst_lv + size_t(r0) * size_t(bx) * size_t(dst_block_bytes))
+							: (dst_lv + size_t(r0 * 4u) * size_t(lw) * 4u);
+					if (!run_uastc_strip(out_ptr, bx, sb_y, uastc_ptr + src_ofs, src_bytes, lw, sp_h, lv)) {
+						failed.store(true, std::memory_order_relaxed);
+					}
+				});
+				if (failed.load(std::memory_order_relaxed)) {
+					break;
+				}
+			} else {
+				if (!run_uastc_strip(dst_lv, bx, by, uastc_ptr, uint32_t(expected_uastc_bytes), lw, lh, lv)) {
+					failed.store(true, std::memory_order_relaxed);
+					break;
+				}
+			}
+
+			// Reconstruct RGB normal channels when software/dummy fallback decoded RG or RRRG to RGBA8.
+			if (!compressed_out && !is_srgb &&
+					(ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG || ch0 == basist::KTX2_DF_CHANNEL_UASTC_RG)) {
+				const size_t px_cnt = size_t(lw) * size_t(lh);
+				const int y_chan = (ch0 == basist::KTX2_DF_CHANNEL_UASTC_RRRG) ? 3 : 1;
+				for (size_t pi = 0; pi < px_cnt; pi++) {
+					uint8_t *px = dst_lv + pi * 4;
+					const float nx = float(px[0]) * (2.0f / 255.0f) - 1.0f;
+					const float ny = float(px[y_chan]) * (2.0f / 255.0f) - 1.0f;
+					const float nz = std::sqrt(MAX(0.0f, 1.0f - nx * nx - ny * ny));
+					px[1] = px[y_chan];
+					px[2] = uint8_t(CLAMP(std::lround((nz * 0.5f + 0.5f) * 255.0f), 0L, 255L));
+					px[3] = 255;
+				}
+			}
+		}
+	} else {
+		auto transcode_one_level = [&](uint32_t p_level, basist::ktx2_transcoder_state *p_state) -> bool {
+			basist::ktx2_image_level_info level_info;
+			if (!transcoder.get_image_level_info(level_info, p_level, 0, 0)) {
+				return false;
+			}
+			const uint32_t count = compressed_out ? level_info.m_total_blocks : (level_info.m_orig_width * level_info.m_orig_height);
+			const int64_t ofs = Image::get_image_mipmap_offset(width, height, image_format, p_level);
+			return transcoder.transcode_image_level(
+					p_level, 0, 0, dst + ofs, count, basisu_format,
+					basist::cDecodeFlagsHighQuality, 0, 0, -1, -1, p_state);
+		};
+
+		if (levels_to_load > 1 && width * height >= 512u * 512u && LoadThreadPool::get_singleton()) {
+			LoadThreadPool::get_singleton()->parallel_for(static_cast<int>(levels_to_load), [&](int p_idx) {
+				if (failed.load(std::memory_order_relaxed)) {
+					return;
+				}
+				basist::ktx2_transcoder_state state;
+				state.clear();
+				if (!transcode_one_level(static_cast<uint32_t>(p_idx), &state)) {
+					failed.store(true, std::memory_order_relaxed);
+				}
+			});
+		} else {
+			for (uint32_t i = 0; i < levels_to_load; i++) {
+				if (!transcode_one_level(i, nullptr)) {
+					failed.store(true, std::memory_order_relaxed);
+					break;
+				}
+			}
+		}
+	}
+
+	if (failed.load(std::memory_order_relaxed)) {
+		return Ref<Image>();
+	}
+
+	Ref<Image> img = Image::create_from_data(width, height, use_mipmaps, image_format, out_data);
+	if (img.is_valid() && r_error) {
+		*r_error = OK;
+	}
+	return img;
+}
+
+} // namespace
 
 KTX_error_code ktx_read(ktxStream *stream, void *dst, const ktx_size_t count) {
 	Ref<FileAccess> *f = reinterpret_cast<Ref<FileAccess> *>(stream->data.custom_ptr.address);
@@ -47,9 +384,7 @@ KTX_error_code ktx_read(ktxStream *stream, void *dst, const ktx_size_t count) {
 
 KTX_error_code ktx_skip(ktxStream *stream, const ktx_size_t count) {
 	Ref<FileAccess> *f = reinterpret_cast<Ref<FileAccess> *>(stream->data.custom_ptr.address);
-	for (ktx_size_t i = 0; i < count; ++i) {
-		(*f)->get_8();
-	}
+	(*f)->seek((*f)->get_position() + count);
 	return KTX_SUCCESS;
 }
 
@@ -81,49 +416,26 @@ void ktx_destruct(ktxStream *stream) {
 	(void)stream;
 }
 
-static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
-	ktxStream ktx_stream;
-	ktx_stream.read = ktx_read;
-	ktx_stream.skip = ktx_skip;
-	ktx_stream.write = ktx_write;
-	ktx_stream.getpos = ktx_getpos;
-	ktx_stream.setpos = ktx_setpos;
-	ktx_stream.getsize = ktx_getsize;
-	ktx_stream.destruct = ktx_destruct;
-	ktx_stream.type = eStreamTypeCustom;
-	ktx_stream.data.custom_ptr.address = &f;
-	ktx_stream.data.custom_ptr.allocatorAddress = nullptr;
-	ktx_stream.data.custom_ptr.size = 0;
-	ktx_stream.readpos = 0;
-	ktx_stream.closeOnDestruct = false;
-	ktxTexture *ktx_texture;
-	KTX_error_code result = ktxTexture_CreateFromStream(&ktx_stream,
-			KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT,
-			&ktx_texture);
-	if (result != KTX_SUCCESS) {
-		ERR_FAIL_V_MSG(Ref<Resource>(), "Invalid or unsupported KTX texture file.");
-	}
-
+static Ref<Image> load_from_ktx_texture(ktxTexture *ktx_texture, Error *r_error) {
 	if (ktx_texture->numDimensions != 2) {
 		ktxTexture_Destroy(ktx_texture);
-		ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported non-2D KTX texture file.");
+		ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported non-2D KTX texture file.");
 	}
 
 	if (ktx_texture->isCubemap || ktx_texture->numFaces != 1) {
 		ktxTexture_Destroy(ktx_texture);
-		ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported cube map KTX texture file.");
+		ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported cube map KTX texture file.");
 	}
 
 	if (ktx_texture->isArray) {
 		ktxTexture_Destroy(ktx_texture);
-		ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported array KTX texture file.");
+		ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported array KTX texture file.");
 	}
 
 	uint32_t width = ktx_texture->baseWidth;
 	uint32_t height = ktx_texture->baseHeight;
 	uint32_t mipmaps = ktx_texture->numLevels;
 	Image::Format format;
-	bool srgb = false;
 
 	switch (ktx_texture->classId) {
 		case ktxTexture1_c:
@@ -135,12 +447,12 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 					format = Image::FORMAT_LA8;
 					break;
 				case GL_SRGB8:
+				case GL_RGB8:
 					format = Image::FORMAT_RGB8;
-					srgb = true;
 					break;
 				case GL_SRGB8_ALPHA8:
+				case GL_RGBA8:
 					format = Image::FORMAT_RGBA8;
-					srgb = true;
 					break;
 				case GL_R8:
 				case GL_R8UI:
@@ -148,12 +460,6 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 					break;
 				case GL_RG8:
 					format = Image::FORMAT_RG8;
-					break;
-				case GL_RGB8:
-					format = Image::FORMAT_RGB8;
-					break;
-				case GL_RGBA8:
-					format = Image::FORMAT_RGBA8;
 					break;
 				case GL_RGBA4:
 					format = Image::FORMAT_RGBA4444;
@@ -240,42 +546,26 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 				case GL_COMPRESSED_R11_EAC:
 					format = Image::FORMAT_ETC2_R11;
 					break;
-				// Decompression is not supported for this format.
-				/*case GL_COMPRESSED_SIGNED_R11_EAC:
-					format = Image::FORMAT_ETC2_R11S;
-					break;*/
 				case GL_COMPRESSED_RG11_EAC:
 					format = Image::FORMAT_ETC2_RG11;
 					break;
-				// Decompression is not supported for this format.
-				/*case GL_COMPRESSED_SIGNED_RG11_EAC:
-					format = Image::FORMAT_ETC2_RG11S;
-					break;*/
 				case GL_COMPRESSED_RGB8_ETC2:
 					format = Image::FORMAT_ETC2_RGB8;
 					break;
 				case GL_COMPRESSED_RGBA8_ETC2_EAC:
 					format = Image::FORMAT_ETC2_RGBA8;
 					break;
-				// Decompression is not supported for this format.
-				/*case GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2:
-					format = Image::FORMAT_ETC2_RGB8A1;
-					break;*/
 				case GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR:
+				case GL_COMPRESSED_RGBA_ASTC_4x4_KHR:
 					format = Image::FORMAT_ASTC_4x4;
 					break;
-				case GL_COMPRESSED_RGBA_ASTC_4x4_KHR:
-					format = Image::FORMAT_ASTC_4x4_HDR;
-					break;
 				case GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR:
-					format = Image::FORMAT_ASTC_8x8;
-					break;
 				case GL_COMPRESSED_RGBA_ASTC_8x8_KHR:
-					format = Image::FORMAT_ASTC_8x8_HDR;
+					format = Image::FORMAT_ASTC_8x8;
 					break;
 				default:
 					ktxTexture_Destroy(ktx_texture);
-					ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported format " + itos(((ktxTexture1 *)ktx_texture)->glInternalformat) + " of KTX1 texture file.");
+					ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported format " + itos(((ktxTexture1 *)ktx_texture)->glInternalformat) + " of KTX1 texture file.");
 			}
 			break;
 		case ktxTexture2_c: {
@@ -283,95 +573,104 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 			if (ktx_texture2->vkFormat == VK_FORMAT_UNDEFINED) {
 				if (!ktxTexture2_NeedsTranscoding(ktx_texture2)) {
 					ktxTexture_Destroy(ktx_texture);
-					ERR_FAIL_V_MSG(Ref<Resource>(), "Invalid VK_FORMAT_UNDEFINED of KTX2 texture file.");
+					ERR_FAIL_V_MSG(Ref<Image>(), "Invalid VK_FORMAT_UNDEFINED of KTX2 texture file.");
 				}
-				ktx_transcode_fmt_e ktxfmt;
+				const bool block_aligned = (width % 4 == 0) && (height % 4 == 0);
+				const bool is_srgb = (ktxTexture2_GetOETF_e(ktx_texture2) == KHR_DF_TRANSFER_SRGB);
+				RS *rs = RS::get_singleton();
+				const bool has_astc = block_aligned && rs && rs->has_os_feature("astc");
+				const bool has_bptc = block_aligned && rs && rs->has_os_feature("bptc");
+				const bool has_rgtc = block_aligned && rs && rs->has_os_feature("rgtc");
+				const bool has_s3tc = block_aligned && rs && rs->has_os_feature("s3tc");
+				const bool has_etc2 = block_aligned && rs && rs->has_os_feature("etc2");
+
+				ktx_transcode_fmt_e ktxfmt = KTX_TTF_RGBA32;
 				switch (ktxTexture2_GetNumComponents(ktx_texture2)) {
 					case 1: {
-						if (ktxTexture2_GetOETF_e(ktx_texture2) == KHR_DF_TRANSFER_SRGB) { // TODO srgb native support
-							ktxfmt = KTX_TTF_RGBA32;
-						} else if (RS::get_singleton()->has_os_feature("rgtc")) {
+						if (!is_srgb && has_rgtc) {
 							ktxfmt = KTX_TTF_BC4_R;
-						} else {
-							ktxfmt = KTX_TTF_RGBA32;
+						} else if (!is_srgb && !has_astc && has_etc2) {
+							ktxfmt = KTX_TTF_ETC2_EAC_R11;
+						} else if (has_astc) {
+							ktxfmt = KTX_TTF_ASTC_4x4_RGBA;
+						} else if (has_bptc) {
+							ktxfmt = KTX_TTF_BC7_RGBA;
+						} else if (has_s3tc) {
+							ktxfmt = KTX_TTF_BC1_RGB;
+						} else if (has_etc2) {
+							ktxfmt = KTX_TTF_ETC1_RGB;
 						}
 						break;
 					}
 					case 2: {
-						if (ktxTexture2_GetOETF_e(ktx_texture2) == KHR_DF_TRANSFER_SRGB) { // TODO srgb native support
-							ktxfmt = KTX_TTF_RGBA32;
-						} else if (RS::get_singleton()->has_os_feature("rgtc")) {
+						if (!is_srgb && has_rgtc) {
 							ktxfmt = KTX_TTF_BC5_RG;
-						} else {
-							ktxfmt = KTX_TTF_RGBA32;
+						} else if (!is_srgb && !has_astc && has_etc2) {
+							ktxfmt = KTX_TTF_ETC2_EAC_RG11;
+						} else if (has_astc) {
+							ktxfmt = KTX_TTF_ASTC_4x4_RGBA;
+						} else if (has_bptc) {
+							ktxfmt = KTX_TTF_BC7_RGBA;
+						} else if (has_s3tc) {
+							ktxfmt = KTX_TTF_BC3_RGBA;
+						} else if (has_etc2) {
+							ktxfmt = KTX_TTF_ETC2_RGBA;
 						}
 						break;
 					}
 					case 3: {
-						if (ktxTexture2_GetOETF_e(ktx_texture2) == KHR_DF_TRANSFER_SRGB) { // TODO: srgb native support
-							ktxfmt = KTX_TTF_RGBA32;
-						} else if (RS::get_singleton()->has_os_feature("bptc")) {
+						if (has_astc) {
+							ktxfmt = KTX_TTF_ASTC_4x4_RGBA;
+						} else if (has_bptc) {
 							ktxfmt = KTX_TTF_BC7_RGBA;
-						} else if (RS::get_singleton()->has_os_feature("s3tc")) {
+						} else if (has_s3tc) {
 							ktxfmt = KTX_TTF_BC1_RGB;
-						} else if (RS::get_singleton()->has_os_feature("etc2")) {
+						} else if (has_etc2) {
 							ktxfmt = KTX_TTF_ETC1_RGB;
-						} else {
-							ktxfmt = KTX_TTF_RGBA32;
 						}
 						break;
 					}
 					case 4: {
-						if (ktxTexture2_GetOETF_e(ktx_texture2) == KHR_DF_TRANSFER_SRGB) { // TODO srgb native support
-							ktxfmt = KTX_TTF_RGBA32;
-						} else if (RS::get_singleton()->has_os_feature("astc")) {
+						if (has_astc) {
 							ktxfmt = KTX_TTF_ASTC_4x4_RGBA;
-						} else if (RS::get_singleton()->has_os_feature("bptc")) {
+						} else if (has_bptc) {
 							ktxfmt = KTX_TTF_BC7_RGBA;
-						} else if (RS::get_singleton()->has_os_feature("s3tc")) {
+						} else if (has_s3tc) {
 							ktxfmt = KTX_TTF_BC3_RGBA;
-						} else if (RS::get_singleton()->has_os_feature("etc2")) {
+						} else if (has_etc2) {
 							ktxfmt = KTX_TTF_ETC2_RGBA;
-						} else {
-							ktxfmt = KTX_TTF_RGBA32;
 						}
 						break;
 					}
 					default: {
 						ktxTexture_Destroy(ktx_texture);
-						ERR_FAIL_V_MSG(Ref<Resource>(), "Invalid components of KTX2 texture file.");
+						ERR_FAIL_V_MSG(Ref<Image>(), "Invalid components of KTX2 texture file.");
 					}
 				}
-				result = ktxTexture2_TranscodeBasis(ktx_texture2, ktxfmt, 0);
+				KTX_error_code result = ktxTexture2_TranscodeBasis(ktx_texture2, ktxfmt, 0);
 				if (result != KTX_SUCCESS) {
 					ktxTexture_Destroy(ktx_texture);
-					ERR_FAIL_V_MSG(Ref<Resource>(), "Failed to transcode KTX2 texture file.");
+					ERR_FAIL_V_MSG(Ref<Image>(), "Failed to transcode KTX2 texture file.");
 				}
 			}
 			switch (ktx_texture2->vkFormat) {
 				case VK_FORMAT_R8_UNORM:
-					format = Image::FORMAT_L8;
-					break;
-				case VK_FORMAT_R8G8_UNORM:
-					format = Image::FORMAT_LA8;
-					break;
-				case VK_FORMAT_R8G8B8_SRGB:
-					format = Image::FORMAT_RGB8;
-					srgb = true;
-					break;
-				case VK_FORMAT_R8G8B8A8_SRGB:
-					format = Image::FORMAT_RGBA8;
-					srgb = true;
-					break;
+				case VK_FORMAT_R8_SRGB:
 				case VK_FORMAT_R8_UINT:
 					format = Image::FORMAT_R8;
 					break;
+				case VK_FORMAT_R8G8_UNORM:
+				case VK_FORMAT_R8G8_SRGB:
 				case VK_FORMAT_R8G8_UINT:
 					format = Image::FORMAT_RG8;
 					break;
+				case VK_FORMAT_R8G8B8_UNORM:
+				case VK_FORMAT_R8G8B8_SRGB:
 				case VK_FORMAT_R8G8B8_UINT:
 					format = Image::FORMAT_RGB8;
 					break;
+				case VK_FORMAT_R8G8B8A8_UNORM:
+				case VK_FORMAT_R8G8B8A8_SRGB:
 				case VK_FORMAT_R8G8B8A8_UINT:
 					format = Image::FORMAT_RGBA8;
 					break;
@@ -433,13 +732,17 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 					format = Image::FORMAT_RGBA16I;
 					break;
 				case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+				case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
 				case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+				case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
 					format = Image::FORMAT_DXT1;
 					break;
 				case VK_FORMAT_BC2_UNORM_BLOCK:
+				case VK_FORMAT_BC2_SRGB_BLOCK:
 					format = Image::FORMAT_DXT3;
 					break;
 				case VK_FORMAT_BC3_UNORM_BLOCK:
+				case VK_FORMAT_BC3_SRGB_BLOCK:
 					format = Image::FORMAT_DXT5;
 					break;
 				case VK_FORMAT_BC4_UNORM_BLOCK:
@@ -455,61 +758,53 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 					format = Image::FORMAT_BPTC_RGBF;
 					break;
 				case VK_FORMAT_BC7_UNORM_BLOCK:
+				case VK_FORMAT_BC7_SRGB_BLOCK:
 					format = Image::FORMAT_BPTC_RGBA;
 					break;
 				case VK_FORMAT_EAC_R11_UNORM_BLOCK:
 					format = Image::FORMAT_ETC2_R11;
 					break;
-				// Decompression is not supported for this format.
-				/*case VK_FORMAT_EAC_R11_SNORM_BLOCK:
-					format = Image::FORMAT_ETC2_R11S;
-					break;*/
 				case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
 					format = Image::FORMAT_ETC2_RG11;
 					break;
-				// Decompression is not supported for this format.
-				/*case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
-					format = Image::FORMAT_ETC2_RG11S;
-					break;*/
 				case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
+				case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
 					format = Image::FORMAT_ETC2_RGB8;
 					break;
 				case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
+				case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
 					format = Image::FORMAT_ETC2_RGBA8;
 					break;
-				// Decompression is not supported for this format.
-				/*case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
-					format = Image::FORMAT_ETC2_RGB8A1;
-					break;*/
 				case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
+				case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
 					format = Image::FORMAT_ASTC_4x4;
 					break;
-				case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
+				case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
 					format = Image::FORMAT_ASTC_4x4_HDR;
 					break;
 				case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
+				case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
 					format = Image::FORMAT_ASTC_8x8;
 					break;
-				case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
+				case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
 					format = Image::FORMAT_ASTC_8x8_HDR;
 					break;
 				default:
 					ktxTexture_Destroy(ktx_texture);
-					ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported format " + itos(((ktxTexture2 *)ktx_texture)->vkFormat) + " of KTX2 texture file.");
-					break;
+					ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported format " + itos(((ktxTexture2 *)ktx_texture)->vkFormat) + " of KTX2 texture file.");
 			}
 			break;
 		}
 		default:
 			ktxTexture_Destroy(ktx_texture);
-			ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported version KTX texture file.");
-			break;
+			ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported version KTX texture file.");
 	}
 
-	Vector<uint8_t> src_data;
+	const uint32_t expected_full_levels = static_cast<uint32_t>(Image::get_image_required_mipmaps(width, height, format)) + 1u;
+	if (mipmaps > 1 && mipmaps < expected_full_levels) {
+		mipmaps = 1;
+	}
 
-	// KTX use 4-bytes padding, don't use mipmaps if padding is effective
-	// TODO: unpad dynamically
 	int pixel_size = Image::get_format_pixel_size(format);
 	int pixel_rshift = Image::get_format_pixel_rshift(format);
 	int block = Image::get_format_block_size(format);
@@ -527,7 +822,7 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 		if (mip_size != static_cast<ktx_size_t>(s)) {
 			if (!i) {
 				ktxTexture_Destroy(ktx_texture);
-				ERR_FAIL_V_MSG(Ref<Resource>(), "Unsupported padded KTX texture file.");
+				ERR_FAIL_V_MSG(Ref<Image>(), "Unsupported padded KTX texture file.");
 			}
 			mipmaps = 1;
 			break;
@@ -536,23 +831,27 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 		h = MAX(minh, h >> 1);
 	}
 
+	Vector<uint8_t> src_data;
+	int64_t total_bytes = 0;
+	for (uint32_t i = 0; i < mipmaps; ++i) {
+		total_bytes += static_cast<int64_t>(ktxTexture_GetImageSize(ktx_texture, i));
+	}
+	src_data.resize(total_bytes);
+	uint8_t *dst_ptr = src_data.ptrw();
+	int64_t write_pos = 0;
+
 	for (uint32_t i = 0; i < mipmaps; ++i) {
 		ktx_size_t mip_size = ktxTexture_GetImageSize(ktx_texture, i);
 		ktx_size_t offset;
 		if (ktxTexture_GetImageOffset(ktx_texture, i, 0, 0, &offset) != KTX_SUCCESS) {
 			ktxTexture_Destroy(ktx_texture);
-			ERR_FAIL_V_MSG(Ref<Resource>(), "Invalid KTX texture file.");
+			ERR_FAIL_V_MSG(Ref<Image>(), "Invalid KTX texture file.");
 		}
-		int prev_size = src_data.size();
-		src_data.resize(prev_size + mip_size);
-		memcpy(src_data.ptrw() + prev_size, ktxTexture_GetData(ktx_texture) + offset, mip_size);
+		memcpy(dst_ptr + write_pos, ktxTexture_GetData(ktx_texture) + offset, mip_size);
+		write_pos += static_cast<int64_t>(mip_size);
 	}
 
-	Ref<Image> img = memnew(Image(width, height, mipmaps - 1, format, src_data));
-	if (srgb) {
-		img->srgb_to_linear();
-	}
-
+	Ref<Image> img = memnew(Image(width, height, mipmaps > 1, format, src_data));
 	if (r_error) {
 		*r_error = OK;
 	}
@@ -561,35 +860,48 @@ static Ref<Image> load_from_file_access(Ref<FileAccess> f, Error *r_error) {
 	return img;
 }
 
+static Ref<Image> load_from_memory(const uint8_t *p_data, size_t p_size, Error *r_error) {
+	if (r_error) {
+		*r_error = ERR_FILE_CORRUPT;
+	}
+	if (!p_data || p_size == 0) {
+		return Ref<Image>();
+	}
+	Ref<Image> direct = try_load_basis_ktx2_direct(p_data, p_size, r_error);
+	if (direct.is_valid()) {
+		return direct;
+	}
+	ktxTexture *ktx_texture = nullptr;
+	KTX_error_code result = ktxTexture_CreateFromMemory(
+			p_data, p_size, KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &ktx_texture);
+	if (result != KTX_SUCCESS || !ktx_texture) {
+		ERR_FAIL_V_MSG(Ref<Image>(), "Invalid or unsupported KTX texture file.");
+	}
+	return load_from_ktx_texture(ktx_texture, r_error);
+}
+
 Ref<Resource> ResourceFormatKTX::load(const String &p_path, const String &p_original_path, Error *r_error, bool p_use_sub_threads, float *r_progress, CacheMode p_cache_mode) {
 	if (r_error) {
 		*r_error = ERR_CANT_OPEN;
 	}
 
-	Error err;
-	Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::READ, &err);
-	if (f.is_null()) {
+	FileAccessMMapView view;
+	Error err = view.open(p_path);
+	ERR_FAIL_COND_V_MSG(err != OK || !view.is_valid(), Ref<Resource>(), "Unable to open KTX texture file '" + p_path + "'.");
+
+	Ref<Image> img = load_from_memory(view.ptr(), view.size(), r_error);
+	if (img.is_null()) {
 		return Ref<Resource>();
 	}
-
-	Ref<FileAccess> fref(f);
-	if (r_error) {
-		*r_error = ERR_FILE_CORRUPT;
-	}
-
-	ERR_FAIL_COND_V_MSG(err != OK, Ref<Resource>(), "Unable to open KTX texture file '" + p_path + "'.");
-	Ref<Image> img = load_from_file_access(f, r_error);
 	Ref<ImageTexture> texture = ImageTexture::create_from_image(img);
 	return texture;
 }
 
 static Ref<Image> _ktx_mem_loader_func(const uint8_t *p_ktx, int p_size) {
-	Ref<FileAccessMemory> f;
-	f.instantiate();
-	f->open_custom(p_ktx, p_size);
-	Error err;
-	Ref<Image> img = load_from_file_access(f, &err);
-	ERR_FAIL_COND_V(err, Ref<Image>());
+	ERR_FAIL_COND_V(!p_ktx || p_size <= 0, Ref<Image>());
+	Error err = OK;
+	Ref<Image> img = load_from_memory(p_ktx, static_cast<size_t>(p_size), &err);
+	ERR_FAIL_COND_V(err != OK, Ref<Image>());
 	return img;
 }
 

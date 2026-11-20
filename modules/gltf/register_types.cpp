@@ -35,11 +35,16 @@
 #include "extensions/gltf_document_extension_texture_webp.h"
 #include "extensions/gltf_spec_gloss.h"
 #include "gltf_document.h"
+#include "gltf_fast_scene.h"
 #include "gltf_state.h"
 #include "structures/gltf_object_model_property.h"
 
 #include "core/config/engine.h"
+#include "core/io/resource_loader.h"
 #include "core/object/class_db.h"
+#include "core/os/load_thread_pool.h"
+
+static Ref<ResourceFormatLoaderGLB> resource_loader_glb;
 
 #ifndef PHYSICS_3D_DISABLED
 #include "extensions/physics/gltf_document_extension_physics.h"
@@ -142,6 +147,10 @@ void initialize_gltf_module(ModuleInitializationLevel p_level) {
 		bool is_editor = Engine::get_singleton()->is_editor_hint();
 		if (!is_editor) {
 			GLTF_REGISTER_DOCUMENT_EXTENSION(GLTFDocumentExtensionConvertImporterMesh);
+			GDREGISTER_INTERNAL_CLASS(ResourceFormatLoaderGLB);
+			resource_loader_glb.instantiate();
+			ResourceLoader::add_resource_format_loader(resource_loader_glb, false);
+			(void)LoadThreadPool::get_singleton();
 		}
 	}
 
@@ -165,6 +174,10 @@ void initialize_gltf_module(ModuleInitializationLevel p_level) {
 void uninitialize_gltf_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
+	}
+	if (resource_loader_glb.is_valid()) {
+		ResourceLoader::remove_resource_format_loader(resource_loader_glb);
+		resource_loader_glb.unref();
 	}
 	GLTFDocument::unregister_all_gltf_document_extensions();
 }

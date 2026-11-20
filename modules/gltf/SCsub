@@ -6,10 +6,22 @@ Import("env_modules")
 
 env_gltf = env_modules.Clone()
 
-# Godot source files
+env_gltf.Prepend(CPPPATH=["#thirdparty/yyjson", "#thirdparty/meshoptimizer"])
 
-env_gltf.add_source_files(env.modules_sources, "*.cpp")
-env_gltf.add_source_files(env.modules_sources, "structures/*.cpp")
+# Thirdparty yyjson (ANSI C single-file parser)
+env_yyjson = env_gltf.Clone()
+env_yyjson.disable_warnings()
+yyjson_obj = []
+env_yyjson.add_source_files(yyjson_obj, ["#thirdparty/yyjson/yyjson.c"])
+env.modules_sources += yyjson_obj
+
+# Godot source files
+module_obj = []
+env_gltf.add_source_files(module_obj, "*.cpp")
+env_gltf.add_source_files(module_obj, "structures/*.cpp")
+env.modules_sources += module_obj
+
+env.Depends(module_obj, yyjson_obj)
 
 SConscript("extensions/SCsub")
 

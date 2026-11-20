@@ -49,6 +49,21 @@ public:
 		TARGET_ELEMENT_ARRAY_BUFFER = 34963,
 	};
 
+	enum MeshoptMode {
+		MESHOPT_MODE_NONE = 0,
+		MESHOPT_MODE_ATTRIBUTES = 1,
+		MESHOPT_MODE_TRIANGLES = 2,
+		MESHOPT_MODE_INDICES = 3,
+	};
+
+	enum MeshoptFilter {
+		MESHOPT_FILTER_NONE = 0,
+		MESHOPT_FILTER_OCTAHEDRAL = 1,
+		MESHOPT_FILTER_QUATERNION = 2,
+		MESHOPT_FILTER_EXPONENTIAL = 3,
+		MESHOPT_FILTER_COLOR = 4,
+	};
+
 private:
 	GLTFBufferIndex buffer = -1;
 	int64_t byte_offset = 0;
@@ -56,6 +71,16 @@ private:
 	int64_t byte_stride = -1;
 	bool indices = false; // True for TARGET_ELEMENT_ARRAY_BUFFER.
 	bool vertex_attributes = false; // True for TARGET_ARRAY_BUFFER.
+
+	// EXT_meshopt_compression / KHR_meshopt_compression metadata & decoded buffer.
+	MeshoptMode meshopt_mode = MESHOPT_MODE_NONE;
+	MeshoptFilter meshopt_filter = MESHOPT_FILTER_NONE;
+	GLTFBufferIndex meshopt_buffer = -1;
+	int64_t meshopt_byte_offset = 0;
+	int64_t meshopt_byte_length = 0;
+	int64_t meshopt_byte_stride = 0;
+	int64_t meshopt_count = 0;
+	Vector<uint8_t> decoded_meshopt_data;
 
 protected:
 	static void _bind_methods();
@@ -88,6 +113,13 @@ public:
 
 	bool get_vertex_attributes() const;
 	void set_vertex_attributes(bool p_attributes);
+
+	bool has_meshopt_compression() const { return meshopt_mode != MESHOPT_MODE_NONE; }
+	void configure_meshopt(GLTFBufferIndex p_buffer, int64_t p_byte_offset, int64_t p_byte_length, int64_t p_byte_stride, int64_t p_count, MeshoptMode p_mode, MeshoptFilter p_filter);
+	Error decode_meshopt(const GLTFState *p_gltf_state);
+
+	// Zero-copy raw byte span accessor into either decoded meshopt buffer or GLB/external buffer.
+	bool get_view_span(const GLTFState *p_gltf_state, const uint8_t *&r_ptr, int64_t &r_length) const;
 
 	Vector<uint8_t> load_buffer_view_data(const Ref<GLTFState> p_gltf_state) const;
 	static GLTFBufferViewIndex write_new_buffer_view_into_state(const Ref<GLTFState> &p_gltf_state, const PackedByteArray &p_input_data, const int64_t p_alignment = 1, const ArrayBufferTarget p_target = TARGET_NONE, const int64_t p_byte_stride = -1, const GLTFBufferIndex p_buffer_index = 0, const bool p_deduplicate = true);
