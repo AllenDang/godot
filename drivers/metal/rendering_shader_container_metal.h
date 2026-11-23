@@ -51,6 +51,7 @@ public:
 			NEEDS_VIEW_MASK_BUFFER = 1 << 0,
 			USES_ARGUMENT_BUFFERS = 1 << 1,
 			NEEDS_DEBUG_LOGGING = 1 << 2,
+			USES_FRAMEBUFFER_FETCH = 1 << 3,
 
 			/// A special value indicating that the shader failed to compile, so the compiled library data is invalid and should be ignored.
 			INVALID_SHADER = 0xFFFFFFFF,
@@ -108,6 +109,18 @@ public:
 				flags |= NEEDS_DEBUG_LOGGING;
 			} else {
 				flags &= ~NEEDS_DEBUG_LOGGING;
+			}
+		}
+
+		bool uses_framebuffer_fetch() const {
+			return !is_invalid() && (flags & USES_FRAMEBUFFER_FETCH);
+		}
+
+		void set_uses_framebuffer_fetch(bool p_value) {
+			if (p_value) {
+				flags |= USES_FRAMEBUFFER_FETCH;
+			} else {
+				flags &= ~USES_FRAMEBUFFER_FETCH;
 			}
 		}
 
@@ -197,7 +210,7 @@ private:
 	MetalDeviceProfile::MinimumRequirements inspect_spirv(const ReflectShader &p_shader);
 
 public:
-	static constexpr uint32_t FORMAT_VERSION = 2;
+	static constexpr uint32_t FORMAT_VERSION = 3;
 
 	void set_export_mode(bool p_export_mode) { export_mode = p_export_mode; }
 	void set_device_profile(const MetalDeviceProfile *p_device_profile) { device_profile = p_device_profile; }

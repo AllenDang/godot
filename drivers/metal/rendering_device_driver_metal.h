@@ -398,6 +398,7 @@ public:
 
 private:
 	Result<NS::SharedPtr<MTL::Function>> _create_function(MDLibrary *p_library, NS::String *p_name, VectorView<PipelineSpecializationConstant> &p_specialization_constants);
+	std::shared_ptr<MDLibrary> _get_or_create_remapped_frag_library(MDRenderShader *p_shader, const uint32_t *p_out_slots, uint32_t p_out_count, const uint32_t *p_in_slots, uint32_t p_in_count);
 
 public:
 	virtual void pipeline_free(PipelineID p_pipeline_id) override final;

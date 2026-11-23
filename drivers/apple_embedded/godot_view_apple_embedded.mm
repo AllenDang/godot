@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/os/keyboard.h"
+#include "core/os/os.h"
 #include "core/string/ustring.h"
 #import "drivers/apple_embedded/display_layer_apple_embedded.h"
 #import "drivers/apple_embedded/display_server_apple_embedded.h"
@@ -201,6 +202,14 @@ static const float earth_gravity = 9.80665;
 
 	print_verbose("Start animation!");
 
+	const bool uncapped_no_vsync =
+			(int(GLOBAL_GET("display/window/vsync/vsync_mode")) == int(DisplayServerEnums::VSYNC_DISABLED) &&
+					int(GLOBAL_GET("application/run/max_fps")) == 0) ||
+			(OS::get_singleton() != nullptr && OS::get_singleton()->get_environment("GODOT_MTL_OFF_SCREEN") == U"1");
+	if (uncapped_no_vsync) {
+		self.useCADisplayLink = NO;
+	}
+
 	if (self.useCADisplayLink) {
 		self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(drawView)];
 		self.displayLink.preferredFramesPerSecond = self.preferredFrameRate;
@@ -208,7 +217,9 @@ static const float earth_gravity = 9.80665;
 		// Setup DisplayLink in main thread
 		[self.displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
 	} else {
-		self.animationTimer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / self.preferredFrameRate) target:self selector:@selector(drawView) userInfo:nil repeats:YES];
+		const NSTimeInterval interval = uncapped_no_vsync ? 0.0001 : (1.0 / MAX(1.0, (double)self.preferredFrameRate));
+		self.animationTimer = [NSTimer timerWithTimeInterval:interval target:self selector:@selector(drawView) userInfo:nil repeats:YES];
+		[[NSRunLoop currentRunLoop] addTimer:self.animationTimer forMode:NSRunLoopCommonModes];
 	}
 }
 
@@ -217,6 +228,15 @@ static const float earth_gravity = 9.80665;
 		print_verbose("Draw view not active!");
 		return;
 	}
+
+	struct TimerDrawGuard {
+		bool *flag = nullptr;
+		~TimerDrawGuard() {
+			if (flag) {
+				*flag = false;
+			}
+		}
+	} timer_guard;
 
 	if (self.useCADisplayLink) {
 		// Pause the CADisplayLink to avoid recursion
@@ -229,6 +249,16 @@ static const float earth_gravity = 9.80665;
 
 		// We are good to go, resume the CADisplayLink
 		[self.displayLink setPaused:NO];
+	} else {
+		static bool in_timer_draw = false;
+		if (in_timer_draw) {
+			return;
+		}
+		in_timer_draw = true;
+		timer_guard.flag = &in_timer_draw;
+		while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, TRUE) == kCFRunLoopRunHandledSource) {
+			// Continue.
+		}
 	}
 
 	[self.renderingLayer startRenderDisplayLayer];

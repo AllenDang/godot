@@ -49,8 +49,15 @@ vec3 ycocg_to_rgb(vec3 y) {
 	return max(vec3(tmp + y.y, y.x + y.z, tmp - y.y), vec3(0.0));
 }
 
+vec3 sanitize_hdr(vec3 c) {
+	if (any(isnan(c)) || any(isinf(c))) {
+		return vec3(0.0);
+	}
+	return clamp(c, vec3(0.0), vec3(65000.0));
+}
+
 vec3 hdr_tonemap_ycocg(vec3 rgb) {
-	rgb = max(rgb, vec3(0.0));
+	rgb = sanitize_hdr(rgb);
 	float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
 	return rgb_to_ycocg(rgb / (1.0 + luma));
 }
@@ -87,11 +94,11 @@ vec3 sample_history_catmull_rom_5(highp vec2 uv) {
 	float w_sum = wc + wl + wr + wt + wb;
 
 	vec3 accum =
-			textureLod(u_history, vec2(tc12.x, tc12.y), 0.0).rgb * wc +
-			textureLod(u_history, vec2(tc0.x, tc12.y), 0.0).rgb * wl +
-			textureLod(u_history, vec2(tc3.x, tc12.y), 0.0).rgb * wr +
-			textureLod(u_history, vec2(tc12.x, tc0.y), 0.0).rgb * wt +
-			textureLod(u_history, vec2(tc12.x, tc3.y), 0.0).rgb * wb;
+			sanitize_hdr(textureLod(u_history, vec2(tc12.x, tc12.y), 0.0).rgb) * wc +
+			sanitize_hdr(textureLod(u_history, vec2(tc0.x, tc12.y), 0.0).rgb) * wl +
+			sanitize_hdr(textureLod(u_history, vec2(tc3.x, tc12.y), 0.0).rgb) * wr +
+			sanitize_hdr(textureLod(u_history, vec2(tc12.x, tc0.y), 0.0).rgb) * wt +
+			sanitize_hdr(textureLod(u_history, vec2(tc12.x, tc3.y), 0.0).rgb) * wb;
 	return max(accum / max(w_sum, 1e-5), vec3(0.0));
 }
 
@@ -156,6 +163,9 @@ void main() {
 
 	// 2. Resolve exact motion vector (deriving camera velocity inline when sentinel <= -1.0).
 	highp vec2 raw_vel = texelFetch(u_velocity, closest_coord, 0).xy;
+	if (any(isnan(raw_vel)) || any(isinf(raw_vel))) {
+		raw_vel = vec2(-1.0);
+	}
 	highp vec2 velocity;
 	if (all(lessThanEqual(raw_vel, vec2(-1.0)))) {
 		highp vec2 closest_uv = (vec2(closest_coord) + 0.5) * params.inv_internal_size;

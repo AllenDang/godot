@@ -1274,7 +1274,16 @@ void MDCommandBuffer::render_begin_pass(RDD::RenderPassID p_render_pass, RDD::Fr
 void MDCommandBuffer::render_next_subpass() {
 	DEV_ASSERT(command_buffer());
 
+	const MDRenderPass &pass = *render.pass;
 	MDSubpass *prev_subpass = render.current_subpass;
+	if (pass.is_tile_fused && prev_subpass != nullptr) {
+		render.current_subpass = prev_subpass + 1;
+		render.dirty.set_flag(RenderState::DIRTY_PIPELINE);
+		render.dirty.set_flag(RenderState::DIRTY_DEPTH);
+		render.dirty.set_flag(RenderState::DIRTY_RASTER);
+		return;
+	}
+
 	if (prev_subpass != nullptr) {
 		_end_render_pass();
 		// The closed encoder updated F_cur, and this subpass depends on it.
@@ -1286,7 +1295,6 @@ void MDCommandBuffer::render_next_subpass() {
 			: prev_subpass + 1;
 
 	const MDFrameBuffer &fb = *render.frameBuffer;
-	const MDRenderPass &pass = *render.pass;
 	const MDSubpass &subpass = render.get_subpass();
 
 	NS::SharedPtr<MTL::RenderPassDescriptor> desc = NS::TransferPtr(MTL::RenderPassDescriptor::alloc()->init());
@@ -1298,72 +1306,189 @@ void MDCommandBuffer::render_next_subpass() {
 	PixelFormats &pf = device_driver->get_pixel_formats();
 
 	uint32_t attachmentCount = 0;
-	for (uint32_t i = 0; i < subpass.color_references.size(); i++) {
-		uint32_t idx = subpass.color_references[i].attachment;
-		if (idx == RDD::AttachmentReference::UNUSED) {
-			continue;
-		}
-
-		attachmentCount += 1;
-		MTL::RenderPassColorAttachmentDescriptor *ca = desc->colorAttachments()->object(i);
-
-		uint32_t resolveIdx = subpass.resolve_references.is_empty() ? RDD::AttachmentReference::UNUSED : subpass.resolve_references[i].attachment;
-		bool has_resolve = resolveIdx != RDD::AttachmentReference::UNUSED;
-		bool can_resolve = true;
-		if (resolveIdx != RDD::AttachmentReference::UNUSED) {
-			MTL::Texture *resolve_tex = fb.get_texture(resolveIdx);
-			can_resolve = flags::all(pf.getCapabilities(resolve_tex->pixelFormat()), kMTLFmtCapsResolve);
-			if (can_resolve) {
-				ca->setResolveTexture(resolve_tex);
-			} else {
-				CRASH_NOW_MSG("unimplemented: using a texture format that is not supported for resolve");
+	if (pass.is_tile_fused) {
+		for (uint32_t idx = 0; idx < pass.attachments.size(); idx++) {
+			const MDAttachment &attachment = pass.attachments[idx];
+			if (attachment.getFirstUseSubpassIndex() == UINT32_MAX || !(attachment.type & MDAttachmentType::Color)) {
+				continue;
 			}
-		}
-
-		const MDAttachment &attachment = pass.attachments[idx];
-
-		MTL::Texture *tex = fb.get_texture(idx);
-		ERR_FAIL_NULL_MSG(tex, "Frame buffer color texture is null.");
-
-		if ((attachment.type & MDAttachmentType::Color)) {
-			if (attachment.configureDescriptor(ca, pf, subpass, tex, render.is_rendering_entire_area, has_resolve, can_resolve, false)) {
-				Color clearColor = render.clear_values[idx].color;
-				ca->setClearColor(MTL::ClearColor(clearColor.r, clearColor.g, clearColor.b, clearColor.a));
+			const uint32_t slot = attachment.metal_color_slot;
+			if (slot == UINT32_MAX) {
+				continue;
 			}
-		}
-	}
 
-	if (subpass.depth_stencil_reference.attachment != RDD::AttachmentReference::UNUSED) {
-		attachmentCount += 1;
-		uint32_t idx = subpass.depth_stencil_reference.attachment;
-		const MDAttachment &attachment = pass.attachments[idx];
-		MTL::Texture *tex = fb.get_texture(idx);
-		ERR_FAIL_NULL_MSG(tex, "Frame buffer depth / stencil texture is null.");
-		if (attachment.type & MDAttachmentType::Depth) {
-			MTL::RenderPassDepthAttachmentDescriptor *da = desc->depthAttachment();
+			attachmentCount += 1;
+			MTL::RenderPassColorAttachmentDescriptor *ca = desc->colorAttachments()->object(slot);
+			MTL::Texture *tex = fb.get_texture(idx);
+			ERR_FAIL_NULL_MSG(tex, "Frame buffer color texture is null.");
 
-			uint32_t resolveIdx = subpass.depth_resolve_reference.attachment;
+			const MDSubpass &first_sp = pass.subpasses[attachment.getFirstUseSubpassIndex()];
+			const MDSubpass &last_sp = pass.subpasses[attachment.getLastUseSubpassIndex()];
+			uint32_t resolveIdx = RDD::AttachmentReference::UNUSED;
+			if (!last_sp.resolve_references.is_empty()) {
+				for (uint32_t c = 0; c < last_sp.color_references.size() && c < last_sp.resolve_references.size(); c++) {
+					if (last_sp.color_references[c].attachment == idx) {
+						resolveIdx = last_sp.resolve_references[c].attachment;
+						break;
+					}
+				}
+			}
 			bool has_resolve = resolveIdx != RDD::AttachmentReference::UNUSED;
 			bool can_resolve = true;
 			if (has_resolve) {
 				MTL::Texture *resolve_tex = fb.get_texture(resolveIdx);
 				can_resolve = flags::all(pf.getCapabilities(resolve_tex->pixelFormat()), kMTLFmtCapsResolve);
 				if (can_resolve) {
-					da->setResolveTexture(resolve_tex);
+					ca->setResolveTexture(resolve_tex);
 				} else {
 					CRASH_NOW_MSG("unimplemented: using a texture format that is not supported for resolve");
 				}
 			}
 
-			if (attachment.configureDescriptor(da, pf, subpass, tex, render.is_rendering_entire_area, has_resolve, can_resolve, false)) {
-				da->setClearDepth(render.clear_values[idx].depth);
+			ca->setTexture(tex);
+			const bool is_memoryless = tex->storageMode() == MTL::StorageModeMemoryless;
+			MTL::LoadAction load = render.is_rendering_entire_area ? attachment.loadAction : MTL::LoadActionLoad;
+			if (is_memoryless && load == MTL::LoadActionLoad) {
+				load = MTL::LoadActionDontCare;
+			}
+			ca->setLoadAction(load);
+			if (is_memoryless) {
+				ca->setStoreAction((has_resolve && can_resolve) ? MTL::StoreActionMultisampleResolve : MTL::StoreActionDontCare);
+			} else {
+				ca->setStoreAction(attachment.getMTLStoreAction(last_sp, render.is_rendering_entire_area, has_resolve, can_resolve, false));
+			}
+			if (load == MTL::LoadActionClear && attachment.shouldClear(first_sp, false)) {
+				Color clearColor = render.clear_values[idx].color;
+				ca->setClearColor(MTL::ClearColor(clearColor.r, clearColor.g, clearColor.b, clearColor.a));
 			}
 		}
 
-		if (attachment.type & MDAttachmentType::Stencil) {
-			MTL::RenderPassStencilAttachmentDescriptor *sa = desc->stencilAttachment();
-			if (attachment.configureDescriptor(sa, pf, subpass, tex, render.is_rendering_entire_area, false, false, true)) {
-				sa->setClearStencil(render.clear_values[idx].stencil);
+		if (pass.fused_depth_stencil_attachment != RDD::AttachmentReference::UNUSED) {
+			attachmentCount += 1;
+			const uint32_t idx = pass.fused_depth_stencil_attachment;
+			const MDAttachment &attachment = pass.attachments[idx];
+			const MDSubpass &first_sp = pass.subpasses[attachment.getFirstUseSubpassIndex()];
+			const MDSubpass &last_sp = pass.subpasses[attachment.getLastUseSubpassIndex()];
+			MTL::Texture *tex = fb.get_texture(idx);
+			ERR_FAIL_NULL_MSG(tex, "Frame buffer depth / stencil texture is null.");
+			const bool is_memoryless = tex->storageMode() == MTL::StorageModeMemoryless;
+
+			if (attachment.type & MDAttachmentType::Depth) {
+				MTL::RenderPassDepthAttachmentDescriptor *da = desc->depthAttachment();
+				uint32_t resolveIdx = last_sp.depth_resolve_reference.attachment;
+				bool has_resolve = resolveIdx != RDD::AttachmentReference::UNUSED;
+				bool can_resolve = true;
+				if (has_resolve) {
+					MTL::Texture *resolve_tex = fb.get_texture(resolveIdx);
+					can_resolve = flags::all(pf.getCapabilities(resolve_tex->pixelFormat()), kMTLFmtCapsResolve);
+					if (can_resolve) {
+						da->setResolveTexture(resolve_tex);
+					} else {
+						CRASH_NOW_MSG("unimplemented: using a texture format that is not supported for resolve");
+					}
+				}
+				da->setTexture(tex);
+				MTL::LoadAction load = render.is_rendering_entire_area ? attachment.loadAction : MTL::LoadActionLoad;
+				if (is_memoryless && load == MTL::LoadActionLoad) {
+					load = MTL::LoadActionDontCare;
+				}
+				da->setLoadAction(load);
+				if (is_memoryless) {
+					da->setStoreAction((has_resolve && can_resolve) ? MTL::StoreActionMultisampleResolve : MTL::StoreActionDontCare);
+				} else {
+					da->setStoreAction(attachment.getMTLStoreAction(last_sp, render.is_rendering_entire_area, has_resolve, can_resolve, false));
+				}
+				if (load == MTL::LoadActionClear && attachment.shouldClear(first_sp, false)) {
+					da->setClearDepth(render.clear_values[idx].depth);
+				}
+			}
+
+			if (attachment.type & MDAttachmentType::Stencil) {
+				MTL::RenderPassStencilAttachmentDescriptor *sa = desc->stencilAttachment();
+				sa->setTexture(tex);
+				MTL::LoadAction load = render.is_rendering_entire_area ? attachment.stencilLoadAction : MTL::LoadActionLoad;
+				if (is_memoryless && load == MTL::LoadActionLoad) {
+					load = MTL::LoadActionDontCare;
+				}
+				sa->setLoadAction(load);
+				if (is_memoryless) {
+					sa->setStoreAction(MTL::StoreActionDontCare);
+				} else {
+					sa->setStoreAction(attachment.getMTLStoreAction(last_sp, render.is_rendering_entire_area, false, false, true));
+				}
+				if (load == MTL::LoadActionClear && attachment.shouldClear(first_sp, true)) {
+					sa->setClearStencil(render.clear_values[idx].stencil);
+				}
+			}
+		}
+	} else {
+		for (uint32_t i = 0; i < subpass.color_references.size(); i++) {
+			uint32_t idx = subpass.color_references[i].attachment;
+			if (idx == RDD::AttachmentReference::UNUSED) {
+				continue;
+			}
+
+			attachmentCount += 1;
+			MTL::RenderPassColorAttachmentDescriptor *ca = desc->colorAttachments()->object(i);
+
+			uint32_t resolveIdx = subpass.resolve_references.is_empty() ? RDD::AttachmentReference::UNUSED : subpass.resolve_references[i].attachment;
+			bool has_resolve = resolveIdx != RDD::AttachmentReference::UNUSED;
+			bool can_resolve = true;
+			if (resolveIdx != RDD::AttachmentReference::UNUSED) {
+				MTL::Texture *resolve_tex = fb.get_texture(resolveIdx);
+				can_resolve = flags::all(pf.getCapabilities(resolve_tex->pixelFormat()), kMTLFmtCapsResolve);
+				if (can_resolve) {
+					ca->setResolveTexture(resolve_tex);
+				} else {
+					CRASH_NOW_MSG("unimplemented: using a texture format that is not supported for resolve");
+				}
+			}
+
+			const MDAttachment &attachment = pass.attachments[idx];
+
+			MTL::Texture *tex = fb.get_texture(idx);
+			ERR_FAIL_NULL_MSG(tex, "Frame buffer color texture is null.");
+
+			if ((attachment.type & MDAttachmentType::Color)) {
+				if (attachment.configureDescriptor(ca, pf, subpass, tex, render.is_rendering_entire_area, has_resolve, can_resolve, false)) {
+					Color clearColor = render.clear_values[idx].color;
+					ca->setClearColor(MTL::ClearColor(clearColor.r, clearColor.g, clearColor.b, clearColor.a));
+				}
+			}
+		}
+
+		if (subpass.depth_stencil_reference.attachment != RDD::AttachmentReference::UNUSED) {
+			attachmentCount += 1;
+			uint32_t idx = subpass.depth_stencil_reference.attachment;
+			const MDAttachment &attachment = pass.attachments[idx];
+			MTL::Texture *tex = fb.get_texture(idx);
+			ERR_FAIL_NULL_MSG(tex, "Frame buffer depth / stencil texture is null.");
+			if (attachment.type & MDAttachmentType::Depth) {
+				MTL::RenderPassDepthAttachmentDescriptor *da = desc->depthAttachment();
+
+				uint32_t resolveIdx = subpass.depth_resolve_reference.attachment;
+				bool has_resolve = resolveIdx != RDD::AttachmentReference::UNUSED;
+				bool can_resolve = true;
+				if (has_resolve) {
+					MTL::Texture *resolve_tex = fb.get_texture(resolveIdx);
+					can_resolve = flags::all(pf.getCapabilities(resolve_tex->pixelFormat()), kMTLFmtCapsResolve);
+					if (can_resolve) {
+						da->setResolveTexture(resolve_tex);
+					} else {
+						CRASH_NOW_MSG("unimplemented: using a texture format that is not supported for resolve");
+					}
+				}
+
+				if (attachment.configureDescriptor(da, pf, subpass, tex, render.is_rendering_entire_area, has_resolve, can_resolve, false)) {
+					da->setClearDepth(render.clear_values[idx].depth);
+				}
+			}
+
+			if (attachment.type & MDAttachmentType::Stencil) {
+				MTL::RenderPassStencilAttachmentDescriptor *sa = desc->stencilAttachment();
+				if (attachment.configureDescriptor(sa, pf, subpass, tex, render.is_rendering_entire_area, false, false, true)) {
+					sa->setClearStencil(render.clear_values[idx].stencil);
+				}
 			}
 		}
 	}
@@ -2009,6 +2134,9 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				p_enc.set(buf_info->buffer.get(), frame_idx * buf_info->size_bytes, indexes.buffer);
 			} break;
 			case RDD::UNIFORM_TYPE_INPUT_ATTACHMENT: {
+				if (p_shader->uses_framebuffer_fetch) {
+					break;
+				}
 				size_t count = uniform.ids.size();
 				MTL::Texture **objects = ALLOCA_ARRAY(MTL::Texture *, count);
 				for (size_t j = 0; j < count; j += 1) {

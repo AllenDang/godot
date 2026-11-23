@@ -397,7 +397,25 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 	msl_options.force_active_argument_buffer_resources = true;
 	msl_options.pad_argument_buffer_resources = true;
 	msl_options.texture_buffer_native = true; // Enable texture buffer support.
-	msl_options.use_framebuffer_fetch_subpasses = false;
+	bool has_ms_subpass_input = false;
+	for (const ReflectDescriptorSet &dset : p_shader.uniform_sets) {
+		for (const ReflectUniform &uniform : dset) {
+			if (RDC::UniformType(uniform.type) == RDC::UNIFORM_TYPE_INPUT_ATTACHMENT && uniform.get_spv_reflect().image.ms) {
+				has_ms_subpass_input = true;
+				break;
+			}
+		}
+		if (has_ms_subpass_input) {
+			break;
+		}
+	}
+	const bool fbfetch_env_disabled = OS::get_singleton() != nullptr && OS::get_singleton()->get_environment("GODOT_MTL_DISABLE_FBFETCH") == "1";
+	const bool use_fbfetch = !fbfetch_env_disabled &&
+			!has_ms_subpass_input &&
+			device_profile->gpu >= MetalDeviceProfile::GPU::Apple2 &&
+			(device_profile->platform != MetalDeviceProfile::Platform::macOS || msl_version >= MSL_VERSION_23);
+	msl_options.use_framebuffer_fetch_subpasses = use_fbfetch;
+	mtl_reflection_data.set_uses_framebuffer_fetch(use_fbfetch);
 	msl_options.pad_fragment_output_components = true;
 	msl_options.r32ui_alignment_constant_id = R32UI_ALIGNMENT_CONSTANT_ID;
 	msl_options.agx_manual_cube_grad_fixup = true;
@@ -558,10 +576,16 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 						rb.basetype = SPIRType::BaseType::Void;
 					} break;
 					case RDC::UNIFORM_TYPE_INPUT_ATTACHMENT: {
-						found->data_type = MTL::DataTypeTexture;
-						found->get_indexes(UniformData::IndexType::SLOT).texture = next_index(Texture, binding_stride);
-						found->get_indexes(UniformData::IndexType::ARG).texture = next_arg_index(binding_stride);
-						rb.basetype = SPIRType::BaseType::Image;
+						if (msl_options.use_framebuffer_fetch_subpasses) {
+							found->data_type = MTL::DataTypeNone;
+							found->usage = 0;
+							rb.basetype = SPIRType::BaseType::Unknown;
+						} else {
+							found->data_type = MTL::DataTypeTexture;
+							found->get_indexes(UniformData::IndexType::SLOT).texture = next_index(Texture, binding_stride);
+							found->get_indexes(UniformData::IndexType::ARG).texture = next_arg_index(binding_stride);
+							rb.basetype = SPIRType::BaseType::Image;
+						}
 					} break;
 					case RDC::UNIFORM_TYPE_MAX:
 					default:
@@ -669,6 +693,9 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 		spv::ExecutionModel execution_model = map_stage(stage);
 		for (uint32_t jj = 0; jj < spirv_bindings.size(); jj++) {
 			MSLResourceBinding &rb = spirv_bindings.ptr()[jj].first;
+			if (rb.basetype == SPIRType::BaseType::Unknown) {
+				continue;
+			}
 			rb.stage = execution_model;
 			compiler.add_msl_resource_binding(rb);
 		}

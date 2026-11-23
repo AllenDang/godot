@@ -793,8 +793,9 @@ RID RenderSceneBuffersRD::ensure_flora_vis_texture() {
 		return get_texture(SNAME("flora_vis"), SNAME("vis_id"));
 	}
 	uint32_t usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
-	const bool is_vulkan = OS::get_singleton() && OS::get_singleton()->get_current_rendering_driver_name() == "vulkan";
-	if (is_vulkan && !flora_desktop_tile_compute) {
+	const String driver_name = OS::get_singleton() ? OS::get_singleton()->get_current_rendering_driver_name() : String();
+	const bool is_tbdr_subpass_driver = (driver_name == "vulkan" || driver_name == "metal");
+	if (is_tbdr_subpass_driver && !flora_desktop_tile_compute) {
 		if (RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R32_UINT, usage_bits | RD::TEXTURE_USAGE_TRANSIENT_BIT)) {
 			usage_bits |= RD::TEXTURE_USAGE_TRANSIENT_BIT;
 		} else {

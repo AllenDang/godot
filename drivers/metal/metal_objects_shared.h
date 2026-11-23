@@ -416,11 +416,12 @@ struct MDSubpass {
 
 struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDAttachment {
 private:
-	uint32_t index = 0;
 	uint32_t firstUseSubpassIndex = 0;
 	uint32_t lastUseSubpassIndex = 0;
 
 public:
+	uint32_t index = 0;
+	uint32_t metal_color_slot = UINT32_MAX;
 	MTL::PixelFormat format = MTL::PixelFormatInvalid;
 	MDAttachmentType type = MDAttachmentType::None;
 	MTL::LoadAction loadAction = MTL::LoadActionDontCare;
@@ -428,6 +429,9 @@ public:
 	MTL::LoadAction stencilLoadAction = MTL::LoadActionDontCare;
 	MTL::StoreAction stencilStoreAction = MTL::StoreActionDontCare;
 	uint32_t samples = 1;
+
+	_FORCE_INLINE_ uint32_t getFirstUseSubpassIndex() const { return firstUseSubpassIndex; }
+	_FORCE_INLINE_ uint32_t getLastUseSubpassIndex() const { return lastUseSubpassIndex; }
 
 	/*!
 	 * @brief Returns true if this attachment is first used in the given subpass.
@@ -463,12 +467,16 @@ public:
 			bool p_can_resolve,
 			bool p_is_stencil) const {
 		p_desc->setTexture(p_attachment);
+		const bool is_memoryless = p_attachment->storageMode() == MTL::StorageModeMemoryless;
 
 		MTL::LoadAction load;
 		if (!p_is_rendering_entire_area || !isFirstUseOf(p_subpass)) {
-			load = MTL::LoadActionLoad;
+			load = is_memoryless ? MTL::LoadActionDontCare : MTL::LoadActionLoad;
 		} else {
 			load = p_is_stencil ? (MTL::LoadAction)stencilLoadAction : (MTL::LoadAction)loadAction;
+			if (is_memoryless && load == MTL::LoadActionLoad) {
+				load = MTL::LoadActionDontCare;
+			}
 		}
 
 		p_desc->setLoadAction(load);
@@ -478,6 +486,8 @@ public:
 		bool isStencilFormat = p_pf.isStencilFormat(mtlFmt);
 		if (isStencilFormat && !p_is_stencil && !isDepthFormat) {
 			p_desc->setStoreAction(MTL::StoreActionDontCare);
+		} else if (is_memoryless) {
+			p_desc->setStoreAction((p_has_resolve && p_can_resolve) ? MTL::StoreActionMultisampleResolve : MTL::StoreActionDontCare);
 		} else {
 			p_desc->setStoreAction(getMTLStoreAction(p_subpass, p_is_rendering_entire_area, p_has_resolve, p_can_resolve, p_is_stencil));
 		}
@@ -493,12 +503,15 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRenderP
 public:
 	LocalVector<MDAttachment> attachments;
 	LocalVector<MDSubpass> subpasses;
+	bool is_tile_fused = false;
+	uint32_t fused_color_count = 0;
+	uint32_t fused_depth_stencil_attachment = RDD::AttachmentReference::UNUSED;
 
 	uint32_t get_sample_count() const {
 		return attachments.is_empty() ? 1 : attachments[0].samples;
 	}
 
-	MDRenderPass(LocalVector<MDAttachment> &&p_attachments, LocalVector<MDSubpass> &&p_subpasses);
+	MDRenderPass(LocalVector<MDAttachment> &&p_attachments, LocalVector<MDSubpass> &&p_subpasses, bool p_allow_tile_fusion = false);
 };
 
 #pragma mark - Command Buffer Helpers
@@ -825,16 +838,9 @@ enum class ShaderLoadStrategy {
 class MDLibrary : public std::enable_shared_from_this<MDLibrary> {
 protected:
 	ShaderCacheEntry *_entry = nullptr;
-#ifdef DEV_ENABLED
 	NS::SharedPtr<NS::String> _original_source = nullptr;
-#endif
 
-	MDLibrary(ShaderCacheEntry *p_entry
-#ifdef DEV_ENABLED
-			,
-			NS::String *p_source
-#endif
-	);
+	MDLibrary(ShaderCacheEntry *p_entry, NS::String *p_source);
 
 public:
 	virtual ~MDLibrary();
@@ -842,9 +848,7 @@ public:
 	virtual MTL::Library *get_library() = 0;
 	virtual NS::Error *get_error() = 0;
 	virtual void set_label(NS::String *p_label);
-#ifdef DEV_ENABLED
 	NS::String *get_original_source() const { return _original_source.get(); }
-#endif
 
 	static std::shared_ptr<MDLibrary> create(ShaderCacheEntry *p_entry,
 			MTL::Device *p_device,
@@ -854,9 +858,7 @@ public:
 
 	static std::shared_ptr<MDLibrary> create(ShaderCacheEntry *p_entry,
 			MTL::Device *p_device,
-#ifdef DEV_ENABLED
 			NS::String *p_source,
-#endif
 			dispatch_data_t p_data);
 };
 
@@ -890,6 +892,7 @@ public:
 	} push_constants;
 	DynamicOffsetLayout dynamic_offset_layout;
 	bool uses_argument_buffers = true;
+	bool uses_framebuffer_fetch = false;
 
 	MDShader(CharString p_name, Vector<UniformSet> p_sets, bool p_uses_argument_buffers) :
 			name(p_name), sets(p_sets), uses_argument_buffers(p_uses_argument_buffers) {}
@@ -908,9 +911,14 @@ public:
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRenderShader final : public MDShader {
 public:
 	bool needs_view_mask_buffer = false;
+	bool needs_debug_logging = false;
+	bool frag_is_position_invariant = false;
+	uint32_t msl_version = 0;
 
 	std::shared_ptr<MDLibrary> vert;
 	std::shared_ptr<MDLibrary> frag;
+	LocalVector<std::shared_ptr<MDLibrary>> remapped_frag_libs;
+	Mutex remapped_frag_mutex;
 
 	MDRenderShader(CharString p_name,
 			Vector<UniformSet> p_sets,
