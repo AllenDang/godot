@@ -50,8 +50,6 @@
 
 #include "rendering_device_driver_metal.h"
 
-#include <string>
-
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
@@ -72,6 +70,7 @@
 #include <os/signpost.h>
 
 #include <algorithm>
+#include <string>
 
 #ifndef MTLGPUAddress
 typedef uint64_t MTLGPUAddress;
@@ -3351,8 +3350,8 @@ Error RenderingDeviceDriverMetal::_create_device() {
 	_enable_debug_labels = true;
 #else
 	_enable_debug_labels = (OS::get_singleton() != nullptr &&
-			(OS::get_singleton()->get_environment("METAL_CAPTURE_ENABLED") == U"1" ||
-					OS::get_singleton()->get_environment("GODOT_MTL_DEBUG_LABELS") == U"1")) ||
+								   (OS::get_singleton()->get_environment("METAL_CAPTURE_ENABLED") == U"1" ||
+										   OS::get_singleton()->get_environment("GODOT_MTL_DEBUG_LABELS") == U"1")) ||
 			(cap_mgr != nullptr && (cap_mgr->isCapturing() || cap_mgr->supportsDestination(MTL::CaptureDestinationGPUTraceDocument)));
 #endif
 

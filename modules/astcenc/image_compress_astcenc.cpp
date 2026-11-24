@@ -36,6 +36,7 @@
 #include "core/string/print_string.h"
 
 #include <astcenc.h>
+
 #include <atomic>
 
 #if defined(__aarch64__) || defined(_M_ARM64)

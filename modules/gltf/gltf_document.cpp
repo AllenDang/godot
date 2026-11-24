@@ -2561,8 +2561,8 @@ Error GLTFDocument::_parse_images(Ref<GLTFState> p_state, const String &p_base_p
 					if (texture.is_valid()) {
 						p_state->images.push_back(texture);
 						p_state->source_images.push_back(texture->has_meta(SNAME("_ange_gpu_source_image"))
-								? Ref<Image>(texture->get_meta(SNAME("_ange_gpu_source_image")))
-								: texture->get_image());
+										? Ref<Image>(texture->get_meta(SNAME("_ange_gpu_source_image")))
+										: texture->get_image());
 						continue;
 					}
 				}

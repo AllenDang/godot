@@ -829,7 +829,6 @@ void RenderForwardMobile::_setup_lightmaps(const RenderDataRD *p_render_data, co
 		scene_state.lightmap_ids[i] = p_lightmaps[i];
 		scene_state.lightmap_has_sh[i] = light_storage->lightmap_uses_spherical_harmonics(lightmap);
 
-
 		scene_state.lightmaps_used++;
 	}
 	if (scene_state.lightmaps_used > 0) {

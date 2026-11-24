@@ -39,13 +39,14 @@
 
 #include "modules/modules_enabled.gen.h"
 
+#include <objc/message.h>
+#include <os/log.h>
+#include <os/signpost.h>
+
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <objc/message.h>
-#include <os/log.h>
-#include <os/signpost.h>
 
 #if defined(VISIONOS_ENABLED) && defined(MODULE_VISIONOS_XR_ENABLED)
 #include "modules/visionos_xr/visionos_xr_interface.h"
