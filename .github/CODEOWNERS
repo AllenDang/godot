@@ -202,6 +202,7 @@
 /modules/noise/tests/                         @godotengine/core @godotengine/tests
 /modules/objectdb_profiler/                   @godotengine/debugger
 /modules/objectdb_profiler/editor/            @godotengine/debugger @godotengine/editor
+/modules/perfci/                              @godotengine/debugger
 /modules/regex/                               @godotengine/core
 /modules/regex/doc_classes/                   @godotengine/core @godotengine/documentation
 /modules/regex/tests/                         @godotengine/core @godotengine/tests
