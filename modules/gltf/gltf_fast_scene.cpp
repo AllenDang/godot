@@ -1477,13 +1477,13 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 				stack.push_back(FastStackEntry{ fast_children_pool[rfn.first_child + uint32_t(c)], root_ss_idx });
 			}
 		} else {
-			String sname = p_state->get_scene_name();
-			if (sname.is_empty()) {
-				sname = "Node3D";
+			String scene_name_str = p_state->get_scene_name();
+			if (scene_name_str.is_empty()) {
+				scene_name_str = "Node3D";
 			} else {
-				sname = GLTFFastAccess::gen_unique_name(p_doc, p_state, sname);
+				scene_name_str = GLTFFastAccess::gen_unique_name(p_doc, p_state, scene_name_str);
 			}
-			const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(sname)), -1, -1, next_unique_id++);
+			const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(scene_name_str)), -1, -1, next_unique_id++);
 			const Vector<int> &rnodes = GLTFFastAccess::root_nodes(p_state.ptr());
 			for (int r = rnodes.size() - 1; r >= 0; r--) {
 				stack.push_back(FastStackEntry{ rnodes[r], root_ss_idx });
@@ -1538,13 +1538,13 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 				stack.push_back(StackEntry{ rchildren[c], root_ss_idx });
 			}
 		} else {
-			String sname = p_state->get_scene_name();
-			if (sname.is_empty()) {
-				sname = "Node3D";
+			String scene_name_str = p_state->get_scene_name();
+			if (scene_name_str.is_empty()) {
+				scene_name_str = "Node3D";
 			} else {
-				sname = GLTFFastAccess::gen_unique_name(p_doc, p_state, sname);
+				scene_name_str = GLTFFastAccess::gen_unique_name(p_doc, p_state, scene_name_str);
 			}
-			const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(sname)), -1, -1, next_unique_id++);
+			const int root_ss_idx = ss->add_node(-1, -1, type_node3d, intern_name(StringName(scene_name_str)), -1, -1, next_unique_id++);
 			const Vector<int> &rnodes = GLTFFastAccess::root_nodes(p_state.ptr());
 			for (int r = rnodes.size() - 1; r >= 0; r--) {
 				stack.push_back(StackEntry{ rnodes[r], root_ss_idx });
@@ -1954,9 +1954,9 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 				ntype = type_bone_attach;
 			}
 
-			const StringName sname(vn.name);
+			const StringName node_sname(vn.name);
 			const int owner_ss = (item.parent_ss_idx < 0) ? -1 : 0;
-			const int ss_idx = ss->add_node(item.parent_ss_idx, owner_ss, ntype, intern_name(sname), -1, -1, next_unique_id++);
+			const int ss_idx = ss->add_node(item.parent_ss_idx, owner_ss, ntype, intern_name(node_sname), -1, -1, next_unique_id++);
 
 			if (item.parent_ss_idx < 0) {
 				Vector<StringName> dot_p;
@@ -1967,7 +1967,7 @@ Ref<PackedScene> gltf_build_packed_scene_direct(
 				if (p.size() == 1 && p[0] == SNAME(".")) {
 					p.clear();
 				}
-				p.push_back(sname);
+				p.push_back(node_sname);
 				vnode_paths[uint32_t(item.vidx)] = p;
 			}
 

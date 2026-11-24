@@ -30,12 +30,13 @@
 
 #pragma once
 
+#include "core/os/condition_variable.h"
+#include "core/os/mutex.h"
 #include "core/os/thread.h"
 #include "core/templates/local_vector.h"
 
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
+#include <type_traits>
 
 // Global low-priority asset loading pool strictly capped at <= 3 worker threads.
 // All worker threads run at Thread::PRIORITY_LOW (QOS_CLASS_UTILITY on Apple
@@ -53,10 +54,10 @@ private:
 		Thread thread;
 	};
 
-	std::mutex dispatch_mutex;
-	std::mutex queue_mutex;
-	std::condition_variable worker_cv;
-	std::condition_variable done_cv;
+	BinaryMutex dispatch_mutex;
+	BinaryMutex queue_mutex;
+	ConditionVariable worker_cv;
+	ConditionVariable done_cv;
 
 	LocalVector<WorkerSlot *> workers;
 	bool initialized = false;

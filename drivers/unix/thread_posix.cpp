@@ -44,10 +44,12 @@ void init_thread_posix() {
 #include <pthread_np.h>
 #endif
 
+#if !defined(WEB_ENABLED)
 #include <sys/resource.h>
-#include <unistd.h>
+#endif
 
-static Error set_priority(Thread::Priority p_priority) {
+static void set_priority(Thread::Priority p_priority) {
+#if !defined(WEB_ENABLED)
 	int nice_val = 0;
 	switch (p_priority) {
 		case Thread::PRIORITY_LOW:
@@ -60,11 +62,10 @@ static Error set_priority(Thread::Priority p_priority) {
 			nice_val = -2;
 			break;
 	}
-	int err = setpriority(PRIO_PROCESS, 0, nice_val);
-	if (err != 0 && p_priority == Thread::PRIORITY_HIGH) {
-		return OK;
-	}
-	return err == 0 ? OK : ERR_CANT_CREATE;
+	(void)setpriority(PRIO_PROCESS, 0, nice_val);
+#else
+	(void)p_priority;
+#endif
 }
 
 static Error set_name(const String &p_name) {

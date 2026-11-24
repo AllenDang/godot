@@ -56,9 +56,10 @@ struct ScopedAutoreleasePool {
 #endif
 
 thread_local bool tl_is_load_pool_worker = false;
-std::mutex g_pool_singleton_mutex;
+BinaryMutex g_pool_singleton_mutex;
 LoadThreadPool *g_load_pool_singleton = nullptr;
 
+#ifdef THREADS_ENABLED
 int query_env_max_threads() {
 	const char *env = std::getenv("ANGE_GLB_MAX_THREADS");
 	if (!env || env[0] == '\0') {
@@ -87,6 +88,7 @@ int query_platform_thermal_state() {
 	return 0;
 #endif
 }
+#endif // THREADS_ENABLED
 
 struct ScopedPoolParticipant {
 	bool prev;
@@ -104,7 +106,7 @@ struct ScopedPoolParticipant {
 LoadThreadPool *LoadThreadPool::get_singleton() {
 	LoadThreadPool *pool = nullptr;
 	{
-		std::lock_guard<std::mutex> lock(g_pool_singleton_mutex);
+		MutexLock<BinaryMutex> lock(g_pool_singleton_mutex);
 		if (!g_load_pool_singleton) {
 			g_load_pool_singleton = memnew(LoadThreadPool);
 		}
@@ -117,7 +119,7 @@ LoadThreadPool *LoadThreadPool::get_singleton() {
 void LoadThreadPool::cleanup() {
 	LoadThreadPool *instance = nullptr;
 	{
-		std::lock_guard<std::mutex> lock(g_pool_singleton_mutex);
+		MutexLock<BinaryMutex> lock(g_pool_singleton_mutex);
 		instance = g_load_pool_singleton;
 		g_load_pool_singleton = nullptr;
 	}
@@ -125,7 +127,7 @@ void LoadThreadPool::cleanup() {
 		return;
 	}
 	{
-		std::lock_guard<std::mutex> qlock(instance->queue_mutex);
+		MutexLock<BinaryMutex> qlock(instance->queue_mutex);
 		instance->shutting_down = true;
 	}
 	instance->worker_cv.notify_all();
@@ -140,6 +142,9 @@ void LoadThreadPool::cleanup() {
 }
 
 int LoadThreadPool::get_concurrency_budget(bool p_gameplay_throttle) const {
+#ifndef THREADS_ENABLED
+	return 1;
+#else
 	static const int env_cap = query_env_max_threads();
 	const int cpu_count = OS::get_singleton() ? MAX(1, OS::get_singleton()->get_processor_count()) : 1;
 	int budget = MIN(MAX_LOAD_THREADS, cpu_count);
@@ -160,13 +165,15 @@ int LoadThreadPool::get_concurrency_budget(bool p_gameplay_throttle) const {
 		}
 	}
 	return CLAMP(budget, 1, MAX_LOAD_THREADS);
+#endif
 }
 
 void LoadThreadPool::_ensure_initialized() {
-	std::lock_guard<std::mutex> qlock(queue_mutex);
+	MutexLock<BinaryMutex> qlock(queue_mutex);
 	if (initialized || shutting_down) {
 		return;
 	}
+#ifdef THREADS_ENABLED
 	const int cpu_count = OS::get_singleton() ? MAX(1, OS::get_singleton()->get_processor_count()) : 1;
 	// Calling thread participates as 1 worker, so at most (MAX_LOAD_THREADS - 1) helper threads are needed.
 	const int num_workers = CLAMP(cpu_count - 1, 1, MAX_LOAD_THREADS - 1);
@@ -181,6 +188,7 @@ void LoadThreadPool::_ensure_initialized() {
 		slot->thread.start(_worker_entry, slot, settings);
 		workers.push_back(slot);
 	}
+#endif
 	initialized = true;
 }
 
@@ -198,13 +206,13 @@ void LoadThreadPool::_worker_loop(int p_slot_index) {
 		void *ud = nullptr;
 		int count = 0;
 		{
-			std::unique_lock<std::mutex> qlock(queue_mutex);
-			worker_cv.wait(qlock, [&]() {
-				return shutting_down ||
-						(job_generation != seen_generation &&
-								p_slot_index < active_worker_limit &&
-								next_index.load(std::memory_order_relaxed) < job_count);
-			});
+			MutexLock<BinaryMutex> qlock(queue_mutex);
+			while (!shutting_down &&
+					!(job_generation != seen_generation &&
+							p_slot_index < active_worker_limit &&
+							next_index.load(std::memory_order_relaxed) < job_count)) {
+				worker_cv.wait(qlock);
+			}
 			if (shutting_down) {
 				return;
 			}
@@ -227,7 +235,7 @@ void LoadThreadPool::_worker_loop(int p_slot_index) {
 		}
 
 		{
-			std::lock_guard<std::mutex> qlock(queue_mutex);
+			MutexLock<BinaryMutex> qlock(queue_mutex);
 			if (remaining_workers.fetch_sub(1, std::memory_order_acq_rel) == 1 && active_worker_limit == 0) {
 				done_cv.notify_one();
 			}
@@ -254,7 +262,7 @@ void LoadThreadPool::parallel_for_raw(int p_count, TaskCallback p_callback, void
 		return;
 	}
 
-	std::lock_guard<std::mutex> dlock(dispatch_mutex);
+	MutexLock<BinaryMutex> dlock(dispatch_mutex);
 	_ensure_initialized();
 	const int avail = static_cast<int>(workers.size());
 	const int total_threads = CLAMP(MIN(p_count, budget), 1, MAX_LOAD_THREADS);
@@ -267,7 +275,7 @@ void LoadThreadPool::parallel_for_raw(int p_count, TaskCallback p_callback, void
 	}
 
 	{
-		std::lock_guard<std::mutex> qlock(queue_mutex);
+		MutexLock<BinaryMutex> qlock(queue_mutex);
 		job_callback = p_callback;
 		job_userdata = p_userdata;
 		job_count = p_count;
@@ -290,11 +298,11 @@ void LoadThreadPool::parallel_for_raw(int p_count, TaskCallback p_callback, void
 	}
 
 	{
-		std::unique_lock<std::mutex> qlock(queue_mutex);
+		MutexLock<BinaryMutex> qlock(queue_mutex);
 		active_worker_limit = 0;
-		done_cv.wait(qlock, [&]() {
-			return remaining_workers.load(std::memory_order_acquire) == 0;
-		});
+		while (remaining_workers.load(std::memory_order_acquire) != 0) {
+			done_cv.wait(qlock);
+		}
 		job_callback = nullptr;
 		job_userdata = nullptr;
 		job_count = 0;

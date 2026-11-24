@@ -84,20 +84,20 @@ bool Skeleton3D::_set(const StringName &p_path, const Variant &p_value) {
 	}
 
 	uint32_t which = 0;
-	int pos = 6;
-	if (pos >= len || s[pos] < '0' || s[pos] > '9') {
+	int char_pos = 6;
+	if (char_pos >= len || s[char_pos] < '0' || s[char_pos] > '9') {
 		return false;
 	}
-	while (pos < len && s[pos] >= '0' && s[pos] <= '9') {
-		which = which * 10u + uint32_t(s[pos] - '0');
-		pos++;
+	while (char_pos < len && s[char_pos] >= '0' && s[char_pos] <= '9') {
+		which = which * 10u + uint32_t(s[char_pos] - '0');
+		char_pos++;
 	}
-	if (pos >= len || s[pos] != '/') {
+	if (char_pos >= len || s[char_pos] != '/') {
 		return false;
 	}
-	pos++;
-	const char32_t *what_ptr = s + pos;
-	const int what_len = len - pos;
+	char_pos++;
+	const char32_t *what_ptr = s + char_pos;
+	const int what_len = len - char_pos;
 
 	if (which == bones.size() && what_len == 4 && what_ptr[0] == 'n' && what_ptr[1] == 'a' && what_ptr[2] == 'm' && what_ptr[3] == 'e') {
 		add_bone(p_value);
@@ -126,7 +126,7 @@ bool Skeleton3D::_set(const StringName &p_path, const Variant &p_value) {
 		return true;
 	}
 
-	String what = path.substr(pos);
+	String what = path.substr(char_pos);
 	if (what.begins_with("bone_meta/")) {
 		set_bone_meta(which, what.substr(10), p_value);
 #ifndef DISABLE_DEPRECATED

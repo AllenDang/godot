@@ -1700,7 +1700,7 @@ Error gltf_build_fast_array_mesh(
 							float wf_lane[4];
 							vst1q_f32(wf_lane, wv);
 							const Vector3 &p = pos_ptr[vi];
-							const float p4[4] = { p.x, p.y, p.z, 0.0f };
+							const float p4[4] = { float(p.x), float(p.y), float(p.z), 0.0f };
 							const float32x4_t pv = vld1q_f32(p4);
 							for (uint32_t b = 0; b < 4; b++) {
 								if (wf_lane[b] > 0.0f) {

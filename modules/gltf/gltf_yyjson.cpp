@@ -1111,9 +1111,9 @@ Error gltf_yyjson_populate_state(
 					}
 				}
 			}
-			const String sname = yj_str(yyjson_obj_get(sobj, "name"));
-			if (!sname.is_empty() && !sname.begins_with("Scene")) {
-				GLTFFastAccess::scene_name(p_state.ptr()) = sname;
+			const String scene_name_str = yj_str(yyjson_obj_get(sobj, "name"));
+			if (!scene_name_str.is_empty() && !scene_name_str.begins_with("Scene")) {
+				GLTFFastAccess::scene_name(p_state.ptr()) = scene_name_str;
 			} else if (GLTFFastAccess::scene_name(p_state.ptr()).is_empty()) {
 				GLTFFastAccess::scene_name(p_state.ptr()) = GLTFFastAccess::filename(p_state.ptr());
 			}
