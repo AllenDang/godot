@@ -33,6 +33,8 @@
 #include "drivers/metal/metal3_objects.h"
 #include "drivers/metal/rendering_device_driver_metal.h"
 
+#include "modules/modules_enabled.gen.h" // For perfci.
+
 #include <Metal/Metal.hpp>
 
 namespace MTL3 {
@@ -67,6 +69,11 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) RenderingDeviceDriverMet
 
 	Error _execute_and_present_barriers(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains);
 	Error _execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains);
+
+#ifdef MODULE_PERFCI_ENABLED
+	bool perfci_capturing = false;
+	void _perfci_frame_boundary();
+#endif
 
 protected:
 	Error _create_device() override;

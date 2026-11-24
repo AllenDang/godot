@@ -36,6 +36,12 @@
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_context_driver_metal.h"
 
+#ifdef MODULE_PERFCI_ENABLED
+#include "core/config/engine.h"
+
+#include "modules/perfci/perfci_gpu_capture.h"
+#endif
+
 namespace MTL3 {
 
 #pragma mark - Fence
@@ -251,11 +257,45 @@ Error RenderingDeviceDriverMetal::command_queue_execute_and_present(CommandQueue
 		// Used as a signal that we're presenting, so this is the end of a frame.
 		MTL::CaptureScope *scope = device_scope.get();
 		scope->endScope();
+#ifdef MODULE_PERFCI_ENABLED
+		_perfci_frame_boundary();
+#endif
 		scope->beginScope();
 	}
 
 	return OK;
 }
+
+#ifdef MODULE_PERFCI_ENABLED
+void RenderingDeviceDriverMetal::_perfci_frame_boundary() {
+	if (!perfci_capturing && !PerfCIGpuCapture::has_pending_request()) {
+		return;
+	}
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+	MTL::CaptureManager *manager = MTL::CaptureManager::sharedCaptureManager();
+	if (perfci_capturing) {
+		// Started at the previous present, so every command buffer of this frame is recorded.
+		manager->stopCapture();
+		perfci_capturing = false;
+		PerfCIGpuCapture::finish(String(), Engine::get_singleton()->get_frames_drawn() + 1);
+	}
+
+	String path;
+	if (!PerfCIGpuCapture::take_request(path)) {
+		return;
+	}
+	NS::SharedPtr<MTL::CaptureDescriptor> descriptor = NS::TransferPtr(MTL::CaptureDescriptor::alloc()->init());
+	descriptor->setCaptureObject(device);
+	descriptor->setDestination(MTL::CaptureDestinationGPUTraceDocument);
+	descriptor->setOutputURL(NS::URL::fileURLWithPath(NS::String::string(path.utf8().get_data(), NS::UTF8StringEncoding)));
+	NS::Error *error = nullptr;
+	if (manager->startCapture(descriptor.get(), &error)) {
+		perfci_capturing = true;
+		return;
+	}
+	PerfCIGpuCapture::finish(error ? String::utf8(error->localizedDescription()->utf8String()) : String("MTLCaptureManager failed to start the capture."), 0);
+}
+#endif
 
 void RenderingDeviceDriverMetal::command_queue_free(CommandQueueID p_cmd_queue) {
 }
