@@ -34,7 +34,6 @@
 
 #include "core/os/memory.h"
 #include "core/string/ustring.h"
-#include "core/templates/local_vector.h"
 #include "core/variant/variant.h"
 
 #include <yyjson.h>

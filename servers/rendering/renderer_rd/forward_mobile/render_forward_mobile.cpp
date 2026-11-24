@@ -31,6 +31,7 @@
 #include "render_forward_mobile.h"
 
 #include "core/config/project_settings.h"
+#include "servers/rendering/renderer_rd/forward_mobile/flora_tile_vis.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -46,7 +47,7 @@
 #include "servers/xr/xr_server.h"
 #endif
 
-#include "modules/modules_enabled.gen.h"
+#include "modules/modules_enabled.gen.h" // IWYU pragma: keep
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
 #include "modules/texture_streaming/texture_streaming.h"
 #endif

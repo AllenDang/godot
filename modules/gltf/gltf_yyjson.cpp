@@ -41,13 +41,10 @@
 #include "core/io/file_access.h"
 #include "core/io/file_access_mmap.h"
 #include "core/io/image.h"
-#include "core/io/marshalls.h"
 #include "core/io/resource_loader.h"
-#include "core/object/class_db.h"
 #include "core/os/load_thread_pool.h"
 #include "scene/resources/image_texture.h"
 #include "scene/resources/material.h"
-#include "scene/resources/placeholder_textures.h"
 #include "scene/resources/portable_compressed_texture.h"
 
 #include <atomic>
@@ -286,19 +283,20 @@ Error GLTFYyjsonDoc::parse(const char *p_utf8, size_t p_len, String *r_err_msg, 
 		return ERR_PARSE_ERROR;
 	}
 
-	const size_t pool_bytes = yyjson_read_max_memory_usage(p_len, 0);
+	const yyjson_read_flag flg = YYJSON_READ_ALLOW_TRAILING_COMMAS | YYJSON_READ_ALLOW_COMMENTS;
+	const size_t pool_bytes = yyjson_read_max_memory_usage(p_len, flg);
 	if (pool_bytes > 0 && pool_bytes <= (256ULL * 1024ULL * 1024ULL)) {
 		pool_mem = Memory::alloc_static(pool_bytes);
 	}
 	yyjson_read_err read_err = {};
 	if (pool_mem && yyjson_alc_pool_init(&alc, pool_mem, pool_bytes)) {
-		doc = yyjson_read_opts(const_cast<char *>(p_utf8), p_len, 0, &alc, &read_err);
+		doc = yyjson_read_opts(const_cast<char *>(p_utf8), p_len, flg, &alc, &read_err);
 	} else {
 		if (pool_mem) {
 			Memory::free_static(pool_mem);
 			pool_mem = nullptr;
 		}
-		doc = yyjson_read_opts(const_cast<char *>(p_utf8), p_len, 0, nullptr, &read_err);
+		doc = yyjson_read_opts(const_cast<char *>(p_utf8), p_len, flg, nullptr, &read_err);
 	}
 
 	if (!doc) {

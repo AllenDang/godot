@@ -32,11 +32,11 @@
 
 #include "core/input/input.h"
 #include "core/input/input_event.h"
-#include "core/os/os.h"
 #include "servers/display/native_menu.h"
 #include "servers/rendering/dummy/rasterizer_dummy.h"
 
 #if defined(METAL_ENABLED) && defined(RD_ENABLED)
+#include "core/os/os.h"
 #include "drivers/metal/rendering_context_driver_metal.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/rendering_device.h"

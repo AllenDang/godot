@@ -35,8 +35,6 @@
 #include "core/os/os.h"
 #include "core/string/ustring.h"
 
-#include <cstdlib>
-
 #if defined(__APPLE__)
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -61,11 +59,15 @@ LoadThreadPool *g_load_pool_singleton = nullptr;
 
 #ifdef THREADS_ENABLED
 int query_env_max_threads() {
-	const char *env = std::getenv("ANGE_GLB_MAX_THREADS");
-	if (!env || env[0] == '\0') {
+	const OS *os = OS::get_singleton();
+	if (!os) {
 		return 0;
 	}
-	const int val = std::atoi(env);
+	const String env = os->get_environment("ANGE_GLB_MAX_THREADS");
+	if (env.is_empty()) {
+		return 0;
+	}
+	const int val = env.to_int();
 	return CLAMP(val, 1, LoadThreadPool::MAX_LOAD_THREADS);
 }
 

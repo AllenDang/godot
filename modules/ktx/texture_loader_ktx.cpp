@@ -32,9 +32,7 @@
 
 #include "core/io/compression.h"
 #include "core/io/file_access.h"
-#include "core/io/file_access_memory.h"
 #include "core/io/file_access_mmap.h"
-#include "core/math/math_funcs.h"
 #include "core/object/class_db.h"
 #include "core/os/load_thread_pool.h"
 #include "core/templates/local_vector.h"
