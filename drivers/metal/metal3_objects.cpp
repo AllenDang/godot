@@ -2033,8 +2033,8 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers(MDUniformSet *p_set, MDSha
 		enc->setVertexBuffer(alloc.buffer, alloc.offset, p_set_index);
 		enc->setFragmentBuffer(alloc.buffer, alloc.offset, p_set_index);
 	} else {
-		enc->setVertexBuffer(p_set->arg_buffer.buffer.get(), 0, p_set_index);
-		enc->setFragmentBuffer(p_set->arg_buffer.buffer.get(), 0, p_set_index);
+		enc->setVertexBuffer(p_set->arg_buffer_mtl(), p_set->arg_buffer_offset, p_set_index);
+		enc->setFragmentBuffer(p_set->arg_buffer_mtl(), p_set->arg_buffer_offset, p_set_index);
 	}
 }
 
@@ -2191,7 +2191,7 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers_compute(MDUniformSet *p_se
 
 		enc->setBuffer(alloc.buffer, alloc.offset, p_set_index);
 	} else {
-		enc->setBuffer(p_set->arg_buffer.buffer.get(), 0, p_set_index);
+		enc->setBuffer(p_set->arg_buffer_mtl(), p_set->arg_buffer_offset, p_set_index);
 	}
 }
 

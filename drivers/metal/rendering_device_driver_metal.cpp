@@ -1216,11 +1216,19 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 	PipelineType pipeline_type = PIPELINE_TYPE_RASTERIZATION;
 	Vector<uint8_t> decompressed_code;
 	bool frag_is_position_invariant = false;
+	PackedByteArray frag_compressed_code;
+	uint32_t frag_code_compression_flags = 0;
+	uint32_t frag_code_decompressed_size = 0;
+	uint32_t frag_source_size = 0;
 	for (uint32_t shader_index = 0; shader_index < shaders.size(); shader_index++) {
 		const RenderingShaderContainer::Shader &shader = shaders[shader_index];
 		const RSCM::StageData &shader_data = mtl_shaders[shader_index];
 		if (shader.shader_stage == RDD::ShaderStage::SHADER_STAGE_FRAGMENT) {
 			frag_is_position_invariant = shader_data.is_position_invariant;
+			frag_compressed_code = shader.code_compressed_bytes;
+			frag_code_compression_flags = shader.code_compression_flags;
+			frag_code_decompressed_size = shader.code_decompressed_size;
+			frag_source_size = shader_data.source_size;
 		}
 
 		if (shader.shader_stage == RDD::ShaderStage::SHADER_STAGE_COMPUTE) {
@@ -1243,16 +1251,15 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 		cd->name = shader_name;
 		cd->stage = shader.shader_stage;
 
-		NS::SharedPtr<NS::String> source = NS::TransferPtr(NS::String::alloc()->init((void *)decompressed_code.ptr(), shader_data.source_size, NS::UTF8StringEncoding));
-
 		std::shared_ptr<MDLibrary> library;
 		if (shader_data.library_size > 0) {
 			ERR_FAIL_COND_V_MSG(mtl_reflection_data.os_min_version > device_properties->os_version,
 					RDD::ShaderID(),
 					"Metal shader binary was generated for a newer target OS");
 			dispatch_data_t binary = dispatch_data_create(decompressed_code.ptr() + shader_data.source_size, shader_data.library_size, dispatch_get_main_queue(), DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-			library = MDLibrary::create(cd, device, source.get(), binary);
+			library = MDLibrary::create(cd, device, binary);
 		} else {
+			NS::SharedPtr<NS::String> source = NS::TransferPtr(NS::String::alloc()->init((void *)decompressed_code.ptr(), shader_data.source_size, NS::UTF8StringEncoding));
 			options->setPreserveInvariance(shader_data.is_position_invariant);
 #if __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000 || __IPHONE_OS_VERSION_MIN_REQUIRED >= 180000 || __TV_OS_VERSION_MIN_REQUIRED >= 180000 || defined(VISIONOS_ENABLED)
 			options->setMathMode(MTL::MathModeFast);
@@ -1347,6 +1354,10 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 		rs->needs_debug_logging = mtl_reflection_data.needs_debug_logging();
 		rs->frag_is_position_invariant = frag_is_position_invariant;
 		rs->msl_version = mtl_reflection_data.msl_version;
+		rs->frag_compressed_code = frag_compressed_code;
+		rs->frag_code_compression_flags = frag_code_compression_flags;
+		rs->frag_code_decompressed_size = frag_code_decompressed_size;
+		rs->frag_source_size = frag_source_size;
 		shader = rs;
 	}
 
@@ -1522,13 +1533,32 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 		}
 
 		if (!is_dynamic) {
-			set->arg_buffer = allocator->new_buffer(shader_set.buffer_size, base_hazard_tracking | MTL::ResourceStorageModePrivate);
-#if DEV_ENABLED
-			char label[64];
-			snprintf(label, sizeof(label), "Uniform Set %u", p_set_index);
-			set->arg_buffer.buffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
-#endif
-			_copy_queue_copy_to_buffer(arg_buffer_data, set->arg_buffer.buffer.get());
+			MTL::Buffer *arena_buf = nullptr;
+			uint32_t arena_off = 0;
+			uint16_t arena_bucket = UINT16_MAX;
+			uint16_t arena_chunk = 0;
+			if (_arg_buffer_arena.allocate(shader_set.buffer_size, allocator, base_hazard_tracking, _enable_debug_labels, arena_buf, arena_off, arena_bucket, arena_chunk)) {
+				set->arg_buffer_ptr = arena_buf;
+				set->arg_buffer_offset = arena_off;
+				set->arg_arena_bucket = arena_bucket;
+				set->arg_arena_chunk = arena_chunk;
+				if (!arg_buffer_data.is_empty()) {
+					memcpy(static_cast<uint8_t *>(arena_buf->contents()) + arena_off, arg_buffer_data.ptr(), arg_buffer_data.size());
+				}
+			} else {
+				set->arg_buffer = allocator->new_buffer(MAX(shader_set.buffer_size, 64u), base_hazard_tracking | MTL::ResourceStorageModeShared | MTL::ResourceCPUCacheModeWriteCombined);
+				set->arg_buffer_ptr = set->arg_buffer.buffer.get();
+				set->arg_buffer_offset = 0;
+				set->arg_arena_bucket = UINT16_MAX;
+				if (_enable_debug_labels && set->arg_buffer.buffer) {
+					char label[64];
+					snprintf(label, sizeof(label), "Uniform Set %u", p_set_index);
+					set->arg_buffer.buffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
+				}
+				if (!arg_buffer_data.is_empty() && set->arg_buffer.buffer) {
+					memcpy(set->arg_buffer.buffer->contents(), arg_buffer_data.ptr(), arg_buffer_data.size());
+				}
+			}
 		} else {
 			// Store the arg buffer data for dynamic uniform sets.
 			// It will be copied and updated at bind time.
@@ -1547,9 +1577,99 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 	return UniformSetID(set);
 }
 
+bool RenderingDeviceDriverMetal::MDArgBufferArena::allocate(uint32_t p_size, MetalAllocator *p_allocator, MTL::ResourceOptions p_base_hazard_tracking, bool p_debug_labels, MTL::Buffer *&r_buffer, uint32_t &r_offset, uint16_t &r_bucket, uint16_t &r_chunk) {
+	const uint32_t req_size = round_up_to_alignment(MAX(p_size, 64u), min_align);
+	if (req_size > BUCKET_SIZES[BUCKET_COUNT - 1]) {
+		r_bucket = UINT16_MAX;
+		return false;
+	}
+	uint16_t bucket = 0;
+	while (bucket < BUCKET_COUNT && BUCKET_SIZES[bucket] < req_size) {
+		bucket++;
+	}
+	const uint32_t slot_size = round_up_to_alignment(BUCKET_SIZES[bucket], min_align);
+	if (slot_size > BUCKET_SIZES[BUCKET_COUNT - 1]) {
+		r_bucket = UINT16_MAX;
+		return false;
+	}
+
+	MutexLock lock(mutex);
+	LocalVector<FreeSlot> &fl = free_lists[bucket];
+	if (!fl.is_empty()) {
+		const FreeSlot slot = fl[fl.size() - 1];
+		fl.remove_at(fl.size() - 1);
+		r_buffer = chunks[slot.chunk_index].buffer.buffer.get();
+		r_offset = slot.offset;
+		r_bucket = bucket;
+		r_chunk = slot.chunk_index;
+		return true;
+	}
+
+	for (uint32_t ci = 0; ci < chunks.size(); ci++) {
+		Chunk &c = chunks[ci];
+		const uint32_t aligned_head = round_up_to_alignment(c.head, min_align);
+		if (aligned_head + slot_size <= CHUNK_SIZE) {
+			c.head = aligned_head + slot_size;
+			r_buffer = c.buffer.buffer.get();
+			r_offset = aligned_head;
+			r_bucket = bucket;
+			r_chunk = static_cast<uint16_t>(ci);
+			return true;
+		}
+	}
+
+	if (chunks.size() >= UINT16_MAX) {
+		r_bucket = UINT16_MAX;
+		return false;
+	}
+
+	Chunk new_chunk;
+	new_chunk.buffer = p_allocator->new_buffer(CHUNK_SIZE, p_base_hazard_tracking | MTL::ResourceStorageModeShared | MTL::ResourceCPUCacheModeWriteCombined);
+	if (!new_chunk.buffer.buffer) {
+		r_bucket = UINT16_MAX;
+		return false;
+	}
+	if (p_debug_labels) {
+		new_chunk.buffer.buffer->setLabel(MTLSTR("Argument Buffer Arena"));
+	}
+	new_chunk.head = slot_size;
+	const uint16_t chunk_idx = static_cast<uint16_t>(chunks.size());
+	chunks.push_back(std::move(new_chunk));
+	r_buffer = chunks[chunk_idx].buffer.buffer.get();
+	r_offset = 0;
+	r_bucket = bucket;
+	r_chunk = chunk_idx;
+	return true;
+}
+
+void RenderingDeviceDriverMetal::MDArgBufferArena::release(uint16_t p_bucket, uint16_t p_chunk, uint32_t p_offset) {
+	if (p_bucket >= BUCKET_COUNT) {
+		return;
+	}
+	MutexLock lock(mutex);
+	free_lists[p_bucket].push_back({ p_chunk, p_offset });
+}
+
+void RenderingDeviceDriverMetal::MDArgBufferArena::clear(MetalAllocator *p_allocator) {
+	MutexLock lock(mutex);
+	for (uint32_t b = 0; b < BUCKET_COUNT; b++) {
+		free_lists[b].clear();
+	}
+	if (p_allocator != nullptr) {
+		for (uint32_t i = 0; i < chunks.size(); i++) {
+			p_allocator->free_buffer(chunks[i].buffer);
+		}
+	}
+	chunks.clear();
+}
+
 void RenderingDeviceDriverMetal::uniform_set_free(UniformSetID p_uniform_set) {
 	MDUniformSet *obj = (MDUniformSet *)p_uniform_set.id;
-	allocator->free_buffer(obj->arg_buffer);
+	if (obj->arg_arena_bucket != UINT16_MAX) {
+		_arg_buffer_arena.release(obj->arg_arena_bucket, obj->arg_arena_chunk, obj->arg_buffer_offset);
+	} else if (obj->arg_buffer.buffer) {
+		allocator->free_buffer(obj->arg_buffer);
+	}
 	memdelete(obj);
 }
 
@@ -1993,13 +2113,100 @@ std::shared_ptr<MDLibrary> RenderingDeviceDriverMetal::_get_or_create_remapped_f
 	if (!p_shader || !p_shader->frag) {
 		return nullptr;
 	}
-	NS::String *orig_ns = p_shader->frag->get_original_source();
-	const char *orig_utf8 = orig_ns ? orig_ns->utf8String() : nullptr;
-	if (!orig_utf8 || orig_utf8[0] == '\0') {
+
+	const bool check_in = p_shader->uses_framebuffer_fetch && p_in_slots != nullptr && p_in_count > 0;
+	bool is_identity = true;
+	if (p_out_slots != nullptr) {
+		for (uint32_t i = 0; i < p_out_count; i++) {
+			if (p_out_slots[i] != UINT32_MAX && p_out_slots[i] != i) {
+				is_identity = false;
+				break;
+			}
+		}
+	}
+	if (is_identity && check_in) {
+		for (uint32_t i = 0; i < p_in_count; i++) {
+			if (p_in_slots[i] != UINT32_MAX && p_in_slots[i] != i) {
+				is_identity = false;
+				break;
+			}
+		}
+	}
+	if (is_identity) {
 		return p_shader->frag;
 	}
 
-	std::string src(orig_utf8);
+	uint64_t slot_key = 0;
+	bool can_key_slots = p_out_count <= 8 && (!check_in || p_in_count <= 8);
+	if (can_key_slots) {
+		uint32_t out_packed = 0xFFFFFFFFu;
+		if (p_out_slots != nullptr) {
+			for (uint32_t i = 0; i < p_out_count; i++) {
+				const uint32_t v = p_out_slots[i];
+				if (v != UINT32_MAX && v >= 15u) {
+					can_key_slots = false;
+					break;
+				}
+				const uint32_t nib = (v == UINT32_MAX) ? 0xFu : (v & 0xFu);
+				out_packed = (out_packed & ~(0xFu << (i * 4u))) | (nib << (i * 4u));
+			}
+		}
+		uint32_t in_packed = 0xFFFFFFFFu;
+		if (can_key_slots && check_in) {
+			for (uint32_t i = 0; i < p_in_count; i++) {
+				const uint32_t v = p_in_slots[i];
+				if (v != UINT32_MAX && v >= 15u) {
+					can_key_slots = false;
+					break;
+				}
+				const uint32_t nib = (v == UINT32_MAX) ? 0xFu : (v & 0xFu);
+				in_packed = (in_packed & ~(0xFu << (i * 4u))) | (nib << (i * 4u));
+			}
+		}
+		slot_key = (uint64_t(in_packed) << 32u) | uint64_t(out_packed);
+	}
+
+	if (can_key_slots) {
+		MutexLock shader_lock(p_shader->remapped_frag_mutex);
+		for (const MDRenderShader::RemappedFragCacheItem &item : p_shader->remapped_frag_slot_cache) {
+			if (item.slot_key == slot_key) {
+				return item.lib;
+			}
+		}
+	}
+
+	if (p_shader->frag_source_size == 0 || p_shader->frag_compressed_code.is_empty()) {
+		return p_shader->frag;
+	}
+
+	Vector<uint8_t> decompressed_code;
+	const uint8_t *src_bytes = nullptr;
+	if (p_shader->frag_code_decompressed_size > 0) {
+		decompressed_code.resize(p_shader->frag_code_decompressed_size);
+		Ref<RenderingShaderContainer> container = shader_container_format->create_container();
+		if (!container->decompress_code(p_shader->frag_compressed_code.ptr(), p_shader->frag_compressed_code.size(), p_shader->frag_code_compression_flags, decompressed_code.ptrw(), decompressed_code.size())) {
+			ERR_PRINT(vformat("Failed to decompress fragment shader '%s' for subpass slot remap.", String::utf8(p_shader->name.get_data())));
+			return p_shader->frag;
+		}
+		src_bytes = decompressed_code.ptr();
+	} else {
+		src_bytes = p_shader->frag_compressed_code.ptr();
+	}
+
+	const uint32_t avail_len = p_shader->frag_code_decompressed_size > 0 ? p_shader->frag_code_decompressed_size : (uint32_t)p_shader->frag_compressed_code.size();
+	if (p_shader->frag_source_size > avail_len) {
+		return p_shader->frag;
+	}
+
+	std::string src(reinterpret_cast<const char *>(src_bytes), p_shader->frag_source_size);
+	const size_t nul_pos = src.find('\0');
+	if (nul_pos != std::string::npos) {
+		src.resize(nul_pos);
+	}
+	if (src.empty()) {
+		return p_shader->frag;
+	}
+
 	size_t frag_pos = src.find("\nfragment ");
 	if (frag_pos == std::string::npos) {
 		if (src.rfind("fragment ", 0) == 0) {
@@ -2047,18 +2254,29 @@ std::shared_ptr<MDLibrary> RenderingDeviceDriverMetal::_get_or_create_remapped_f
 	};
 
 	std::string remapped = remap_section(src, 0, frag_pos, p_out_slots, p_out_count);
-	if (p_shader->uses_framebuffer_fetch && p_in_count > 0 && frag_pos < src.size()) {
+	if (check_in && frag_pos < src.size()) {
 		remapped += remap_section(src, frag_pos, src.size(), p_in_slots, p_in_count);
 	} else if (frag_pos < src.size()) {
 		remapped.append(src, frag_pos, src.size() - frag_pos);
 	}
 
 	if (remapped == src) {
+		if (can_key_slots) {
+			MutexLock shader_lock(p_shader->remapped_frag_mutex);
+			p_shader->remapped_frag_slot_cache.push_back({ slot_key, p_shader->frag });
+		}
 		return p_shader->frag;
 	}
 
 	SHA256Digest remapped_hash(remapped.c_str(), remapped.length());
 	MutexLock shader_lock(p_shader->remapped_frag_mutex);
+	if (can_key_slots) {
+		for (const MDRenderShader::RemappedFragCacheItem &item : p_shader->remapped_frag_slot_cache) {
+			if (item.slot_key == slot_key) {
+				return item.lib;
+			}
+		}
+	}
 	if (std::optional<std::shared_ptr<MDLibrary>> cached = shader_cache_get_library(remapped_hash); cached) {
 		bool already_held = false;
 		for (const std::shared_ptr<MDLibrary> &held : p_shader->remapped_frag_libs) {
@@ -2069,6 +2287,9 @@ std::shared_ptr<MDLibrary> RenderingDeviceDriverMetal::_get_or_create_remapped_f
 		}
 		if (!already_held) {
 			p_shader->remapped_frag_libs.push_back(*cached);
+		}
+		if (can_key_slots) {
+			p_shader->remapped_frag_slot_cache.push_back({ slot_key, *cached });
 		}
 		return *cached;
 	}
@@ -2095,6 +2316,9 @@ std::shared_ptr<MDLibrary> RenderingDeviceDriverMetal::_get_or_create_remapped_f
 	std::shared_ptr<MDLibrary> library = MDLibrary::create(cd, device, remapped_ns.get(), options.get(), _shader_load_strategy);
 	shader_cache_set_entry(remapped_hash, cd);
 	p_shader->remapped_frag_libs.push_back(library);
+	if (can_key_slots) {
+		p_shader->remapped_frag_slot_cache.push_back({ slot_key, library });
+	}
 	return library;
 }
 
@@ -2204,7 +2428,9 @@ RDD::PipelineID RenderingDeviceDriverMetal::render_pipeline_create(
 	}
 
 	desc->setVertexDescriptor(vert_desc);
-	desc->setLabel(conv::to_nsstring(shader->name));
+	if (_enable_debug_labels) {
+		desc->setLabel(conv::to_nsstring(shader->name));
+	}
 
 	if (shader->uses_argument_buffers) {
 		// Set mutability of argument buffers.
@@ -2524,7 +2750,9 @@ RDD::PipelineID RenderingDeviceDriverMetal::compute_pipeline_create(ShaderID p_s
 
 	NS::SharedPtr<MTL::ComputePipelineDescriptor> desc = NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
 	desc->setComputeFunction(function.get());
-	desc->setLabel(conv::to_nsstring(shader->name));
+	if (_enable_debug_labels) {
+		desc->setLabel(conv::to_nsstring(shader->name));
+	}
 
 	if (shader->uses_argument_buffers) {
 		// Set mutability of argument buffers.
@@ -2692,6 +2920,9 @@ void RenderingDeviceDriverMetal::end_segment() {
 #pragma mark - Misc
 
 void RenderingDeviceDriverMetal::set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) {
+	if (!_enable_debug_labels) {
+		return;
+	}
 	NS::String *label = conv::to_nsstring(p_name);
 
 	switch (p_type) {
@@ -2721,7 +2952,9 @@ void RenderingDeviceDriverMetal::set_object_name(ObjectType p_type, ID p_driver_
 		} break;
 		case OBJECT_TYPE_UNIFORM_SET: {
 			MDUniformSet *set = (MDUniformSet *)(p_driver_id.id);
-			set->arg_buffer.buffer->setLabel(label);
+			if (set->arg_arena_bucket == UINT16_MAX && set->arg_buffer.buffer) {
+				set->arg_buffer.buffer->setLabel(label);
+			}
 		} break;
 		case OBJECT_TYPE_PIPELINE: {
 			// Can't set label after creation.
@@ -3086,6 +3319,7 @@ RenderingDeviceDriverMetal::~RenderingDeviceDriverMetal() {
 	memdelete(device_properties);
 
 	if (allocator != nullptr) {
+		_arg_buffer_arena.clear(allocator);
 		allocator->free_buffer(copy_queue_buffer);
 
 #ifdef DEBUG_ENABLED
@@ -3112,7 +3346,17 @@ RenderingDeviceDriverMetal::~RenderingDeviceDriverMetal() {
 Error RenderingDeviceDriverMetal::_create_device() {
 	device = context_driver->get_metal_device();
 
-	device_scope = NS::TransferPtr(MTL::CaptureManager::sharedCaptureManager()->newCaptureScope(device));
+	MTL::CaptureManager *cap_mgr = MTL::CaptureManager::sharedCaptureManager();
+#ifdef DEV_ENABLED
+	_enable_debug_labels = true;
+#else
+	_enable_debug_labels = (OS::get_singleton() != nullptr &&
+			(OS::get_singleton()->get_environment("METAL_CAPTURE_ENABLED") == U"1" ||
+					OS::get_singleton()->get_environment("GODOT_MTL_DEBUG_LABELS") == U"1")) ||
+			(cap_mgr != nullptr && (cap_mgr->isCapturing() || cap_mgr->supportsDestination(MTL::CaptureDestinationGPUTraceDocument)));
+#endif
+
+	device_scope = NS::TransferPtr(cap_mgr->newCaptureScope(device));
 	device_scope->setLabel(MTLSTR("Godot Frame"));
 	device_scope->beginScope(); // Allow Xcode to capture the first frame, if desired.
 
@@ -3217,6 +3461,7 @@ Error RenderingDeviceDriverMetal::_initialize(uint32_t p_device_index, uint32_t 
 	}
 
 	device_properties = memnew(MetalDeviceProperties(device));
+	_arg_buffer_arena.min_align = MAX(64u, (uint32_t)device_properties->limits.minUniformBufferOffsetAlignment);
 	pixel_formats = memnew(PixelFormats(device, device_properties->features));
 	device_profile = device_profile_from_properties(device_properties);
 	resource_cache = std::make_unique<MDResourceCache>(device, *pixel_formats, device_properties->limits.maxPerStageBufferCount);

@@ -838,9 +838,8 @@ enum class ShaderLoadStrategy {
 class MDLibrary : public std::enable_shared_from_this<MDLibrary> {
 protected:
 	ShaderCacheEntry *_entry = nullptr;
-	NS::SharedPtr<NS::String> _original_source = nullptr;
 
-	MDLibrary(ShaderCacheEntry *p_entry, NS::String *p_source);
+	explicit MDLibrary(ShaderCacheEntry *p_entry);
 
 public:
 	virtual ~MDLibrary();
@@ -848,7 +847,6 @@ public:
 	virtual MTL::Library *get_library() = 0;
 	virtual NS::Error *get_error() = 0;
 	virtual void set_label(NS::String *p_label);
-	NS::String *get_original_source() const { return _original_source.get(); }
 
 	static std::shared_ptr<MDLibrary> create(ShaderCacheEntry *p_entry,
 			MTL::Device *p_device,
@@ -858,7 +856,6 @@ public:
 
 	static std::shared_ptr<MDLibrary> create(ShaderCacheEntry *p_entry,
 			MTL::Device *p_device,
-			NS::String *p_source,
 			dispatch_data_t p_data);
 };
 
@@ -910,14 +907,25 @@ public:
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRenderShader final : public MDShader {
 public:
+	struct RemappedFragCacheItem {
+		uint64_t slot_key = 0;
+		std::shared_ptr<MDLibrary> lib;
+	};
+
 	bool needs_view_mask_buffer = false;
 	bool needs_debug_logging = false;
 	bool frag_is_position_invariant = false;
 	uint32_t msl_version = 0;
 
+	PackedByteArray frag_compressed_code;
+	uint32_t frag_code_compression_flags = 0;
+	uint32_t frag_code_decompressed_size = 0;
+	uint32_t frag_source_size = 0;
+
 	std::shared_ptr<MDLibrary> vert;
 	std::shared_ptr<MDLibrary> frag;
 	LocalVector<std::shared_ptr<MDLibrary>> remapped_frag_libs;
+	LocalVector<RemappedFragCacheItem> remapped_frag_slot_cache;
 	Mutex remapped_frag_mutex;
 
 	MDRenderShader(CharString p_name,
@@ -962,9 +970,17 @@ _FORCE_INLINE_ MTL::ResourceUsage resource_usage_for_stage(StageResourceUsage p_
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDUniformSet {
 public:
 	MetalBuffer arg_buffer;
+	MTL::Buffer *arg_buffer_ptr = nullptr;
+	uint32_t arg_buffer_offset = 0;
+	uint16_t arg_arena_bucket = UINT16_MAX;
+	uint16_t arg_arena_chunk = 0;
 	Vector<uint8_t> arg_buffer_data; // Stored for dynamic uniform sets.
 	ResourceUsageMap usage_to_resources; // Used by Metal 3 for resource tracking.
 	Vector<RDD::BoundUniform> uniforms;
+
+	_FORCE_INLINE_ MTL::Buffer *arg_buffer_mtl() const {
+		return arg_buffer_ptr ? arg_buffer_ptr : arg_buffer.buffer.get();
+	}
 };
 
 #pragma mark - Pipeline Types

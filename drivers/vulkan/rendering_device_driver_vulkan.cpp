@@ -7167,6 +7167,10 @@ void RenderingDeviceDriverVulkan::end_segment() {
 /**************/
 
 void RenderingDeviceDriverVulkan::set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) {
+	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+	if (functions.SetDebugUtilsObjectNameEXT == nullptr && functions.DebugMarkerSetObjectNameEXT == nullptr) {
+		return;
+	}
 	switch (p_type) {
 		case OBJECT_TYPE_TEXTURE: {
 			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;

@@ -18,9 +18,20 @@
 #if defined(__APPLE__)
 #include <objc/message.h>
 #include <objc/runtime.h>
+extern "C" void *objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void *p_pool);
 #endif
 
 namespace {
+
+#if defined(__APPLE__)
+struct ScopedAutoreleasePool {
+	void *pool = objc_autoreleasePoolPush();
+	~ScopedAutoreleasePool() {
+		objc_autoreleasePoolPop(pool);
+	}
+};
+#endif
 
 thread_local bool tl_is_load_pool_worker = false;
 std::mutex g_pool_singleton_mutex;
@@ -187,6 +198,9 @@ void LoadThreadPool::_worker_loop(int p_slot_index) {
 			if (idx >= count) {
 				break;
 			}
+#if defined(__APPLE__)
+			ScopedAutoreleasePool autorelease_pool;
+#endif
 			cb(ud, idx);
 		}
 

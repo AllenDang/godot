@@ -824,8 +824,8 @@ void ShaderCacheEntry::notify_free() {
 
 #pragma mark - MDLibrary
 
-MDLibrary::MDLibrary(ShaderCacheEntry *p_entry, NS::String *p_source) :
-		_entry(p_entry), _original_source(NS::RetainPtr(p_source)) {
+MDLibrary::MDLibrary(ShaderCacheEntry *p_entry) :
+		_entry(p_entry) {
 }
 
 MDLibrary::~MDLibrary() {
@@ -863,7 +863,7 @@ MDLazyLibrary::MDLazyLibrary(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
 		NS::String *p_source,
 		MTL::CompileOptions *p_options) :
-		MDLibrary(p_entry, p_source),
+		MDLibrary(p_entry),
 		_device(p_device),
 		_source(NS::RetainPtr(p_source)),
 		_options(NS::RetainPtr(p_options)) {
@@ -936,14 +936,15 @@ MDImmediateLibrary::MDImmediateLibrary(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
 		NS::String *p_source,
 		MTL::CompileOptions *p_options) :
-		MDLibrary(p_entry, p_source) {
+		MDLibrary(p_entry) {
 	os_signpost_id_t compile_id = (os_signpost_id_t)(uintptr_t)this;
 	os_signpost_interval_begin(LOG_INTERVALS, compile_id, "shader_compile",
 			"shader_name=%{public}s stage=%{public}s hash=%X",
 			p_entry->name.get_data(), SHADER_STAGE_NAMES[p_entry->stage], p_entry->key.short_sha());
 
-	// Use Metal's async compilation API with std::function callback.
-	p_device->newLibrary(p_source, p_options, [this, compile_id, p_entry](MTL::Library *library, NS::Error *error) {
+	// Retain source only for the lifetime of the async compilation callback.
+	NS::SharedPtr<NS::String> source_ref = NS::RetainPtr(p_source);
+	p_device->newLibrary(source_ref.get(), p_options, [this, compile_id, p_entry, source_ref](MTL::Library *library, NS::Error *error) {
 		os_signpost_interval_end(LOG_INTERVALS, compile_id, "shader_compile");
 		if (library) {
 			_library = NS::RetainPtr(library);
@@ -984,7 +985,6 @@ class MDBinaryLibrary final : public MDLibrary {
 public:
 	MDBinaryLibrary(ShaderCacheEntry *p_entry,
 			MTL::Device *p_device,
-			NS::String *p_source,
 			dispatch_data_t p_data);
 
 	MTL::Library *get_library() override;
@@ -993,9 +993,8 @@ public:
 
 MDBinaryLibrary::MDBinaryLibrary(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
-		NS::String *p_source,
 		dispatch_data_t p_data) :
-		MDLibrary(p_entry, p_source) {
+		MDLibrary(p_entry) {
 	NS::Error *error = nullptr;
 	_library = NS::TransferPtr(p_device->newLibrary(p_data, &error));
 	if (error != nullptr) {
@@ -1036,9 +1035,8 @@ std::shared_ptr<MDLibrary> MDLibrary::create(ShaderCacheEntry *p_entry,
 
 std::shared_ptr<MDLibrary> MDLibrary::create(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
-		NS::String *p_source,
 		dispatch_data_t p_data) {
-	std::shared_ptr<MDLibrary> lib = std::make_shared<MDBinaryLibrary>(p_entry, p_device, p_source, p_data);
+	std::shared_ptr<MDLibrary> lib = std::make_shared<MDBinaryLibrary>(p_entry, p_device, p_data);
 	p_entry->library = lib;
 	return lib;
 }
