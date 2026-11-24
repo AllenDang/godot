@@ -200,14 +200,25 @@ void GLTFNode::set_visible(bool p_visible) {
 }
 
 Variant GLTFNode::get_additional_data(const StringName &p_extension_name) {
+	if (p_extension_name == SNAME("GODOT_rest_transform")) {
+		return has_rest_transform ? Variant(rest_transform) : Variant();
+	}
 	return additional_data.get(p_extension_name, Variant());
 }
 
 bool GLTFNode::has_additional_data(const StringName &p_extension_name) {
+	if (p_extension_name == SNAME("GODOT_rest_transform")) {
+		return has_rest_transform;
+	}
 	return additional_data.has(p_extension_name);
 }
 
 void GLTFNode::set_additional_data(const StringName &p_extension_name, Variant p_additional_data) {
+	if (p_extension_name == SNAME("GODOT_rest_transform") && p_additional_data.get_type() == Variant::TRANSFORM3D) {
+		rest_transform = p_additional_data;
+		has_rest_transform = true;
+		return;
+	}
 	additional_data[p_extension_name] = p_additional_data;
 }
 

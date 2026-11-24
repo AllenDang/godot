@@ -31,6 +31,7 @@
 #include "render_forward_mobile.h"
 
 #include "core/config/project_settings.h"
+#include "servers/rendering/renderer_rd/forward_mobile/flora_tile_vis.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -46,7 +47,7 @@
 #include "servers/xr/xr_server.h"
 #endif
 
-#include "modules/modules_enabled.gen.h"
+#include "modules/modules_enabled.gen.h" // IWYU pragma: keep
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
 #include "modules/texture_streaming/texture_streaming.h"
 #endif
@@ -176,11 +177,46 @@ void RenderForwardMobile::fill_push_constant_instance_indices(SceneState::Instan
 
 /* Render buffer */
 
+void RenderForwardMobile::RenderBufferDataForwardMobile::ensure_fsr2(RendererRD::FSR2Effect *p_effect) {
+	if (fsr2_context == nullptr && render_buffers != nullptr && p_effect != nullptr) {
+		fsr2_context = p_effect->create_context(render_buffers->get_internal_size(), render_buffers->get_target_size());
+	}
+}
+
+#ifdef METAL_MFXTEMPORAL_ENABLED
+bool RenderForwardMobile::RenderBufferDataForwardMobile::ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect) {
+	if (mfx_temporal_context == nullptr && render_buffers != nullptr && p_effect != nullptr) {
+		RendererRD::MFXTemporalEffect::CreateParams params;
+		params.input_size = render_buffers->get_internal_size();
+		params.output_size = render_buffers->get_target_size();
+		params.input_format = render_buffers->get_base_data_format();
+		params.depth_format = render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage());
+		params.motion_format = render_buffers->get_velocity_format();
+		params.reactive_format = render_buffers->get_base_data_format();
+		params.output_format = render_buffers->has_upscaled_texture() ? render_buffers->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED).format : render_buffers->get_base_data_format();
+		params.motion_vector_scale = render_buffers->get_internal_size();
+		mfx_temporal_context = p_effect->create_context(params);
+		return true;
+	}
+	return false;
+}
+#endif
+
 void RenderForwardMobile::RenderBufferDataForwardMobile::free_data() {
 	// this should already be done but JIC..
 	if (render_buffers) {
 		render_buffers->clear_context(RB_SCOPE_MOBILE);
 	}
+	if (fsr2_context) {
+		memdelete(fsr2_context);
+		fsr2_context = nullptr;
+	}
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	if (mfx_temporal_context) {
+		memdelete(mfx_temporal_context);
+		mfx_temporal_context = nullptr;
+	}
+#endif
 }
 
 void RenderForwardMobile::RenderBufferDataForwardMobile::configure(RenderSceneBuffersRD *p_render_buffers) {
@@ -201,6 +237,9 @@ RID RendererSceneRenderImplementation::RenderForwardMobile::RenderBufferDataForw
 
 	RID velocity = render_buffers->get_velocity_buffer(false);
 	RID velocity_depth = render_buffers->get_velocity_depth_buffer();
+	if (velocity_depth.is_null()) {
+		velocity_depth = render_buffers->get_depth_texture();
+	}
 
 	if (velocity.is_valid() && velocity_depth.is_valid()) {
 		Vector<RID> textures;
@@ -791,7 +830,6 @@ void RenderForwardMobile::_setup_lightmaps(const RenderDataRD *p_render_data, co
 		scene_state.lightmap_ids[i] = p_lightmaps[i];
 		scene_state.lightmap_has_sh[i] = light_storage->lightmap_uses_spherical_harmonics(lightmap);
 
-
 		scene_state.lightmaps_used++;
 	}
 	if (scene_state.lightmaps_used > 0) {
@@ -855,7 +893,7 @@ void RenderForwardMobile::_pre_opaque_render(RenderDataRD *p_render_data) {
 
 		_render_shadow_process();
 
-		_render_shadow_end();
+		_render_shadow_end(p_render_data->render_buffers);
 	}
 }
 
@@ -888,15 +926,49 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 	RENDER_TIMESTAMP("Setup 3D Scene");
 
 	bool has_depth_texture_override = false;
+	bool has_override_velocity = false;
 	bool supports_depth_resolve = RenderingDevice::get_singleton()->has_feature(RD::SUPPORTS_FRAMEBUFFER_DEPTH_RESOLVE);
 
 	RID render_target = rb->get_render_target();
 	if (render_target.is_valid()) {
-		p_render_data->scene_data->calculate_motion_vectors = texture_storage->render_target_get_override_velocity(render_target).is_valid();
+		has_override_velocity = texture_storage->render_target_get_override_velocity(render_target).is_valid();
 		has_depth_texture_override = texture_storage->render_target_get_override_depth(render_target).is_valid();
-	} else {
-		p_render_data->scene_data->calculate_motion_vectors = false;
 	}
+
+	bool using_debug_mvs = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_MOTION_VECTORS;
+	bool using_taa = !is_reflection_probe && rb->get_use_taa();
+	bool ce_needs_motion_vectors = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
+
+	enum {
+		SCALE_NONE,
+		SCALE_TAAU,
+		SCALE_FSR2,
+		SCALE_MFX,
+	} scale_type = SCALE_NONE;
+
+	if (!is_reflection_probe) {
+		switch (rb->get_scaling_3d_mode()) {
+			case RSE::VIEWPORT_SCALING_3D_MODE_TAAU:
+				scale_type = SCALE_TAAU;
+				break;
+			case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
+				scale_type = SCALE_FSR2;
+				break;
+			case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
+#ifdef METAL_MFXTEMPORAL_ENABLED
+				scale_type = SCALE_MFX;
+#else
+				scale_type = SCALE_TAAU;
+#endif
+				break;
+			default:
+				break;
+		}
+	}
+
+	bool using_upscaling = scale_type != SCALE_NONE;
+	bool motion_vectors_required = !is_reflection_probe && (has_override_velocity || using_debug_mvs || ce_needs_motion_vectors || using_taa || using_upscaling);
+	p_render_data->scene_data->calculate_motion_vectors = motion_vectors_required;
 
 	p_render_data->scene_data->directional_light_count = 0;
 	p_render_data->scene_data->opaque_prepass_threshold = 0.0;
@@ -1006,8 +1078,8 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 		// setup rendering to render buffer
 		screen_size = p_render_data->render_buffers->get_internal_size();
 
-		if (rb->get_scaling_3d_mode() != RSE::VIEWPORT_SCALING_3D_MODE_OFF) {
-			// can't do blit subpass because we're scaling
+		if (rb->get_scaling_3d_mode() != RSE::VIEWPORT_SCALING_3D_MODE_OFF || using_taa || using_upscaling) {
+			// can't do blit subpass because we're scaling or temporally resolving
 			using_subpass_post_process = false;
 		} else if (p_render_data->environment.is_valid() && (environment_get_glow_enabled(p_render_data->environment) || RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes) || RSG::camera_attributes->camera_attributes_uses_dof(p_render_data->camera_attributes) || environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
 			// can't do blit subpass because we're using post processes
@@ -1228,7 +1300,14 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 			breadcrumb = RDD::BreadcrumbMarker::REFLECTION_PROBES;
 		}
 
-		if (rb_data.is_valid() && p_render_data->scene_data->calculate_motion_vectors) {
+		if (rb_data.is_valid() && motion_vectors_required && !has_override_velocity) {
+			rb->ensure_velocity();
+		}
+		if (rb_data.is_valid() && using_upscaling && scale_type != SCALE_TAAU) {
+			rb->ensure_upscaled();
+		}
+
+		if (rb_data.is_valid() && p_render_data->scene_data->calculate_motion_vectors && has_override_velocity) {
 			RID mv_fb = rb_data->get_motion_vectors_fb();
 
 			if (mv_fb.is_valid()) {
@@ -1271,170 +1350,389 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 		bool fog_requested = rb_data.is_valid() && (!copy_canvas || !is_multiview) && ce_has_pre_transparent && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_POST_OPAQUE_FOG, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT);
 		RID next_radiance = p_render_data->environment.is_valid() ? sky.sky_get_next_radiance_texture_rd(environment_get_sky(p_render_data->environment), false) : RID();
 		bool defer_fog = rb_data.is_valid() && mobile_fog.prepare(p_render_data, fog_requested, radiance_texture, next_radiance, aerial_perspective.get_texture(0), aerial_perspective.get_texture(1), is_using_radiance_octmap_array(), get_roughness_layers(), 1.0f / inverse_luminance_multiplier);
-		RID opaque_framebuffer = defer_fog ? mobile_fog.get_framebuffer(rb, resolve_depth_buffer) : framebuffer;
+		const bool use_flora_tile_vis = rb_data.is_valid() && !copy_canvas && RendererRD::FloraTileVis::is_supported(rb, is_reflection_probe, use_msaa);
+		bool velocity_cleared_by_flora_subpass = false;
 
-		// Set clear colors.
-		Vector<Color> c;
-		if (!load_color) {
-			Color cc = clear_color * inverse_luminance_multiplier;
-			if (rb_data.is_valid()) {
-				cc.a = 0; // For transparent viewport backgrounds.
+		if (use_flora_tile_vis) {
+			RendererRD::FloraTileVisPassConfig flora_cfg = RendererRD::FloraTileVis::prepare_pass(
+					rb,
+					clear_color * inverse_luminance_multiplier,
+					load_color,
+					defer_fog,
+					motion_vectors_required && !has_override_velocity,
+					merge_transparent_pass && using_subpass_post_process);
+
+			if (using_subpass_post_process) {
+				using_subpass_post_process = merge_transparent_pass && flora_cfg.has_post_subpass;
 			}
 
-			c.push_back(cc); // Our render buffer.
-			if (rb_data.is_valid()) {
-				if (use_msaa) {
-					c.push_back(clear_color * inverse_luminance_multiplier); // Our resolve buffer.
-				}
-				if (using_subpass_post_process) {
-					c.push_back(Color()); // Our 2D buffer we're copying into.
-				}
-			}
-		}
+			RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(flora_cfg.framebuffer, flora_cfg.clear_flags, flora_cfg.clear_colors, 0.0f, 0, p_render_data->render_region, breadcrumb);
+			RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(flora_cfg.framebuffer);
 
-		if (defer_fog && copy_canvas) {
-			RD::DrawListID canvas_list = RD::get_singleton()->draw_list_begin(framebuffer, RD::DRAW_DEFAULT_ALL);
-			RID canvas_texture = RendererRD::TextureStorage::get_singleton()->render_target_get_rd_texture(rb->get_render_target());
-			copy_effects->copy_to_drawlist(canvas_list, RD::get_singleton()->framebuffer_get_format(framebuffer), canvas_texture, !hdr_render_target, 2.0f);
-			RD::get_singleton()->draw_list_end();
-			copy_canvas = false;
-			load_color = true; // Preserve the canvas copied into the opaque color target.
-		}
-		uint32_t clear_flags = load_color ? RD::DRAW_CLEAR_DEPTH : (RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_DEPTH);
-		if (defer_fog) {
-			c.resize(use_msaa ? 3 : 2);
-			c.write[1] = Color(0, 0, 0, 0);
-			clear_flags |= RD::DRAW_CLEAR_COLOR_1;
-		}
-		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, clear_flags, c, 0.0f, 0, p_render_data->render_region, breadcrumb);
-		RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(opaque_framebuffer);
-
-		if (copy_canvas) {
-			if (p_render_data->scene_data->view_count > 1) {
-				WARN_PRINT_ONCE("Canvas background is not supported in multiview!");
-			} else {
-				RID texture = RendererRD::TextureStorage::get_singleton()->render_target_get_rd_texture(rb->get_render_target());
-				bool convert_to_linear = !hdr_render_target;
-
-				copy_effects->copy_to_drawlist(draw_list, fb_format, texture, convert_to_linear, 2.0f);
-			}
-		}
-
-		if (render_list[RENDER_LIST_OPAQUE].elements.size() > 0) {
-			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
-			render_list_params.defer_opaque_fog = defer_fog;
-			render_list_params.framebuffer_format = fb_format;
-			render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
-
-			_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
-		}
-
-		RD::get_singleton()->draw_command_end_label(); //Render Opaque
-		if (defer_fog) {
-			RD::get_singleton()->draw_list_switch_to_next_pass();
-		}
-
-		if (draw_sky || draw_sky_fog_only) {
-			RD::get_singleton()->draw_command_begin_label("Draw Sky");
-
-			// Note, sky.setup should have been called up above and setup stuff we need.
-
-			sky.draw_sky(draw_list, rb, p_render_data->environment, opaque_framebuffer, time, inverse_luminance_multiplier, sky_brightness_multiplier);
-
-			RD::get_singleton()->draw_command_end_label(); // Draw Sky
-		}
-
-		if (merge_transparent_pass) {
-			if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
-				// transparent pass
-
-				RD::get_singleton()->draw_command_begin_label("Render Transparent");
-
-				rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
-
-				RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR_TRANSPARENT, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+			// Subpass 0: Standard Opaque Geometry (subpass == 0).
+			if (render_list[RENDER_LIST_OPAQUE].elements.size() > 0) {
+				RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+				render_list_params.defer_opaque_fog = flora_cfg.defer_fog;
 				render_list_params.framebuffer_format = fb_format;
-				render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
-
+				render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass();
 				_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
-
-				RD::get_singleton()->draw_command_end_label(); // Render Transparent Subpass
 			}
+			RD::get_singleton()->draw_command_end_label(); // Render Opaque
 
-			// blit to tonemap
-			if (rb_data.is_valid() && using_subpass_post_process) {
-				_post_process_subpass(p_render_data->render_buffers->get_internal_texture(), framebuffer, p_render_data);
-			}
+			// Subpass 1: Flora Visibility Buffer + Stencil 0x80.
+			RD::get_singleton()->draw_command_begin_label("Flora Subpass Vis");
+			draw_list = RD::get_singleton()->draw_list_switch_to_next_pass();
+			rb->get_flora_subpass_vis_callback().call(int64_t(draw_list), int64_t(fb_format), int64_t(RD::get_singleton()->draw_list_get_current_pass()), p_render_data);
+			RD::get_singleton()->draw_command_end_label();
 
-			RD::get_singleton()->draw_command_end_label(); // Render 3D Pass / Render Reflection Probe Pass
+			if (!flora_cfg.desktop_tile_compute) {
+				// Subpass 2: Flora Visible-Only Resolve (subpassLoad + Early-Stencil == 0x80).
+				RD::get_singleton()->draw_command_begin_label("Flora Subpass Resolve");
+				draw_list = RD::get_singleton()->draw_list_switch_to_next_pass();
+				rb->get_flora_subpass_resolve_callback().call(int64_t(draw_list), int64_t(fb_format), int64_t(RD::get_singleton()->draw_list_get_current_pass()), p_render_data, flora_cfg.defer_fog, flora_cfg.has_velocity);
+				RD::get_singleton()->draw_command_end_label();
+				velocity_cleared_by_flora_subpass = flora_cfg.has_velocity;
 
-			RD::get_singleton()->draw_list_end();
+				// Subpass 3: Sky + Merged Transparent.
+				draw_list = RD::get_singleton()->draw_list_switch_to_next_pass();
+				if (draw_sky || draw_sky_fog_only) {
+					RD::get_singleton()->draw_command_begin_label("Draw Sky");
+					sky.draw_sky(draw_list, rb, p_render_data->environment, flora_cfg.framebuffer, time, inverse_luminance_multiplier, sky_brightness_multiplier);
+					RD::get_singleton()->draw_command_end_label();
+				}
 
-			// note, if MSAA is used we should get an automatic resolve of the color buffer here.
+				if (merge_transparent_pass) {
+					if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
+						RD::get_singleton()->draw_command_begin_label("Render Transparent");
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
+						RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR_TRANSPARENT, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+						render_list_params.framebuffer_format = fb_format;
+						render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass();
+						_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+						RD::get_singleton()->draw_command_end_label();
+					}
 
-			if (use_msaa && has_depth_texture_override && !supports_depth_resolve) {
-				// We don't have a fallback for this, See PR #111322
-				WARN_PRINT_ONCE("MSAA Depth buffer resolve is not supported on this platform.");
+					if (using_subpass_post_process) {
+						_post_process_subpass(rb->get_internal_texture(), flora_cfg.framebuffer, p_render_data);
+					}
+
+					RD::get_singleton()->draw_command_end_label(); // Render 3D Pass
+					RD::get_singleton()->draw_list_end();
+				} else {
+					RD::get_singleton()->draw_list_end();
+					RD::get_singleton()->draw_command_end_label(); // Render 3D Pass
+
+					if (ce_has_pre_transparent) {
+						_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
+					}
+					if (defer_fog) {
+						mobile_fog.finish(rb);
+					}
+					fb_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
+
+					if (scene_state.used_screen_texture || global_surface_data.screen_texture_used) {
+						_render_buffers_ensure_screen_texture(p_render_data);
+						if (scene_state.used_screen_texture) {
+							_render_buffers_copy_screen_texture(p_render_data);
+						}
+					}
+
+					if (scene_state.used_depth_texture || global_surface_data.depth_texture_used) {
+						_render_buffers_ensure_depth_texture(p_render_data);
+						if (scene_state.used_depth_texture) {
+							aerial_perspective.record_scene_depth_copy(false);
+							_render_buffers_copy_depth_texture(p_render_data, false);
+						}
+					}
+
+					if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
+						RD::get_singleton()->draw_command_begin_label("Render Transparent Pass");
+						RENDER_TIMESTAMP("Render Transparent");
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
+						RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+						render_list_params.framebuffer_format = fb_format;
+						render_list_params.subpass = 0;
+						draw_list = RD::get_singleton()->draw_list_begin(framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, p_render_data->render_region, breadcrumb);
+						_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+						RD::get_singleton()->draw_list_end();
+						RD::get_singleton()->draw_command_end_label();
+					}
+				}
+			} else {
+				// Desktop IMR 8x8 Tile VisID Bitmask DispatchIndirect Compute Resolve path.
+				using_subpass_post_process = false;
+				RD::get_singleton()->draw_list_end();
+				RD::get_singleton()->draw_command_end_label(); // Render 3D Pass
+
+				if (flora_cfg.has_velocity) {
+					RID mv_fb = rb_data->get_motion_vectors_fb();
+					if (mv_fb.is_valid()) {
+						Vector<Color> mv_clear = { Color(-1.0f, -1.0f, 0.0f, 0.0f) };
+						RD::get_singleton()->draw_list_begin(mv_fb, RD::DRAW_CLEAR_COLOR_0, mv_clear);
+						RD::get_singleton()->draw_list_end();
+						velocity_cleared_by_flora_subpass = true;
+					}
+				}
+
+				RD::get_singleton()->draw_command_begin_label("Flora Tile Compute Resolve");
+				rb->get_flora_subpass_resolve_callback().call(int64_t(0), int64_t(0), int64_t(-1), p_render_data, flora_cfg.defer_fog, flora_cfg.has_velocity);
+				RD::get_singleton()->draw_command_end_label();
+
+				RID post_flora_fb = rb_data->get_color_fbs(RenderBufferDataForwardMobile::FB_CONFIG_RENDER_PASS);
+				fb_format = RD::get_singleton()->framebuffer_get_format(post_flora_fb);
+				if (draw_sky || draw_sky_fog_only || (merge_transparent_pass && render_list[RENDER_LIST_ALPHA].element_info.size() > 0)) {
+					draw_list = RD::get_singleton()->draw_list_begin(post_flora_fb, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, p_render_data->render_region, breadcrumb);
+					if (draw_sky || draw_sky_fog_only) {
+						RD::get_singleton()->draw_command_begin_label("Draw Sky");
+						sky.draw_sky(draw_list, rb, p_render_data->environment, post_flora_fb, time, inverse_luminance_multiplier, sky_brightness_multiplier);
+						RD::get_singleton()->draw_command_end_label();
+					}
+					if (merge_transparent_pass && render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
+						RD::get_singleton()->draw_command_begin_label("Render Transparent");
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
+						RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR_TRANSPARENT, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+						render_list_params.framebuffer_format = fb_format;
+						render_list_params.subpass = 0;
+						_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+						RD::get_singleton()->draw_command_end_label();
+					}
+					RD::get_singleton()->draw_list_end();
+				}
+
+				if (!merge_transparent_pass) {
+					if (ce_has_pre_transparent) {
+						_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
+					}
+					if (defer_fog) {
+						mobile_fog.finish(rb);
+					}
+					if (scene_state.used_screen_texture || global_surface_data.screen_texture_used) {
+						_render_buffers_ensure_screen_texture(p_render_data);
+						if (scene_state.used_screen_texture) {
+							_render_buffers_copy_screen_texture(p_render_data);
+						}
+					}
+					if (scene_state.used_depth_texture || global_surface_data.depth_texture_used) {
+						_render_buffers_ensure_depth_texture(p_render_data);
+						if (scene_state.used_depth_texture) {
+							aerial_perspective.record_scene_depth_copy(false);
+							_render_buffers_copy_depth_texture(p_render_data, false);
+						}
+					}
+					if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
+						RD::get_singleton()->draw_command_begin_label("Render Transparent Pass");
+						RENDER_TIMESTAMP("Render Transparent");
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
+						RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+						render_list_params.framebuffer_format = fb_format;
+						render_list_params.subpass = 0;
+						draw_list = RD::get_singleton()->draw_list_begin(post_flora_fb, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, p_render_data->render_region, breadcrumb);
+						_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+						RD::get_singleton()->draw_list_end();
+						RD::get_singleton()->draw_command_end_label();
+					}
+				}
 			}
 		} else {
-			// We're done with our subpasses so end our container pass
-			// note, if MSAA is used we should get an automatic resolve of the color buffer here.
+			RID opaque_framebuffer = defer_fog ? mobile_fog.get_framebuffer(rb, resolve_depth_buffer) : framebuffer;
 
-			RD::get_singleton()->draw_list_end();
+			// Set clear colors.
+			Vector<Color> c;
+			if (!load_color) {
+				Color cc = clear_color * inverse_luminance_multiplier;
+				if (rb_data.is_valid()) {
+					cc.a = 0; // For transparent viewport backgrounds.
+				}
 
-			RD::get_singleton()->draw_command_end_label(); // Render 3D Pass / Render Reflection Probe Pass
-
-			// rendering effects
-			if (ce_has_pre_transparent) {
-				_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
+				c.push_back(cc); // Our render buffer.
+				if (rb_data.is_valid()) {
+					if (use_msaa) {
+						c.push_back(clear_color * inverse_luminance_multiplier); // Our resolve buffer.
+					}
+					if (using_subpass_post_process) {
+						c.push_back(Color()); // Our 2D buffer we're copying into.
+					}
+				}
 			}
+
+			if (defer_fog && copy_canvas) {
+				RD::DrawListID canvas_list = RD::get_singleton()->draw_list_begin(framebuffer, RD::DRAW_DEFAULT_ALL);
+				RID canvas_texture = RendererRD::TextureStorage::get_singleton()->render_target_get_rd_texture(rb->get_render_target());
+				copy_effects->copy_to_drawlist(canvas_list, RD::get_singleton()->framebuffer_get_format(framebuffer), canvas_texture, !hdr_render_target, 2.0f);
+				RD::get_singleton()->draw_list_end();
+				copy_canvas = false;
+				load_color = true; // Preserve the canvas copied into the opaque color target.
+			}
+			uint32_t clear_flags = load_color ? RD::DRAW_CLEAR_DEPTH : (RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_DEPTH);
 			if (defer_fog) {
-				mobile_fog.finish(rb);
+				c.resize(use_msaa ? 3 : 2);
+				c.write[1] = Color(0, 0, 0, 0);
+				clear_flags |= RD::DRAW_CLEAR_COLOR_1;
 			}
-			fb_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
+			RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(opaque_framebuffer, clear_flags, c, 0.0f, 0, p_render_data->render_region, breadcrumb);
+			RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(opaque_framebuffer);
 
-			if (scene_state.used_screen_texture || global_surface_data.screen_texture_used) {
-				_render_buffers_ensure_screen_texture(p_render_data);
+			if (copy_canvas) {
+				if (p_render_data->scene_data->view_count > 1) {
+					WARN_PRINT_ONCE("Canvas background is not supported in multiview!");
+				} else {
+					RID texture = RendererRD::TextureStorage::get_singleton()->render_target_get_rd_texture(rb->get_render_target());
+					bool convert_to_linear = !hdr_render_target;
 
-				if (scene_state.used_screen_texture) {
-					// Copy screen texture to backbuffer so we can read from it
-					_render_buffers_copy_screen_texture(p_render_data);
+					copy_effects->copy_to_drawlist(draw_list, fb_format, texture, convert_to_linear, 2.0f);
 				}
 			}
 
-			if (use_msaa && has_depth_texture_override && !supports_depth_resolve) {
-				// We don't have a fallback for this, See PR #111322
-				WARN_PRINT_ONCE("MSAA Depth buffer resolve is not supported on this platform.");
-			}
-
-			if (scene_state.used_depth_texture || global_surface_data.depth_texture_used) {
-				_render_buffers_ensure_depth_texture(p_render_data);
-
-				if (scene_state.used_depth_texture) {
-					// Copy depth texture to backbuffer so we can read from it.
-					aerial_perspective.record_scene_depth_copy(use_msaa && !supports_depth_resolve);
-					_render_buffers_copy_depth_texture(p_render_data, use_msaa && !supports_depth_resolve); // Note, once fallback for has_depth_texture_override works, we also don't need to do our resolve here.
-				}
-			}
-
-			if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
-				RD::get_singleton()->draw_command_begin_label("Render Transparent Pass");
-				RENDER_TIMESTAMP("Render Transparent");
-
-				rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
-
-				// this may be needed if we re-introduced steps that change info, not sure which do so in the previous implementation
-				//_setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
-
-				RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+			if (render_list[RENDER_LIST_OPAQUE].elements.size() > 0) {
+				RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+				render_list_params.defer_opaque_fog = defer_fog;
 				render_list_params.framebuffer_format = fb_format;
 				render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
 
-				draw_list = RD::get_singleton()->draw_list_begin(framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, p_render_data->render_region, breadcrumb);
 				_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+			}
+
+			RD::get_singleton()->draw_command_end_label(); //Render Opaque
+			if (defer_fog) {
+				RD::get_singleton()->draw_list_switch_to_next_pass();
+			}
+
+			if (draw_sky || draw_sky_fog_only) {
+				RD::get_singleton()->draw_command_begin_label("Draw Sky");
+
+				// Note, sky.setup should have been called up above and setup stuff we need.
+
+				sky.draw_sky(draw_list, rb, p_render_data->environment, opaque_framebuffer, time, inverse_luminance_multiplier, sky_brightness_multiplier);
+
+				RD::get_singleton()->draw_command_end_label(); // Draw Sky
+			}
+
+			if (merge_transparent_pass) {
+				if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
+					// transparent pass
+
+					RD::get_singleton()->draw_command_begin_label("Render Transparent");
+
+					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
+
+					RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR_TRANSPARENT, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+					render_list_params.framebuffer_format = fb_format;
+					render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
+
+					_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+
+					RD::get_singleton()->draw_command_end_label(); // Render Transparent Subpass
+				}
+
+				// blit to tonemap
+				if (rb_data.is_valid() && using_subpass_post_process) {
+					_post_process_subpass(p_render_data->render_buffers->get_internal_texture(), framebuffer, p_render_data);
+				}
+
+				RD::get_singleton()->draw_command_end_label(); // Render 3D Pass / Render Reflection Probe Pass
+
 				RD::get_singleton()->draw_list_end();
 
-				RD::get_singleton()->draw_command_end_label(); // Render Transparent Pass
+				// note, if MSAA is used we should get an automatic resolve of the color buffer here.
+
+				if (use_msaa && has_depth_texture_override && !supports_depth_resolve) {
+					// We don't have a fallback for this, See PR #111322
+					WARN_PRINT_ONCE("MSAA Depth buffer resolve is not supported on this platform.");
+				}
+			} else {
+				// We're done with our subpasses so end our container pass
+				// note, if MSAA is used we should get an automatic resolve of the color buffer here.
+
+				RD::get_singleton()->draw_list_end();
+
+				RD::get_singleton()->draw_command_end_label(); // Render 3D Pass / Render Reflection Probe Pass
+
+				// rendering effects
+				if (ce_has_pre_transparent) {
+					_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
+				}
+				if (defer_fog) {
+					mobile_fog.finish(rb);
+				}
+				fb_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
+
+				if (scene_state.used_screen_texture || global_surface_data.screen_texture_used) {
+					_render_buffers_ensure_screen_texture(p_render_data);
+
+					if (scene_state.used_screen_texture) {
+						// Copy screen texture to backbuffer so we can read from it
+						_render_buffers_copy_screen_texture(p_render_data);
+					}
+				}
+
+				if (use_msaa && has_depth_texture_override && !supports_depth_resolve) {
+					// We don't have a fallback for this, See PR #111322
+					WARN_PRINT_ONCE("MSAA Depth buffer resolve is not supported on this platform.");
+				}
+
+				if (scene_state.used_depth_texture || global_surface_data.depth_texture_used) {
+					_render_buffers_ensure_depth_texture(p_render_data);
+
+					if (scene_state.used_depth_texture) {
+						// Copy depth texture to backbuffer so we can read from it.
+						aerial_perspective.record_scene_depth_copy(use_msaa && !supports_depth_resolve);
+						_render_buffers_copy_depth_texture(p_render_data, use_msaa && !supports_depth_resolve); // Note, once fallback for has_depth_texture_override works, we also don't need to do our resolve here.
+					}
+				}
+
+				if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
+					RD::get_singleton()->draw_command_begin_label("Render Transparent Pass");
+					RENDER_TIMESTAMP("Render Transparent");
+
+					rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, true);
+
+					// this may be needed if we re-introduced steps that change info, not sure which do so in the previous implementation
+					//_setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
+
+					RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
+					render_list_params.framebuffer_format = fb_format;
+					render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
+
+					draw_list = RD::get_singleton()->draw_list_begin(framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, p_render_data->render_region, breadcrumb);
+					_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
+					RD::get_singleton()->draw_list_end();
+
+					RD::get_singleton()->draw_command_end_label(); // Render Transparent Pass
+				}
+			}
+		}
+
+		// Sparse dynamic motion vectors (0 cost for static terrain/buildings; (-1, -1) sentinel derived inline).
+		if (rb_data.is_valid() && motion_vectors_required && !has_override_velocity && !use_msaa) {
+			const bool need_clear = !velocity_cleared_by_flora_subpass;
+			const bool need_draw = scene_state.has_dynamic_opaque_motion;
+			if (need_clear || need_draw) {
+				RID mv_fb = rb_data->get_motion_vectors_fb();
+				if (mv_fb.is_valid()) {
+					RENDER_TIMESTAMP("Render Dynamic Motion Vectors");
+					RD::get_singleton()->draw_command_begin_label("Render Dynamic Motion Vectors");
+					Vector<Color> mv_clear;
+					BitField<RD::DrawFlags> mv_flags = RD::DRAW_DEFAULT_ALL;
+					if (need_clear) {
+						mv_clear.push_back(Color(-1.0f, -1.0f, 0.0f, 0.0f));
+						mv_flags = RD::DRAW_CLEAR_COLOR_0;
+					}
+					if (need_draw) {
+						RID mv_rp_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, is_multiview, RID(), samplers);
+						RenderListParameters mv_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_MOTION_VECTORS, mv_rp_set, base_specialization, false, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count);
+						mv_params.dynamic_motion_only = true;
+						_render_list_with_draw_list(&mv_params, mv_fb, mv_flags, mv_clear, 0.0f, 0u, p_render_data->render_region);
+					} else {
+						RD::get_singleton()->draw_list_begin(mv_fb, mv_flags, mv_clear, 0.0f, 0u, p_render_data->render_region);
+						RD::get_singleton()->draw_list_end();
+					}
+					RD::get_singleton()->draw_command_end_label();
+				}
+			}
+			if (scale_type == SCALE_MFX && motion_vectors_store) {
+				motion_vectors_store->process(rb,
+						p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform,
+						p_render_data->scene_data->prev_cam_projection, p_render_data->scene_data->prev_cam_transform);
 			}
 		}
 	}
@@ -1444,6 +1742,84 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 
 		if (ce_has_post_transparent) {
 			_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, p_render_data);
+		}
+
+		if (using_upscaling || using_taa) {
+			if (scale_type == SCALE_FSR2 && fsr2_effect) {
+				rb_data->ensure_fsr2(fsr2_effect);
+				RID exposure;
+				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+					exposure = luminance->get_current_luminance_buffer(rb);
+				}
+				RD::get_singleton()->draw_command_begin_label("FSR2");
+				RENDER_TIMESTAMP("FSR2");
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					real_t fov = p_render_data->scene_data->cam_projection.get_fov();
+					real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
+					real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, 1.0 / aspect);
+					Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
+					RendererRD::FSR2Effect::Parameters params;
+					params.context = rb_data->get_fsr2_context();
+					params.internal_size = rb->get_internal_size();
+					params.sharpness = CLAMP(1.0f - (rb->get_fsr_sharpness() / 2.0f), 0.0f, 1.0f);
+					params.color = rb->get_internal_texture(v);
+					params.depth = rb->get_depth_texture(v);
+					params.velocity = rb->get_velocity_buffer(false, v);
+					params.reactive = rb->get_internal_texture_reactive(v);
+					params.exposure = exposure;
+					params.output = rb->get_upscaled_texture(v);
+					params.z_near = p_render_data->scene_data->z_near;
+					params.z_far = p_render_data->scene_data->z_far;
+					params.fovy = fovy;
+					params.jitter = jitter;
+					params.delta_time = float(time_step);
+					params.reset_accumulation = false;
+
+					Projection correction;
+					correction.set_depth_correction(true, true, false);
+					const Projection &prev_proj = p_render_data->scene_data->prev_cam_projection;
+					const Projection &cur_proj = p_render_data->scene_data->cam_projection;
+					const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
+					const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
+					params.reprojection = (correction * prev_proj) * prev_transform.affine_inverse() * cur_transform * (correction * cur_proj).inverse();
+
+					fsr2_effect->upscale(params);
+				}
+				RD::get_singleton()->draw_command_end_label();
+			} else if (scale_type == SCALE_MFX) {
+#ifdef METAL_MFXTEMPORAL_ENABLED
+				if (mfx_temporal_effect) {
+					bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+					RID exposure;
+					if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+						exposure = luminance->get_current_luminance_buffer(rb);
+					}
+					RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
+					Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
+					jitter *= Vector2(1.0, -1.0);
+					for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+						RendererRD::MFXTemporalEffect::Params params;
+						params.src = rb->get_internal_texture(v);
+						params.depth = rb->get_depth_texture(v);
+						params.motion = rb->get_velocity_buffer(false, v);
+						params.exposure = exposure;
+						params.dst = rb->get_upscaled_texture(v);
+						params.jitter_offset = jitter;
+						params.reset = reset;
+						mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
+					}
+					RD::get_singleton()->draw_command_end_label();
+				}
+#endif
+			} else if (mobile_taau) {
+				RD::get_singleton()->draw_command_begin_label("Mobile TAAU");
+				RENDER_TIMESTAMP("Mobile TAAU");
+				mobile_taau->process(rb,
+						p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform,
+						p_render_data->scene_data->prev_cam_projection, p_render_data->scene_data->prev_cam_transform,
+						p_render_data->scene_data->taa_jitter);
+				RD::get_singleton()->draw_command_end_label();
+			}
 		}
 
 		// If we need extra effects we do this in its own pass
@@ -1625,9 +2001,11 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 		}
 	}
 
+	const bool is_directional_light = light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL;
+
 	if (render_cubemap) {
 		//rendering to cubemap
-		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, true, true, p_render_info, p_main_cam_transform);
+		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, true, true, p_render_info, p_main_cam_transform, false, 0);
 		if (finalize_cubemap) {
 			_render_shadow_process();
 			_render_shadow_end();
@@ -1646,7 +2024,7 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 
 	} else {
 		//render shadow
-		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, p_clear_region, p_open_pass, p_close_pass, p_render_info, p_main_cam_transform);
+		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, p_clear_region, p_open_pass, p_close_pass, p_render_info, p_main_cam_transform, is_directional_light, p_pass);
 	}
 }
 
@@ -1658,7 +2036,7 @@ void RenderForwardMobile::_render_shadow_begin() {
 	render_list[RENDER_LIST_SECONDARY].clear();
 }
 
-void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, const Rect2i &p_rect, bool p_flip_y, bool p_clear_region, bool p_begin, bool p_end, RenderingServerTypes::RenderInfo *p_render_info, const Transform3D &p_main_cam_transform) {
+void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, const Rect2i &p_rect, bool p_flip_y, bool p_clear_region, bool p_begin, bool p_end, RenderingServerTypes::RenderInfo *p_render_info, const Transform3D &p_main_cam_transform, bool p_is_directional, int32_t p_cascade_index) {
 	SceneState::ShadowPass shadow_pass;
 
 	if (p_render_info) {
@@ -1725,6 +2103,11 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 		shadow_pass.framebuffer = p_framebuffer;
 		shadow_pass.clear_depth = p_begin || p_clear_region;
 		shadow_pass.rect = p_rect;
+		shadow_pass.is_directional = p_is_directional;
+		shadow_pass.cascade_index = p_cascade_index;
+		shadow_pass.projection = p_projection;
+		shadow_pass.transform = p_transform;
+		shadow_pass.zfar = p_zfar;
 
 		scene_state.shadow_passes.push_back(shadow_pass);
 	}
@@ -1747,12 +2130,22 @@ void RenderForwardMobile::_render_shadow_process() {
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RenderForwardMobile::_render_shadow_end() {
+void RenderForwardMobile::_render_shadow_end(Ref<RenderSceneBuffersRD> p_rb) {
 	RD::get_singleton()->draw_command_begin_label("Shadow Render");
+	const bool has_flora_shadow = p_rb.is_valid() && p_rb->is_flora_tile_vis_active() && p_rb->get_flora_shadow_callback().is_valid();
 
 	for (SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
 		RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr() + shadow_pass.element_from, render_list[RENDER_LIST_SECONDARY].element_info.ptr() + shadow_pass.element_from, shadow_pass.element_count, shadow_pass.flip_cull, shadow_pass.pass_mode, shadow_pass.rp_uniform_set, scene_shader.default_specialization, false, Vector2(), shadow_pass.lod_distance_multiplier, shadow_pass.screen_mesh_lod_threshold, 1, shadow_pass.element_from);
-		_render_list_with_draw_list(&render_list_parameters, shadow_pass.framebuffer, shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+		if (has_flora_shadow && shadow_pass.is_directional) {
+			RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(shadow_pass.framebuffer);
+			render_list_parameters.framebuffer_format = fb_format;
+			RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(shadow_pass.framebuffer, shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+			_render_list(draw_list, fb_format, &render_list_parameters, 0, render_list_parameters.element_count);
+			p_rb->get_flora_shadow_callback().call(int64_t(draw_list), int64_t(fb_format), shadow_pass.cascade_index, shadow_pass.rect, shadow_pass.projection, shadow_pass.transform, shadow_pass.zfar);
+			RD::get_singleton()->draw_list_end();
+		} else {
+			_render_list_with_draw_list(&render_list_parameters, shadow_pass.framebuffer, shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+		}
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2123,7 +2516,10 @@ RID RenderForwardMobile::_render_buffers_get_normal_texture(Ref<RenderSceneBuffe
 }
 
 RID RenderForwardMobile::_render_buffers_get_velocity_texture(Ref<RenderSceneBuffersRD> p_render_buffers) {
-	return RID();
+	if (p_render_buffers.is_null() || !p_render_buffers->has_velocity_buffer(false)) {
+		return RID();
+	}
+	return p_render_buffers->get_velocity_buffer(false);
 }
 
 void RenderForwardMobile::SceneState::grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append) {
@@ -2245,6 +2641,8 @@ void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const 
 		scene_state.used_screen_texture = false;
 		scene_state.used_depth_texture = false;
 		scene_state.used_lightmap = false;
+		scene_state.used_opaque_stencil = false;
+		scene_state.has_dynamic_opaque_motion = false;
 	}
 	uint32_t lightmap_captures_used = 0;
 
@@ -2329,6 +2727,14 @@ void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const 
 					uses_lightmap = true;
 				}
 			}
+
+			bool transform_changed = inst->prev_transform_dirty;
+			bool has_mesh_instance = inst->mesh_instance.is_valid();
+			bool uses_particles = (inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES) != 0;
+			bool is_multimesh_with_motion = !uses_particles && (inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && mesh_storage->_multimesh_uses_motion_vectors_offsets(inst->data->base);
+			if (transform_changed || has_mesh_instance || uses_particles || is_multimesh_with_motion) {
+				flags |= INSTANCE_DATA_FLAGS_DYNAMIC;
+			}
 		}
 		inst->flags_cache = flags;
 
@@ -2386,6 +2792,9 @@ void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const 
 #endif
 				if (!force_alpha && (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
 					rl->add_element(surf);
+					if ((inst->flags_cache & INSTANCE_DATA_FLAGS_DYNAMIC) || (surf->shader && surf->shader->uses_vertex)) {
+						scene_state.has_dynamic_opaque_motion = true;
+					}
 				}
 				if (force_alpha || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
 					render_list[RENDER_LIST_ALPHA].add_element(surf);
@@ -2521,6 +2930,11 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 		if (inst->instance_count == 0) {
 			continue;
 		}
+		if constexpr (p_pass_mode == PASS_MODE_MOTION_VECTORS) {
+			if (p_params->dynamic_motion_only && !(inst->flags_cache & INSTANCE_DATA_FLAGS_DYNAMIC) && !(surf->shader && surf->shader->uses_vertex)) {
+				continue;
+			}
+		}
 
 		SceneShaderForwardMobile::ShaderSpecialization pipeline_specialization = p_params->base_specialization;
 		pipeline_specialization.multimesh = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH);
@@ -2623,7 +3037,7 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL;
 			} break;
 			case PASS_MODE_MOTION_VECTORS: {
-				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS_MULTIVIEW;
+				pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS;
 			}
 		}
 
@@ -3442,11 +3856,15 @@ void RenderForwardMobile::_mesh_compile_pipelines_for_surface(const SurfacePipel
 	const uint32_t hdr_start = p_global.use_ldr_render_target ? 0 : 1;
 	const uint32_t hdr_target_iterations = p_global.use_hdr_render_target ? 2 : 1;
 
+	const bool supports_packed_hdr = RD::get_singleton()->texture_is_format_supported_for_usage(
+			RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32,
+			RenderSceneBuffersRD::get_color_usage_bits(false, false, buffers_can_be_storage));
+
 	for (uint32_t use_vrs = 0; use_vrs < vrs_iterations; use_vrs++) {
 		for (uint32_t use_post_pass = post_pass_start; use_post_pass < post_pass_iterations; use_post_pass++) {
 			const uint32_t hdr_iterations = use_post_pass ? hdr_target_iterations : (hdr_start + 1);
 			for (uint32_t use_hdr = hdr_start; use_hdr < hdr_iterations; use_hdr++) {
-				const RD::DataFormat buffers_color_format = use_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : _render_buffers_get_preferred_color_format();
+				const RD::DataFormat buffers_color_format = use_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : (supports_packed_hdr ? RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32 : _render_buffers_get_preferred_color_format());
 				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS;
 				pipeline_key.framebuffer_format_id = _get_color_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), RD::TextureSamples(p_global.target_samples), use_vrs, use_post_pass, use_hdr, 1);
 				_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
@@ -3696,6 +4114,12 @@ RenderForwardMobile::RenderForwardMobile() {
 	_update_shader_quality_settings();
 	_update_global_pipeline_data_requirements_from_project();
 
+	fsr2_effect = memnew(RendererRD::FSR2Effect);
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
+	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
+#endif
+
 	// Only update these from the project setting at init time.
 	const bool root_hdr_render_target = GLOBAL_GET("rendering/viewport/hdr_2d");
 	global_pipeline_data_required.use_hdr_render_target = root_hdr_render_target;
@@ -3703,6 +4127,20 @@ RenderForwardMobile::RenderForwardMobile() {
 }
 
 RenderForwardMobile::~RenderForwardMobile() {
+	if (fsr2_effect) {
+		memdelete(fsr2_effect);
+		fsr2_effect = nullptr;
+	}
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	if (mfx_temporal_effect) {
+		memdelete(mfx_temporal_effect);
+		mfx_temporal_effect = nullptr;
+	}
+	if (motion_vectors_store) {
+		memdelete(motion_vectors_store);
+		motion_vectors_store = nullptr;
+	}
+#endif
 	RSG::light_storage->directional_shadow_atlas_set_size(0);
 
 	if (ltc.lut1_texture.is_valid()) {

@@ -30,12 +30,67 @@
 
 #include "image_compress_astcenc.h"
 
+#include "core/config/engine.h"
+#include "core/os/load_thread_pool.h"
 #include "core/os/os.h"
 #include "core/string/print_string.h"
 
 #include <astcenc.h>
 
-#ifdef TOOLS_ENABLED
+#include <atomic>
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
+namespace {
+
+struct CachedAstcEncoderContext {
+	astcenc_context *ctx = nullptr;
+	astcenc_profile profile = ASTCENC_PRF_LDR;
+	unsigned int block_x = 0;
+	unsigned int block_y = 0;
+	float quality = -1.0f;
+
+	~CachedAstcEncoderContext() {
+		if (ctx) {
+			astcenc_context_free(ctx);
+			ctx = nullptr;
+		}
+	}
+
+	astcenc_context *acquire(astcenc_profile p_profile, unsigned int p_bx, unsigned int p_by, float p_quality, astcenc_error &r_status) {
+		if (ctx && profile == p_profile && block_x == p_bx && block_y == p_by && quality == p_quality) {
+			astcenc_compress_reset(ctx);
+			r_status = ASTCENC_SUCCESS;
+			return ctx;
+		}
+		if (ctx) {
+			astcenc_context_free(ctx);
+			ctx = nullptr;
+		}
+		astcenc_config config;
+		r_status = astcenc_config_init(p_profile, p_bx, p_by, 1, p_quality, 0, &config);
+		if (r_status != ASTCENC_SUCCESS) {
+			return nullptr;
+		}
+		r_status = astcenc_context_alloc(&config, 1, &ctx);
+		if (r_status != ASTCENC_SUCCESS) {
+			ctx = nullptr;
+			return nullptr;
+		}
+		profile = p_profile;
+		block_x = p_bx;
+		block_y = p_by;
+		quality = p_quality;
+		return ctx;
+	}
+};
+
+thread_local CachedAstcEncoderContext tl_astc_encoder;
+
+} // namespace
+
 void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
 
@@ -50,7 +105,38 @@ void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 		r_img->convert(Image::FORMAT_RGBAH);
 	} else if (src_format >= Image::FORMAT_RF && src_format <= Image::FORMAT_RGBE9995) {
 		r_img->convert(Image::FORMAT_RGBAF);
-	} else {
+	} else if (src_format == Image::FORMAT_RGB8) {
+		const int64_t src_bytes = r_img->get_data_size();
+		const int64_t npixels = src_bytes / 3;
+		if (npixels > 0 && npixels * 3 == src_bytes) {
+			Vector<uint8_t> rgba_data;
+			rgba_data.resize(npixels * 4);
+			const uint8_t *sp = r_img->ptr();
+			uint8_t *dp = rgba_data.ptrw();
+			int64_t px = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+			const uint8x16_t alpha255 = vdupq_n_u8(255);
+			for (; px + 16 <= npixels; px += 16) {
+				uint8x16x3_t rgb = vld3q_u8(sp + px * 3);
+				uint8x16x4_t rgba;
+				rgba.val[0] = rgb.val[0];
+				rgba.val[1] = rgb.val[1];
+				rgba.val[2] = rgb.val[2];
+				rgba.val[3] = alpha255;
+				vst4q_u8(dp + px * 4, rgba);
+			}
+#endif
+			for (; px < npixels; px++) {
+				dp[px * 4 + 0] = sp[px * 3 + 0];
+				dp[px * 4 + 1] = sp[px * 3 + 1];
+				dp[px * 4 + 2] = sp[px * 3 + 2];
+				dp[px * 4 + 3] = 255;
+			}
+			r_img->set_data(r_img->get_width(), r_img->get_height(), r_img->has_mipmaps(), Image::FORMAT_RGBA8, rgba_data);
+		} else {
+			r_img->convert(Image::FORMAT_RGBA8);
+		}
+	} else if (src_format != Image::FORMAT_RGBA8) {
 		r_img->convert(Image::FORMAT_RGBA8);
 	}
 
@@ -99,22 +185,12 @@ void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 	dest_data.resize(dest_size);
 	uint8_t *dest_write = dest_data.ptrw();
 
-	astcenc_config config;
-	config.block_x = block_x;
-	config.block_y = block_y;
-	config.profile = profile;
-
-	const float quality = ASTCENC_PRE_MEDIUM;
-	astcenc_error status = astcenc_config_init(profile, block_x, block_y, 1, quality, 0, &config);
-	ERR_FAIL_COND_MSG(status != ASTCENC_SUCCESS,
-			vformat("astcenc: Configuration initialization failed: %s.", astcenc_get_error_string(status)));
-
-	// Context allocation.
-	astcenc_context *context;
-	const unsigned int thread_count = 1; // Godot compresses multiple images each on a thread, which is more efficient for large amount of images imported.
-	status = astcenc_context_alloc(&config, thread_count, &context);
-	ERR_FAIL_COND_MSG(status != ASTCENC_SUCCESS,
-			vformat("astcenc: Context allocation failed: %s.", astcenc_get_error_string(status)));
+	const bool is_editor = Engine::get_singleton() && Engine::get_singleton()->is_editor_hint();
+	const float quality = is_editor ? ASTCENC_PRE_MEDIUM : ASTCENC_PRE_FASTEST;
+	astcenc_error status = ASTCENC_SUCCESS;
+	astcenc_context *context = tl_astc_encoder.acquire(profile, block_x, block_y, quality, status);
+	ERR_FAIL_COND_MSG(status != ASTCENC_SUCCESS || context == nullptr,
+			vformat("astcenc: Context initialization failed: %s.", astcenc_get_error_string(status)));
 
 	const int mip_count = has_mipmaps ? Image::get_image_required_mipmaps(width, height, target_format) : 0;
 	const uint8_t *src_data = r_img->ptr();
@@ -129,7 +205,6 @@ void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 
 		// Ensure that mip offset is a multiple of 8 (etcpak expects uint64_t pointer).
 		if (unlikely(dst_ofs % 8 != 0)) {
-			astcenc_context_free(context);
 			ERR_FAIL_MSG("astcenc: Mip offset is not a multiple of 8.");
 		}
 
@@ -152,27 +227,68 @@ void _compress_astc(Image *r_img, Image::ASTCFormat p_format) {
 		// Compute the number of ASTC blocks in each dimension.
 		unsigned int block_count_x = (src_mip_w + block_x - 1) / block_x;
 		unsigned int block_count_y = (src_mip_h + block_y - 1) / block_y;
-		size_t comp_len = block_count_x * block_count_y * 16;
+		size_t comp_len = size_t(block_count_x) * size_t(block_count_y) * 16;
 
 		const astcenc_swizzle swizzle = {
 			ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A
 		};
 
-		status = astcenc_compress_image(context, &image, &swizzle, dest_mip_write, comp_len, 0);
-		ERR_BREAK_MSG(status != ASTCENC_SUCCESS,
-				vformat("astcenc: ASTC image compression failed: %s.", astcenc_get_error_string(status)));
+		const size_t pixel_bytes = (image.data_type == ASTCENC_TYPE_U8) ? 4 : ((image.data_type == ASTCENC_TYPE_F16) ? 8 : 16);
+		if (size_t(block_count_x) * size_t(block_count_y) >= 1024 && block_count_y >= 4 && LoadThreadPool::get_singleton()) {
+			const uint32_t chunks = MIN(uint32_t(block_count_y), 24u);
+			std::atomic<int> strip_err{ int(ASTCENC_SUCCESS) };
+			LoadThreadPool::get_singleton()->parallel_for(chunks, [&](uint32_t ci) {
+				if (strip_err.load(std::memory_order_relaxed) != int(ASTCENC_SUCCESS)) {
+					return;
+				}
+				const unsigned int by0 = (uint64_t(ci) * block_count_y) / chunks;
+				const unsigned int by1 = (uint64_t(ci + 1) * block_count_y) / chunks;
+				if (by0 >= by1) {
+					return;
+				}
+				const unsigned int y0 = by0 * block_y;
+				const unsigned int y1 = MIN(unsigned(src_mip_h), by1 * block_y);
+				if (y0 >= y1) {
+					return;
+				}
+				const uint8_t *strip_src = mip_data + size_t(y0) * size_t(src_mip_w) * pixel_bytes;
+				uint8_t *strip_dst = dest_mip_write + size_t(by0) * size_t(block_count_x) * 16;
+				const size_t strip_len = size_t(by1 - by0) * size_t(block_count_x) * 16;
 
-		astcenc_compress_reset(context);
+				astcenc_error wstatus = ASTCENC_SUCCESS;
+				astcenc_context *wctx = tl_astc_encoder.acquire(profile, block_x, block_y, quality, wstatus);
+				if (wstatus != ASTCENC_SUCCESS || !wctx) {
+					strip_err.store(int(wstatus != ASTCENC_SUCCESS ? wstatus : ASTCENC_ERR_BAD_CONTEXT), std::memory_order_relaxed);
+					return;
+				}
+				astcenc_image simg;
+				simg.dim_x = src_mip_w;
+				simg.dim_y = y1 - y0;
+				simg.dim_z = 1;
+				simg.data_type = image.data_type;
+				simg.data = (void **)(&strip_src);
+				wstatus = astcenc_compress_image(wctx, &simg, &swizzle, strip_dst, strip_len, 0);
+				astcenc_compress_reset(wctx);
+				if (wstatus != ASTCENC_SUCCESS) {
+					strip_err.store(int(wstatus), std::memory_order_relaxed);
+				}
+			});
+			status = static_cast<astcenc_error>(strip_err.load(std::memory_order_relaxed));
+			ERR_BREAK_MSG(status != ASTCENC_SUCCESS,
+					vformat("astcenc: ASTC image compression failed: %s.", astcenc_get_error_string(status)));
+		} else {
+			status = astcenc_compress_image(context, &image, &swizzle, dest_mip_write, comp_len, 0);
+			ERR_BREAK_MSG(status != ASTCENC_SUCCESS,
+					vformat("astcenc: ASTC image compression failed: %s.", astcenc_get_error_string(status)));
+			astcenc_compress_reset(context);
+		}
 	}
-
-	astcenc_context_free(context);
 
 	// Replace original image with compressed one.
 	r_img->set_data(width, height, has_mipmaps, target_format, dest_data);
 
 	print_verbose(vformat("astcenc: Encoding took %d ms.", OS::get_singleton()->get_ticks_msec() - start_time));
 }
-#endif // TOOLS_ENABLED
 
 void _decompress_astc(Image *r_img) {
 	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();

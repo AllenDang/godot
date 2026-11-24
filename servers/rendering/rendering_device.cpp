@@ -3380,7 +3380,7 @@ RDD::RenderPassID RenderingDevice::_render_pass_create(RenderingDeviceDriver *p_
 			if (attachment_last_pass[attachment] != i) {
 				// Preserve can still be used to keep depth or color from being discarded after use.
 				attachment_last_pass[attachment] = i;
-				subpasses[i].preserve_attachments.push_back(attachment);
+				subpasses[i].preserve_attachments.push_back(attachment_remap[attachment]);
 			}
 		}
 
@@ -3389,14 +3389,70 @@ RDD::RenderPassID RenderingDevice::_render_pass_create(RenderingDeviceDriver *p_
 		}
 
 		if (i > 0) {
-			RDD::SubpassDependency dependency;
-			dependency.src_subpass = i - 1;
-			dependency.dst_subpass = i;
-			dependency.src_stages = (RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
-			dependency.dst_stages = (RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-			dependency.src_access = (RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-			dependency.dst_access = (RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_INPUT_ATTACHMENT_READ_BIT);
-			subpass_dependencies.push_back(dependency);
+			auto push_by_region_dep = [&](uint32_t p_src, uint32_t p_dst) {
+				for (const RDD::SubpassDependency &existing : subpass_dependencies) {
+					if (existing.src_subpass == p_src && existing.dst_subpass == p_dst) {
+						return;
+					}
+				}
+				RDD::SubpassDependency dependency;
+				dependency.src_subpass = p_src;
+				dependency.dst_subpass = p_dst;
+				dependency.src_stages = (RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
+				dependency.dst_stages = (RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+				dependency.src_access = (RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+				dependency.dst_access = (RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | RDD::BARRIER_ACCESS_INPUT_ATTACHMENT_READ_BIT);
+				dependency.is_by_region = true;
+				subpass_dependencies.push_back(dependency);
+			};
+
+			// Keep sequential edge (required by Metal's subpass ordering invariant) and
+			// emit direct by-region edges from any earlier subpass whose attachment is
+			// consumed or modified here (eliminates non-transitive WAW/RAW hazards on Android Adreno/Mali).
+			for (int prev = 0; prev < i; prev++) {
+				bool shares_active_attachment = (prev == i - 1);
+				if (!shares_active_attachment) {
+					const RDD::Subpass &prev_sp = subpasses[prev];
+					auto used_in_prev = [&](uint32_t p_remapped_att) -> bool {
+						if (p_remapped_att == RDD::AttachmentReference::UNUSED) {
+							return false;
+						}
+						if (prev_sp.depth_stencil_reference.attachment == p_remapped_att ||
+								prev_sp.depth_resolve_reference.attachment == p_remapped_att) {
+							return true;
+						}
+						for (const RDD::AttachmentReference &r : prev_sp.color_references) {
+							if (r.attachment == p_remapped_att) {
+								return true;
+							}
+						}
+						for (const RDD::AttachmentReference &r : prev_sp.resolve_references) {
+							if (r.attachment == p_remapped_att) {
+								return true;
+							}
+						}
+						return false;
+					};
+					if (used_in_prev(subpass.depth_stencil_reference.attachment)) {
+						shares_active_attachment = true;
+					}
+					for (const RDD::AttachmentReference &r : subpass.color_references) {
+						if (used_in_prev(r.attachment)) {
+							shares_active_attachment = true;
+							break;
+						}
+					}
+					for (const RDD::AttachmentReference &r : subpass.input_references) {
+						if (used_in_prev(r.attachment)) {
+							shares_active_attachment = true;
+							break;
+						}
+					}
+				}
+				if (shares_active_attachment) {
+					push_by_region_dep(uint32_t(prev), uint32_t(i));
+				}
+			}
 		}
 	}
 
@@ -4732,8 +4788,8 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					ERR_FAIL_NULL_V_MSG(texture, RID(),
 							"InputAttachment (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") is not a valid texture.");
 
-					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_SAMPLING_BIT), RID(),
-							"InputAttachment (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_SAMPLING_BIT usage flag set in order to be used as uniform.");
+					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_INPUT_ATTACHMENT_BIT), RID(),
+							"InputAttachment (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_INPUT_ATTACHMENT_BIT usage flag set in order to be used as uniform.");
 
 					DEV_ASSERT(!texture->owner.is_valid() || texture_owner.get_or_null(texture->owner));
 
@@ -6719,6 +6775,7 @@ void RenderingDevice::compute_list_bind_compute_pipeline(ComputeListID p_list, R
 		}
 
 		compute_list.state.set_count = pcount; // Update set count.
+		compute_list.state.push_constant_size = 0;
 
 		if (pipeline->push_constant_size) {
 #ifdef DEBUG_ENABLED

@@ -42,7 +42,7 @@ env_metal.Prepend(CPPPATH=[thirdparty_spirv_headers_dir + "include/spirv/unified
 # Must enable exceptions for SPIRV-Cross; otherwise, it will abort the process on errors.
 if "-fno-exceptions" in env_metal["CXXFLAGS"]:
     env_metal["CXXFLAGS"].remove("-fno-exceptions")
-env_metal.Append(CXXFLAGS=["-fexceptions"])
+env_metal.Append(CXXFLAGS=["-fexceptions", "-fno-delete-null-pointer-checks"])
 
 env_thirdparty = env_metal.Clone()
 env_thirdparty.disable_warnings()

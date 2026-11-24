@@ -5499,6 +5499,12 @@ RDD::RenderPassID RenderingDeviceDriverVulkan::render_pass_create(VectorView<Att
 		vk_subpass_dependencies[i].dstStageMask = _rd_to_vk_pipeline_stages(p_subpass_dependencies[i].dst_stages);
 		vk_subpass_dependencies[i].srcAccessMask = _rd_to_vk_access_flags(p_subpass_dependencies[i].src_access);
 		vk_subpass_dependencies[i].dstAccessMask = _rd_to_vk_access_flags(p_subpass_dependencies[i].dst_access);
+		if (p_subpass_dependencies[i].is_by_region) {
+			vk_subpass_dependencies[i].dependencyFlags |= VK_DEPENDENCY_BY_REGION_BIT;
+			if (p_view_count > 1) {
+				vk_subpass_dependencies[i].dependencyFlags |= VK_DEPENDENCY_VIEW_LOCAL_BIT;
+			}
+		}
 	}
 
 	VkRenderPassCreateInfo2KHR create_info = {};
@@ -7161,6 +7167,10 @@ void RenderingDeviceDriverVulkan::end_segment() {
 /**************/
 
 void RenderingDeviceDriverVulkan::set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) {
+	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+	if (functions.SetDebugUtilsObjectNameEXT == nullptr && functions.DebugMarkerSetObjectNameEXT == nullptr) {
+		return;
+	}
 	switch (p_type) {
 		case OBJECT_TYPE_TEXTURE: {
 			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;

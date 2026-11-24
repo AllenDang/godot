@@ -30,6 +30,7 @@
 
 #include "rendering_context_driver_metal.h"
 
+#include "core/config/project_settings.h"
 #include "core/os/os.h"
 #include "core/templates/sort_array.h"
 #include "drivers/metal/metal3_objects.h"
@@ -41,6 +42,11 @@
 #include <objc/message.h>
 #include <os/log.h>
 #include <os/signpost.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 
 #if defined(VISIONOS_ENABLED) && defined(MODULE_VISIONOS_XR_ENABLED)
 #include "modules/visionos_xr/visionos_xr_interface.h"
@@ -285,12 +291,17 @@ public:
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) SurfaceOffscreen final : public RenderingContextDriverMetal::Surface {
 	static constexpr int frame_buffer_size = 3;
+	struct InFlightSync {
+		std::mutex mutex;
+		std::condition_variable cv;
+		int count = 0;
+	};
 	MDFrameBufferTexture frame_buffers[frame_buffer_size];
 	LocalVector<MTL::Texture *> textures;
 	LocalVector<MTL::Drawable *> drawables;
 
 	int32_t rear = -1;
-	std::atomic_int count;
+	std::shared_ptr<InFlightSync> in_flight_sync = std::make_shared<InFlightSync>();
 	uint64_t target_time = 0;
 	CA::MetalLayer *layer;
 
@@ -316,6 +327,12 @@ public:
 	}
 
 	~SurfaceOffscreen() override {
+		{
+			std::unique_lock<std::mutex> lock(in_flight_sync->mutex);
+			in_flight_sync->cv.wait_for(lock, std::chrono::milliseconds(500), [this]() {
+				return in_flight_sync->count == 0;
+			});
+		}
 		for (MTL::Texture *texture : textures) {
 			if (texture) {
 				texture->release();
@@ -361,13 +378,17 @@ public:
 	}
 
 	RDD::FramebufferID acquire_next_frame_buffer() override {
-		if (count.load(std::memory_order_relaxed) == 3) {
-			// Wait for a frame to be presented.
-			return RDD::FramebufferID();
+		{
+			std::unique_lock<std::mutex> lock(in_flight_sync->mutex);
+			if (!in_flight_sync->cv.wait_for(lock, std::chrono::milliseconds(250), [this]() {
+					return in_flight_sync->count < frame_buffer_size;
+				})) {
+				return RDD::FramebufferID();
+			}
+			in_flight_sync->count++;
 		}
 
-		rear = (rear + 1) % 3;
-		count.fetch_add(1, std::memory_order_relaxed);
+		rear = (rear + 1) % frame_buffer_size;
 
 		MDFrameBufferTexture &frame_buffer = frame_buffers[rear];
 
@@ -387,12 +408,17 @@ public:
 		frame_buffer.size = Size2i(width, height);
 		uint64_t now = OS::get_singleton()->get_ticks_usec();
 		if (now >= target_time) {
-			target_time = now + 1'000'000; // 1 second into the future.
+			target_time = now + 40'000; // Non-blocking ~25Hz live visual preview while rendering uncapped offscreen.
 			CA::MetalDrawable *drawable = layer->nextDrawable();
-			ERR_FAIL_NULL_V_MSG(drawable, RDD::FramebufferID(), "no drawable available");
-			drawables[rear] = drawable;
-			frame_buffer.set_texture(0, drawable->texture());
+			if (drawable != nullptr) {
+				drawables[rear] = drawable;
+				frame_buffer.set_texture(0, drawable->texture());
+			} else {
+				drawables[rear] = nullptr;
+				frame_buffer.set_texture(0, texture);
+			}
 		} else {
+			drawables[rear] = nullptr;
 			frame_buffer.set_texture(0, texture);
 		}
 
@@ -400,22 +426,28 @@ public:
 	}
 
 	void present(MTL3::MDCommandBuffer *p_cmd_buffer) override {
-		MDFrameBufferTexture *frame_buffer = &frame_buffers[rear];
-
 		if (drawables[rear] != nullptr) {
 			p_cmd_buffer->get_command_buffer()->presentDrawable(drawables[rear]);
 			drawables[rear] = nullptr;
 		}
 
-		p_cmd_buffer->get_command_buffer()->addScheduledHandler([frame_buffer, this](MTL::CommandBuffer *) {
-			frame_buffer->unset_texture(0);
-			count.fetch_add(-1, std::memory_order_relaxed);
+		std::shared_ptr<InFlightSync> sync = in_flight_sync;
+		p_cmd_buffer->get_command_buffer()->addCompletedHandler([sync](MTL::CommandBuffer *) {
+			{
+				std::lock_guard<std::mutex> lock(sync->mutex);
+				sync->count--;
+			}
+			sync->cv.notify_one();
 		});
 	}
 
 	MTL::Drawable *next_drawable() override {
-		if (count == 0) {
-			return nullptr;
+		{
+			std::lock_guard<std::mutex> lock(in_flight_sync->mutex);
+			if (in_flight_sync->count == 0) {
+				return nullptr;
+			}
+			in_flight_sync->count--;
 		}
 
 		MDFrameBufferTexture *frame_buffer = &frame_buffers[rear];
@@ -424,7 +456,6 @@ public:
 		drawables[rear] = nullptr;
 
 		frame_buffer->unset_texture(0);
-		count--;
 
 		return next;
 	}
@@ -501,7 +532,14 @@ RenderingContextDriver::SurfaceID RenderingContextDriverMetal::surface_create(co
 	surface = memnew(SurfaceLayer(wpd->layer, metal_device));
 #endif
 #else
-	if (String v = OS::get_singleton()->get_environment("GODOT_MTL_OFF_SCREEN"); v == U"1") {
+#if TARGET_OS_IOS
+	const bool ios_uncapped_no_vsync =
+			int(GLOBAL_GET("display/window/vsync/vsync_mode")) == int(DisplayServerEnums::VSYNC_DISABLED) &&
+			int(GLOBAL_GET("application/run/max_fps")) == 0;
+#else
+	const bool ios_uncapped_no_vsync = false;
+#endif
+	if (OS::get_singleton()->get_environment("GODOT_MTL_OFF_SCREEN") == U"1" || ios_uncapped_no_vsync) {
 		surface = memnew(SurfaceOffscreen(wpd->layer, metal_device));
 	} else {
 		surface = memnew(SurfaceLayer(wpd->layer, metal_device));

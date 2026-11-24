@@ -39,12 +39,15 @@ class GLTFNode : public Resource {
 	friend class GLTFDocument;
 	friend class SkinTool;
 	friend class FBXDocument;
+	friend struct GLTFFastAccess;
 
 private:
 	String original_name;
 	GLTFNodeIndex parent = -1;
 	int height = -1;
 	Transform3D transform;
+	Transform3D rest_transform;
+	bool has_rest_transform = false;
 	GLTFMeshIndex mesh = -1;
 	GLTFCameraIndex camera = -1;
 	GLTFSkinIndex skin = -1;
@@ -52,6 +55,7 @@ private:
 	bool joint = false;
 	bool visible = true;
 	Vector<int> children;
+	Vector<float> node_weights;
 	GLTFLightIndex light = -1;
 	Dictionary additional_data;
 

@@ -359,7 +359,8 @@ void RendererSceneRenderRD::_render_buffers_ensure_screen_texture(const RenderDa
 	// dedicated backbuffer copy texture instead if the blur texture is not an option so shader effects work correctly.
 	Size2i target_size = rb->get_target_size();
 	bool internal_size_matches = (size.width == target_size.width) && (size.height == target_size.height);
-	bool reuse_blur_texture = !rb->has_upscaled_texture() || internal_size_matches;
+	bool is_temporal_upscaling = RSE::scaling_3d_mode_type(rb->get_scaling_3d_mode()) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL;
+	bool reuse_blur_texture = (!rb->has_upscaled_texture() && !is_temporal_upscaling) || internal_size_matches;
 	if (reuse_blur_texture) {
 		rb->allocate_blur_textures();
 	} else {
@@ -392,7 +393,8 @@ void RendererSceneRenderRD::_render_buffers_copy_screen_texture(const RenderData
 	// dedicated backbuffer copy texture instead if the blur texture is not an option so shader effects work correctly.
 	Size2i target_size = rb->get_target_size();
 	bool internal_size_matches = (size.width == target_size.width) && (size.height == target_size.height);
-	bool reuse_blur_texture = !rb->has_upscaled_texture() || internal_size_matches;
+	bool is_temporal_upscaling = RSE::scaling_3d_mode_type(rb->get_scaling_3d_mode()) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL;
+	bool reuse_blur_texture = (!rb->has_upscaled_texture() && !is_temporal_upscaling) || internal_size_matches;
 	if (reuse_blur_texture) {
 		texture_name = RB_TEX_BLUR_0;
 	} else {
@@ -496,6 +498,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	bool can_use_storage = _render_buffers_can_be_storage();
 
 	RSE::ViewportScaling3DMode scale_mode = rb->get_scaling_3d_mode();
+	bool use_taau_output = rb->has_taau_output() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_TAAU || (rb->get_use_taa() && !can_use_storage));
 	bool use_upscaled_texture = rb->has_upscaled_texture() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
 	SpatialUpscaler *spatial_upscaler = nullptr;
 	if (can_use_effects) {
@@ -514,8 +517,8 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	bool using_scaling_pass = spatial_upscaler || ((use_fxaa || use_smaa) && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_NEAREST));
 
 	RID render_target = rb->get_render_target();
-	RID color_texture = use_upscaled_texture ? rb->get_upscaled_texture() : rb->get_internal_texture();
-	Size2i color_size = use_upscaled_texture ? target_size : rb->get_internal_size();
+	RID color_texture = use_taau_output ? rb->get_taau_output_texture() : (use_upscaled_texture ? rb->get_upscaled_texture() : rb->get_internal_texture());
+	Size2i color_size = (use_taau_output || use_upscaled_texture) ? target_size : rb->get_internal_size();
 
 	bool dest_is_msaa_2d = rb->get_view_count() == 1 && texture_storage->render_target_get_msaa(render_target) != RSE::VIEWPORT_MSAA_DISABLED;
 
@@ -542,7 +545,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 
 		if (can_use_storage) {
 			for (uint32_t i = 0; i < rb->get_view_count(); i++) {
-				buffers.base_texture = use_upscaled_texture ? rb->get_upscaled_texture(i) : rb->get_internal_texture(i);
+				buffers.base_texture = use_taau_output ? rb->get_taau_output_texture(i) : (use_upscaled_texture ? rb->get_upscaled_texture(i) : rb->get_internal_texture(i));
 				buffers.depth_texture = rb->get_depth_texture(i);
 
 				// In stereo p_render_data->z_near and p_render_data->z_far can be offset for our combined frustum.
@@ -564,7 +567,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 			buffers.base_weight_fb = rb->weight_buffers[0].fb;
 
 			for (uint32_t i = 0; i < rb->get_view_count(); i++) {
-				buffers.base_texture = use_upscaled_texture ? rb->get_upscaled_texture(i) : rb->get_internal_texture(i);
+				buffers.base_texture = use_taau_output ? rb->get_taau_output_texture(i) : (use_upscaled_texture ? rb->get_upscaled_texture(i) : rb->get_internal_texture(i));
 				buffers.depth_texture = p_use_msaa ? rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH, i, 0) : rb->get_depth_texture(i);
 				buffers.base_fb = FramebufferCacheRD::get_singleton()->get_cache(buffers.base_texture); // TODO move this into bokeh_dof_raster, we can do this internally
 
@@ -1908,6 +1911,7 @@ void RendererSceneRenderRD::init() {
 	if (can_use_storage) {
 		fsr = memnew(RendererRD::FSR);
 	}
+	mobile_taau = memnew(RendererRD::MobileTAAU);
 #ifdef METAL_ENABLED
 	mfx_spatial = memnew(RendererRD::MFXSpatialEffect);
 #endif
@@ -1942,6 +1946,9 @@ RendererSceneRenderRD::~RendererSceneRenderRD() {
 	}
 	if (fsr) {
 		memdelete(fsr);
+	}
+	if (mobile_taau) {
+		memdelete(mobile_taau);
 	}
 #ifdef METAL_ENABLED
 	if (mfx_spatial) {

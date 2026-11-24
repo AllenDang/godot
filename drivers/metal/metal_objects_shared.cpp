@@ -415,10 +415,89 @@ bool MDAttachment::shouldClear(const MDSubpass &p_subpass, bool p_is_stencil) co
 	return (p_is_stencil ? stencilLoadAction : loadAction) == MTL::LoadActionClear;
 }
 
-MDRenderPass::MDRenderPass(LocalVector<MDAttachment> &&p_attachments, LocalVector<MDSubpass> &&p_subpasses) :
+MDRenderPass::MDRenderPass(LocalVector<MDAttachment> &&p_attachments, LocalVector<MDSubpass> &&p_subpasses, bool p_allow_tile_fusion) :
 		attachments(std::move(p_attachments)), subpasses(std::move(p_subpasses)) {
 	for (MDAttachment &att : attachments) {
 		att.linkToSubpass(*this);
+	}
+
+	if (p_allow_tile_fusion && subpasses.size() > 1) {
+		bool can_fuse = true;
+		const uint32_t base_view_count = subpasses[0].view_count;
+		uint32_t common_samples = 0;
+		uint32_t unique_ds_att = RDD::AttachmentReference::UNUSED;
+
+		for (uint32_t s = 0; s < subpasses.size() && can_fuse; s++) {
+			const MDSubpass &sp = subpasses[s];
+			if (sp.view_count != base_view_count) {
+				can_fuse = false;
+				break;
+			}
+			if (sp.depth_stencil_reference.attachment != RDD::AttachmentReference::UNUSED) {
+				const uint32_t ds_idx = sp.depth_stencil_reference.attachment;
+				if (unique_ds_att == RDD::AttachmentReference::UNUSED) {
+					unique_ds_att = ds_idx;
+				} else if (unique_ds_att != ds_idx) {
+					can_fuse = false;
+					break;
+				}
+				if (sp.depth_resolve_reference.attachment != RDD::AttachmentReference::UNUSED &&
+						!attachments[ds_idx].isLastUseOf(sp)) {
+					can_fuse = false;
+					break;
+				}
+			}
+			for (uint32_t c = 0; c < sp.color_references.size(); c++) {
+				const uint32_t c_idx = sp.color_references[c].attachment;
+				if (c_idx == RDD::AttachmentReference::UNUSED) {
+					continue;
+				}
+				const uint32_t r_idx = c < sp.resolve_references.size() ? sp.resolve_references[c].attachment : RDD::AttachmentReference::UNUSED;
+				if (r_idx != RDD::AttachmentReference::UNUSED && !attachments[c_idx].isLastUseOf(sp)) {
+					can_fuse = false;
+					break;
+				}
+			}
+			// Input attachments in fused Apple Tile Imageblock must be color attachments.
+			for (const RDD::AttachmentReference &in_ref : sp.input_references) {
+				if (in_ref.attachment == RDD::AttachmentReference::UNUSED) {
+					continue;
+				}
+				if (!(attachments[in_ref.attachment].type & MDAttachmentType::Color)) {
+					can_fuse = false;
+					break;
+				}
+			}
+		}
+
+		uint32_t color_slot_count = 0;
+		for (uint32_t i = 0; i < attachments.size() && can_fuse; i++) {
+			const MDAttachment &att = attachments[i];
+			if (att.getFirstUseSubpassIndex() == UINT32_MAX) {
+				continue;
+			}
+			if (common_samples == 0) {
+				common_samples = att.samples;
+			} else if (att.samples != common_samples) {
+				can_fuse = false;
+				break;
+			}
+			if (att.type & MDAttachmentType::Color) {
+				color_slot_count++;
+			}
+		}
+
+		if (can_fuse && color_slot_count <= MAX_COLOR_ATTACHMENT_COUNT) {
+			is_tile_fused = true;
+			fused_depth_stencil_attachment = unique_ds_att;
+			uint32_t next_slot = 0;
+			for (MDAttachment &att : attachments) {
+				if (att.getFirstUseSubpassIndex() != UINT32_MAX && (att.type & MDAttachmentType::Color)) {
+					att.metal_color_slot = next_slot++;
+				}
+			}
+			fused_color_count = next_slot;
+		}
 	}
 }
 
@@ -745,16 +824,8 @@ void ShaderCacheEntry::notify_free() {
 
 #pragma mark - MDLibrary
 
-MDLibrary::MDLibrary(ShaderCacheEntry *p_entry
-#ifdef DEV_ENABLED
-		,
-		NS::String *p_source
-#endif
-		) :
+MDLibrary::MDLibrary(ShaderCacheEntry *p_entry) :
 		_entry(p_entry) {
-#ifdef DEV_ENABLED
-	_original_source = NS::RetainPtr(p_source);
-#endif
 }
 
 MDLibrary::~MDLibrary() {
@@ -792,12 +863,7 @@ MDLazyLibrary::MDLazyLibrary(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
 		NS::String *p_source,
 		MTL::CompileOptions *p_options) :
-		MDLibrary(p_entry
-#ifdef DEV_ENABLED
-				,
-				p_source
-#endif
-				),
+		MDLibrary(p_entry),
 		_device(p_device),
 		_source(NS::RetainPtr(p_source)),
 		_options(NS::RetainPtr(p_options)) {
@@ -870,19 +936,15 @@ MDImmediateLibrary::MDImmediateLibrary(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
 		NS::String *p_source,
 		MTL::CompileOptions *p_options) :
-		MDLibrary(p_entry
-#ifdef DEV_ENABLED
-				,
-				p_source
-#endif
-		) {
+		MDLibrary(p_entry) {
 	os_signpost_id_t compile_id = (os_signpost_id_t)(uintptr_t)this;
 	os_signpost_interval_begin(LOG_INTERVALS, compile_id, "shader_compile",
 			"shader_name=%{public}s stage=%{public}s hash=%X",
 			p_entry->name.get_data(), SHADER_STAGE_NAMES[p_entry->stage], p_entry->key.short_sha());
 
-	// Use Metal's async compilation API with std::function callback.
-	p_device->newLibrary(p_source, p_options, [this, compile_id, p_entry](MTL::Library *library, NS::Error *error) {
+	// Retain source only for the lifetime of the async compilation callback.
+	NS::SharedPtr<NS::String> source_ref = NS::RetainPtr(p_source);
+	p_device->newLibrary(source_ref.get(), p_options, [this, compile_id, p_entry, source_ref](MTL::Library *library, NS::Error *error) {
 		os_signpost_interval_end(LOG_INTERVALS, compile_id, "shader_compile");
 		if (library) {
 			_library = NS::RetainPtr(library);
@@ -923,9 +985,6 @@ class MDBinaryLibrary final : public MDLibrary {
 public:
 	MDBinaryLibrary(ShaderCacheEntry *p_entry,
 			MTL::Device *p_device,
-#ifdef DEV_ENABLED
-			NS::String *p_source,
-#endif
 			dispatch_data_t p_data);
 
 	MTL::Library *get_library() override;
@@ -934,16 +993,8 @@ public:
 
 MDBinaryLibrary::MDBinaryLibrary(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
-#ifdef DEV_ENABLED
-		NS::String *p_source,
-#endif
 		dispatch_data_t p_data) :
-		MDLibrary(p_entry
-#ifdef DEV_ENABLED
-				,
-				p_source
-#endif
-		) {
+		MDLibrary(p_entry) {
 	NS::Error *error = nullptr;
 	_library = NS::TransferPtr(p_device->newLibrary(p_data, &error));
 	if (error != nullptr) {
@@ -984,15 +1035,8 @@ std::shared_ptr<MDLibrary> MDLibrary::create(ShaderCacheEntry *p_entry,
 
 std::shared_ptr<MDLibrary> MDLibrary::create(ShaderCacheEntry *p_entry,
 		MTL::Device *p_device,
-#ifdef DEV_ENABLED
-		NS::String *p_source,
-#endif
 		dispatch_data_t p_data) {
-	std::shared_ptr<MDLibrary> lib = std::make_shared<MDBinaryLibrary>(p_entry, p_device,
-#ifdef DEV_ENABLED
-			p_source,
-#endif
-			p_data);
+	std::shared_ptr<MDLibrary> lib = std::make_shared<MDBinaryLibrary>(p_entry, p_device, p_data);
 	p_entry->library = lib;
 	return lib;
 }

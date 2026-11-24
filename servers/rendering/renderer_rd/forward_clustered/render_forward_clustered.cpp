@@ -1782,11 +1782,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	enum {
 		SCALE_NONE,
+		SCALE_TAAU,
 		SCALE_FSR2,
 		SCALE_MFX,
 	} scale_type = SCALE_NONE;
 
 	switch (rb->get_scaling_3d_mode()) {
+		case RSE::VIEWPORT_SCALING_3D_MODE_TAAU:
+			scale_type = SCALE_TAAU;
+			break;
 		case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
 			scale_type = SCALE_FSR2;
 			break;
@@ -2357,7 +2361,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->draw_list_end();
 	}
 
-	if (rb_data.is_valid() && using_upscaling) {
+	if (rb_data.is_valid() && using_upscaling && scale_type != SCALE_TAAU) {
 		// Make sure the upscaled texture is initialized, but not necessarily filled, before running screen copies
 		// so it properly detect if a dedicated copy texture should be used.
 		rb->ensure_upscaled();
@@ -2534,6 +2538,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 			RD::get_singleton()->draw_command_end_label();
 #endif
+		} else if (scale_type == SCALE_TAAU && mobile_taau) {
+			RD::get_singleton()->draw_command_begin_label("TAAU");
+			RENDER_TIMESTAMP("TAAU");
+			mobile_taau->process(rb,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform,
+					p_render_data->scene_data->prev_cam_projection, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->taa_jitter);
+			RD::get_singleton()->draw_command_end_label();
 		} else if (using_taa) {
 			RD::get_singleton()->draw_command_begin_label("TAA");
 			RENDER_TIMESTAMP("TAA");

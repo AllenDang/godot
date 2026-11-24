@@ -30,8 +30,10 @@
 
 #import "godot_view_apple_embedded.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/os/keyboard.h"
+#include "core/os/os.h"
 #include "core/string/ustring.h"
 #import "drivers/apple_embedded/display_layer_apple_embedded.h"
 #import "drivers/apple_embedded/display_server_apple_embedded.h"
@@ -134,16 +136,31 @@ static const float earth_gravity = 9.80665;
 	[self initTouches];
 
 	self.multipleTouchEnabled = YES;
+}
 
-	// Configure and start accelerometer
-	if (!self.motionManager) {
-		self.motionManager = [[CMMotionManager alloc] init];
-		if (self.motionManager.deviceMotionAvailable) {
-			self.motionManager.deviceMotionUpdateInterval = 1.0 / 70.0;
-			[self.motionManager startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXMagneticNorthZVertical];
-		} else {
+- (void)configureMotionSensorsIfNeeded {
+	const bool sensors_enabled =
+			bool(GLOBAL_GET("input_devices/sensors/enable_accelerometer")) ||
+			bool(GLOBAL_GET("input_devices/sensors/enable_gravity")) ||
+			bool(GLOBAL_GET("input_devices/sensors/enable_gyroscope")) ||
+			bool(GLOBAL_GET("input_devices/sensors/enable_magnetometer"));
+	if (!sensors_enabled) {
+		if (self.motionManager) {
+			[self.motionManager stopDeviceMotionUpdates];
 			self.motionManager = nil;
 		}
+		return;
+	}
+	if (!self.motionManager) {
+		self.motionManager = [[CMMotionManager alloc] init];
+	}
+	if (self.motionManager.deviceMotionAvailable) {
+		if (!self.motionManager.deviceMotionActive) {
+			self.motionManager.deviceMotionUpdateInterval = 1.0 / 70.0;
+			[self.motionManager startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXMagneticNorthZVertical];
+		}
+	} else {
+		self.motionManager = nil;
 	}
 }
 
@@ -189,6 +206,10 @@ static const float earth_gravity = 9.80665;
 		self.animationTimer = nil;
 	}
 
+	if (self.motionManager && self.motionManager.deviceMotionActive) {
+		[self.motionManager stopDeviceMotionUpdates];
+	}
+
 	[self clearTouches];
 }
 
@@ -201,6 +222,18 @@ static const float earth_gravity = 9.80665;
 
 	print_verbose("Start animation!");
 
+	const bool uncapped_no_vsync =
+			(int(GLOBAL_GET("display/window/vsync/vsync_mode")) == int(DisplayServerEnums::VSYNC_DISABLED) &&
+					int(GLOBAL_GET("application/run/max_fps")) == 0) ||
+			(OS::get_singleton() != nullptr && OS::get_singleton()->get_environment("GODOT_MTL_OFF_SCREEN") == U"1");
+	if (uncapped_no_vsync) {
+		self.useCADisplayLink = NO;
+	}
+
+	if (self.delegateDidFinishSetUp) {
+		[self configureMotionSensorsIfNeeded];
+	}
+
 	if (self.useCADisplayLink) {
 		self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(drawView)];
 		self.displayLink.preferredFramesPerSecond = self.preferredFrameRate;
@@ -208,65 +241,100 @@ static const float earth_gravity = 9.80665;
 		// Setup DisplayLink in main thread
 		[self.displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
 	} else {
-		self.animationTimer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / self.preferredFrameRate) target:self selector:@selector(drawView) userInfo:nil repeats:YES];
+		const NSTimeInterval interval = uncapped_no_vsync ? 0.0001 : (1.0 / MAX(1.0, (double)self.preferredFrameRate));
+		self.animationTimer = [NSTimer timerWithTimeInterval:interval target:self selector:@selector(drawView) userInfo:nil repeats:YES];
+		[[NSRunLoop currentRunLoop] addTimer:self.animationTimer forMode:NSRunLoopCommonModes];
 	}
 }
 
 - (void)drawView {
-	if (!self.isActive) {
-		print_verbose("Draw view not active!");
-		return;
-	}
-
-	if (self.useCADisplayLink) {
-		// Pause the CADisplayLink to avoid recursion
-		[self.displayLink setPaused:YES];
-
-		// Process all input events
-		while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, TRUE) == kCFRunLoopRunHandledSource) {
-			// Continue.
-		}
-
-		// We are good to go, resume the CADisplayLink
-		[self.displayLink setPaused:NO];
-	}
-
-	[self.renderingLayer startRenderDisplayLayer];
-
-	if (!self.renderer) {
-		return;
-	}
-
-	if ([self.renderer setupView:self]) {
-		return;
-	}
-
-	if (self.delegate && !self.delegateDidFinishSetUp) {
-		[self layoutRenderingLayer]; // Trigger DisplayServerVisionOS::resize_window after Main::start()
-		self.delegateDidFinishSetUp = [self.delegate godotViewFinishedSetup:self];
-		if (!_delegateDidFinishSetUp) {
+	@autoreleasepool {
+		if (!self.isActive) {
+			print_verbose("Draw view not active!");
 			return;
 		}
-	}
 
-	[self handleMotion];
+		struct TimerDrawGuard {
+			bool *flag = nullptr;
+			~TimerDrawGuard() {
+				if (flag) {
+					*flag = false;
+				}
+			}
+		} timer_guard;
 
-#if !defined(VISIONOS_ENABLED)
-	if (@available(iOS 16.0, *)) {
-		CGFloat edr_headroom = UIScreen.mainScreen.currentEDRHeadroom;
-		if (last_edr_headroom != edr_headroom) {
-			last_edr_headroom = edr_headroom;
-			if (DisplayServerAppleEmbedded::get_singleton()) {
-				DisplayServerAppleEmbedded::get_singleton()->current_edr_headroom_changed();
+		if (self.useCADisplayLink) {
+			// Pause the CADisplayLink to avoid recursion
+			[self.displayLink setPaused:YES];
+
+			// Process all input events
+			while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, TRUE) == kCFRunLoopRunHandledSource) {
+				// Continue.
+			}
+
+			// We are good to go, resume the CADisplayLink
+			[self.displayLink setPaused:NO];
+		} else {
+			static bool in_timer_draw = false;
+			if (in_timer_draw) {
+				return;
+			}
+			in_timer_draw = true;
+			timer_guard.flag = &in_timer_draw;
+			while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, TRUE) == kCFRunLoopRunHandledSource) {
+				// Continue.
 			}
 		}
-	}
+
+		[self.renderingLayer startRenderDisplayLayer];
+
+		if (!self.renderer) {
+			return;
+		}
+
+		if ([self.renderer setupView:self]) {
+			return;
+		}
+
+		if (self.delegate && !self.delegateDidFinishSetUp) {
+			[self layoutRenderingLayer]; // Trigger DisplayServerVisionOS::resize_window after Main::start()
+			self.delegateDidFinishSetUp = [self.delegate godotViewFinishedSetup:self];
+			if (!_delegateDidFinishSetUp) {
+				return;
+			}
+			[self configureMotionSensorsIfNeeded];
+			const bool post_setup_uncapped =
+					(int(GLOBAL_GET("display/window/vsync/vsync_mode")) == int(DisplayServerEnums::VSYNC_DISABLED) &&
+							Engine::get_singleton() != nullptr && Engine::get_singleton()->get_max_fps() == 0) ||
+					(OS::get_singleton() != nullptr && OS::get_singleton()->get_environment("GODOT_MTL_OFF_SCREEN") == U"1");
+			if (post_setup_uncapped && self.useCADisplayLink) {
+				[self.displayLink invalidate];
+				self.displayLink = nil;
+				self.useCADisplayLink = NO;
+				self.animationTimer = [NSTimer timerWithTimeInterval:0.0001 target:self selector:@selector(drawView) userInfo:nil repeats:YES];
+				[[NSRunLoop currentRunLoop] addTimer:self.animationTimer forMode:NSRunLoopCommonModes];
+			}
+		}
+
+		[self handleMotion];
+
+#if !defined(VISIONOS_ENABLED)
+		if (@available(iOS 16.0, *)) {
+			CGFloat edr_headroom = UIScreen.mainScreen.currentEDRHeadroom;
+			if (last_edr_headroom != edr_headroom) {
+				last_edr_headroom = edr_headroom;
+				if (DisplayServerAppleEmbedded::get_singleton()) {
+					DisplayServerAppleEmbedded::get_singleton()->current_edr_headroom_changed();
+				}
+			}
+		}
 
 #endif
 
-	[self.renderer renderOnView:self];
+		[self.renderer renderOnView:self];
 
-	[self.renderingLayer stopRenderDisplayLayer];
+		[self.renderingLayer stopRenderDisplayLayer];
+	}
 }
 
 - (BOOL)canRender {

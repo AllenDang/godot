@@ -656,6 +656,7 @@ public:
 		BitField<PipelineStageBits> dst_stages = {};
 		BitField<BarrierAccessBits> src_access = {};
 		BitField<BarrierAccessBits> dst_access = {};
+		bool is_by_region = false;
 	};
 
 	virtual RenderPassID render_pass_create(VectorView<Attachment> p_attachments, VectorView<Subpass> p_subpasses, VectorView<SubpassDependency> p_subpass_dependencies, uint32_t p_view_count, AttachmentReference p_fragment_density_map_attachment) = 0;

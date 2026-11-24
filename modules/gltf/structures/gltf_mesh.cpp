@@ -60,11 +60,15 @@ void GLTFMesh::set_original_name(const String &p_name) {
 }
 
 Ref<ImporterMesh> GLTFMesh::get_mesh() {
+	if (mesh.is_null() && runtime_mesh.is_valid()) {
+		mesh = ImporterMesh::from_mesh(runtime_mesh);
+	}
 	return mesh;
 }
 
 void GLTFMesh::set_mesh(const Ref<ImporterMesh> &p_mesh) {
 	mesh = p_mesh;
+	runtime_mesh.unref();
 }
 
 TypedArray<Material> GLTFMesh::get_instance_materials() {

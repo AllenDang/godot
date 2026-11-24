@@ -103,6 +103,32 @@ protected:
 	// DEV: When true, attempting to create a pipeline will fail if it cannot use the archive.
 	bool archive_fail_on_miss = false;
 
+	bool _enable_debug_labels = false;
+
+	struct MDArgBufferArena {
+		static constexpr uint32_t CHUNK_SIZE = 4u * 1024u * 1024u;
+		static constexpr uint32_t BUCKET_COUNT = 8;
+		static constexpr uint32_t BUCKET_SIZES[BUCKET_COUNT] = { 64, 128, 192, 256, 384, 512, 768, 1024 };
+
+		struct Chunk {
+			MetalBuffer buffer;
+			uint32_t head = 0;
+		};
+		struct FreeSlot {
+			uint16_t chunk_index = 0;
+			uint32_t offset = 0;
+		};
+
+		Mutex mutex;
+		uint32_t min_align = 64;
+		LocalVector<Chunk> chunks;
+		LocalVector<FreeSlot> free_lists[BUCKET_COUNT];
+
+		bool allocate(uint32_t p_size, MetalAllocator *p_allocator, MTL::ResourceOptions p_base_hazard_tracking, bool p_debug_labels, MTL::Buffer *&r_buffer, uint32_t &r_offset, uint16_t &r_bucket, uint16_t &r_chunk);
+		void release(uint16_t p_bucket, uint16_t p_chunk, uint32_t p_offset);
+		void clear(MetalAllocator *p_allocator);
+	} _arg_buffer_arena;
+
 #pragma mark - Copy Queue
 
 	Mutex copy_queue_mutex;
@@ -398,6 +424,7 @@ public:
 
 private:
 	Result<NS::SharedPtr<MTL::Function>> _create_function(MDLibrary *p_library, NS::String *p_name, VectorView<PipelineSpecializationConstant> &p_specialization_constants);
+	std::shared_ptr<MDLibrary> _get_or_create_remapped_frag_library(MDRenderShader *p_shader, const uint32_t *p_out_slots, uint32_t p_out_count, const uint32_t *p_in_slots, uint32_t p_in_count);
 
 public:
 	virtual void pipeline_free(PipelineID p_pipeline_id) override final;
