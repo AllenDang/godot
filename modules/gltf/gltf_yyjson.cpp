@@ -200,6 +200,48 @@ Vector<uint8_t> decode_base64_uri(const String &p_uri) {
 	return buf;
 }
 
+bool verify_ktx2_uastc_slice(const uint8_t *p_data, size_t p_len) {
+	static constexpr uint8_t kKtx2Magic[12] = {
+		0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
+	};
+	if (!p_data || p_len < 80 || p_len > size_t(INT32_MAX) || std::memcmp(p_data, kKtx2Magic, 12) != 0) {
+		return false;
+	}
+	uint32_t vk_format = 0;
+	uint32_t dfd_ofs = 0;
+	uint32_t dfd_len = 0;
+	std::memcpy(&vk_format, p_data + 12, 4);
+	std::memcpy(&dfd_ofs, p_data + 48, 4);
+	std::memcpy(&dfd_len, p_data + 52, 4);
+	// VK_FORMAT_UNDEFINED (0) for supercompressed UASTC LDR/HDR, or VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK (135).
+	if (vk_format != 0u && vk_format != 135u) {
+		return false;
+	}
+	if (dfd_ofs < 80u || dfd_len < 44u || uint64_t(dfd_ofs) + uint64_t(dfd_len) > uint64_t(p_len)) {
+		return false;
+	}
+	const uint8_t color_model = p_data[dfd_ofs + 12u];
+	// KHR_DF_MODEL_UASTC (166) or KHR_DF_MODEL_UASTC_HDR_4x4 (167). Rejects ETC1S (163) and raw formats.
+	return color_model == 166u || color_model == 167u;
+}
+
+String sha256_hex_lower(const uint8_t *p_data, size_t p_len) {
+	unsigned char digest[32] = {};
+	if (CryptoCore::sha256(p_data, p_len, digest) != OK) {
+		return String();
+	}
+	static constexpr char kHex[16] = {
+		'0', '1', '2', '3', '4', '5', '6', '7',
+		'8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
+	};
+	char hex[64];
+	for (int i = 0; i < 32; i++) {
+		hex[i * 2] = kHex[(digest[i] >> 4) & 0x0F];
+		hex[i * 2 + 1] = kHex[digest[i] & 0x0F];
+	}
+	return String::utf8(hex, 64);
+}
+
 void attach_yyjson_extras_to_meta(yyjson_val *p_extras, Ref<Resource> p_res) {
 	if (!p_extras || !yyjson_is_obj(p_extras) || yyjson_obj_size(p_extras) == 0 || p_res.is_null()) {
 		return;
@@ -1503,8 +1545,20 @@ Error gltf_yyjson_populate_state(
 					const Callable ktx2_register = p_state->get_additional_data(SNAME("_ange_ktx2_pool_register"));
 					const bool use_rescache_parallel = p_state->get_additional_data(SNAME("_ange_parallel_ktx2_rescache")).booleanize();
 
-					LocalVector<String> resolved_uris;
-					resolved_uris.resize(uint32_t(img_cnt));
+					struct StrictKtx2Item {
+						String pool_key;
+						String label;
+						const uint8_t *mem_ptr = nullptr;
+						size_t mem_len = 0;
+						Vector<uint8_t> owned_bytes;
+						bool is_memory_slice = false;
+					};
+					LocalVector<StrictKtx2Item> items;
+					items.resize(uint32_t(img_cnt));
+
+					auto probe_candidate = [](const String &p_cand) -> bool {
+						return !p_cand.is_empty() && (FileAccess::exists(p_cand) || ResourceLoader::exists(p_cand));
+					};
 
 					yyjson_arr_iter it = yyjson_arr_iter_with(imgs_arr);
 					int ii = 0;
@@ -1515,172 +1569,208 @@ Error gltf_yyjson_populate_state(
 							ii++;
 							continue;
 						}
-						yyjson_val *bv_val = yyjson_obj_get(iobj, "bufferView");
-						ERR_FAIL_COND_V_MSG(bv_val != nullptr, ERR_FILE_UNRECOGNIZED,
-								vformat("GLTF-KTX2-001: Image index '%d' uses embedded 'bufferView'; only external KTX2+UASTC URI textures are permitted.", ii));
-						yyjson_val *uri_val = yyjson_obj_get(iobj, "uri");
-						ERR_FAIL_COND_V_MSG(!uri_val || !yyjson_is_str(uri_val), ERR_FILE_UNRECOGNIZED,
-								vformat("GLTF-KTX2-001: Image index '%d' is missing external 'uri'.", ii));
-						const String raw_uri = yj_str(uri_val);
-						ERR_FAIL_COND_V_MSG(raw_uri.begins_with("data:"), ERR_FILE_UNRECOGNIZED,
-								vformat("GLTF-KTX2-001: Image index '%d' uses embedded 'data:' URI; only external KTX2+UASTC files are permitted.", ii));
+						StrictKtx2Item &item = items[uint32_t(ii)];
 						const String mime_type = yj_str(yyjson_obj_get(iobj, "mimeType"));
 						ERR_FAIL_COND_V_MSG(!mime_type.is_empty() && mime_type != "image/ktx2", ERR_FILE_UNRECOGNIZED,
-								vformat("GLTF-KTX2-001: Image index '%d' has forbidden mimeType '%s'; only 'image/ktx2' is permitted.", ii, mime_type));
-						const String decoded_uri = raw_uri.uri_file_decode().replace_char('\\', '/');
-						ERR_FAIL_COND_V_MSG(decoded_uri.get_extension().to_lower() != "ktx2", ERR_FILE_UNRECOGNIZED,
-								vformat("GLTF-KTX2-001: Image index '%d' URI '%s' is not a .ktx2 file.", ii, decoded_uri));
+								vformat("GLTF-KTX2-001: Image index '%d' has forbidden mimeType '%s'; only 'image/ktx2' (KTX2+UASTC) is permitted.", ii, mime_type));
 
-						auto probe_candidate = [](const String &p_cand) -> bool {
-							return !p_cand.is_empty() && (FileAccess::exists(p_cand) || ResourceLoader::exists(p_cand));
-						};
+						yyjson_val *bv_val = yyjson_obj_get(iobj, "bufferView");
+						yyjson_val *uri_val = yyjson_obj_get(iobj, "uri");
 
-						String res_uri;
-						if (!p_search_path.is_empty()) {
-							const String cand = p_search_path.path_join(decoded_uri).replace_char('\\', '/').simplify_path();
-							if (probe_candidate(cand)) {
-								res_uri = cand;
-							}
-						}
-						if (res_uri.is_empty() && !game_dir.is_empty()) {
-							const String cand = game_dir.path_join(decoded_uri).replace_char('\\', '/').simplify_path();
-							if (probe_candidate(cand)) {
-								res_uri = cand;
-							}
-						}
-						if (res_uri.is_empty()) {
-							const String fname = decoded_uri.get_file();
-							if (!fname.is_empty()) {
-								const String user_cand = String("user://save/resources/") + fname;
-								if (probe_candidate(user_cand)) {
-									res_uri = user_cand;
-								} else {
-									const String assets_cand = String("res://assets/") + fname;
-									if (probe_candidate(assets_cand)) {
-										res_uri = assets_cand;
+						if (bv_val != nullptr) {
+							const int bvi = int(yj_int(bv_val, -1));
+							ERR_FAIL_COND_V_MSG(bvi < 0 || bvi >= state_bvs.size(), ERR_FILE_UNRECOGNIZED,
+									vformat("GLTF-KTX2-001: Image index '%d' has invalid embedded bufferView '%d'.", ii, bvi));
+							const uint8_t *vptr = nullptr;
+							int64_t vlen = 0;
+							ERR_FAIL_COND_V_MSG(!state_bvs[bvi]->get_view_span(p_state.ptr(), vptr, vlen) || !vptr || vlen <= 0, ERR_FILE_UNRECOGNIZED,
+									vformat("GLTF-KTX2-001: Image index '%d' embedded bufferView '%d' is empty or out of bounds.", ii, bvi));
+							ERR_FAIL_COND_V_MSG(!verify_ktx2_uastc_slice(vptr, size_t(vlen)), ERR_FILE_UNRECOGNIZED,
+									vformat("GLTF-KTX2-001: Image index '%d' embedded bufferView '%d' is not a KTX2+UASTC texture.", ii, bvi));
+							const String hex = sha256_hex_lower(vptr, size_t(vlen));
+							ERR_FAIL_COND_V_MSG(hex.is_empty(), ERR_FILE_CORRUPT,
+									vformat("GLTF-KTX2-003: Failed to hash embedded KTX2 bufferView '%d'.", bvi));
+							item.pool_key = String("mem://ktx2/") + hex;
+							item.label = vformat("embedded bufferView[%d]", bvi);
+							item.mem_ptr = vptr;
+							item.mem_len = size_t(vlen);
+							item.is_memory_slice = true;
+						} else {
+							ERR_FAIL_COND_V_MSG(!uri_val || !yyjson_is_str(uri_val), ERR_FILE_UNRECOGNIZED,
+									vformat("GLTF-KTX2-001: Image index '%d' must specify either an external .ktx2 'uri' or an embedded KTX2+UASTC 'bufferView'.", ii));
+							const String raw_uri = yj_str(uri_val);
+							if (raw_uri.begins_with("data:")) {
+								ERR_FAIL_COND_V_MSG(!raw_uri.begins_with("data:image/ktx2;base64,"), ERR_FILE_UNRECOGNIZED,
+										vformat("GLTF-KTX2-001: Image index '%d' uses forbidden 'data:' URI; only KTX2+UASTC textures are permitted.", ii));
+								item.owned_bytes = decode_base64_uri(raw_uri);
+								ERR_FAIL_COND_V_MSG(!verify_ktx2_uastc_slice(item.owned_bytes.ptr(), size_t(item.owned_bytes.size())), ERR_FILE_UNRECOGNIZED,
+										vformat("GLTF-KTX2-001: Image index '%d' 'data:image/ktx2' payload is not a valid KTX2+UASTC texture.", ii));
+								const String hex = sha256_hex_lower(item.owned_bytes.ptr(), size_t(item.owned_bytes.size()));
+								ERR_FAIL_COND_V_MSG(hex.is_empty(), ERR_FILE_CORRUPT,
+										vformat("GLTF-KTX2-003: Failed to hash embedded data:image/ktx2 image '%d'.", ii));
+								item.pool_key = String("mem://ktx2/") + hex;
+								item.label = vformat("data:image/ktx2[%d]", ii);
+								item.mem_ptr = item.owned_bytes.ptr();
+								item.mem_len = size_t(item.owned_bytes.size());
+								item.is_memory_slice = true;
+							} else {
+								const String decoded_uri = raw_uri.uri_file_decode().replace_char('\\', '/');
+								ERR_FAIL_COND_V_MSG(decoded_uri.get_extension().to_lower() != "ktx2", ERR_FILE_UNRECOGNIZED,
+										vformat("GLTF-KTX2-001: Image index '%d' URI '%s' is not a .ktx2 file.", ii, decoded_uri));
+
+								String res_uri;
+								if (!p_search_path.is_empty()) {
+									const String cand = p_search_path.path_join(decoded_uri).replace_char('\\', '/').simplify_path();
+									if (probe_candidate(cand)) {
+										res_uri = cand;
 									}
 								}
-							}
-						}
-						if (res_uri.is_empty() && ext_resolver.is_valid()) {
-							Variant arg = decoded_uri;
-							const Variant *argp = &arg;
-							Variant resolved_var;
-							Callable::CallError cerr;
-							ext_resolver.callp(&argp, 1, resolved_var, cerr);
-							if (cerr.error == Callable::CallError::CALL_OK && resolved_var.get_type() == Variant::STRING) {
-								const String cand = String(resolved_var);
-								if (probe_candidate(cand)) {
-									res_uri = cand;
+								if (res_uri.is_empty() && !game_dir.is_empty()) {
+									const String cand = game_dir.path_join(decoded_uri).replace_char('\\', '/').simplify_path();
+									if (probe_candidate(cand)) {
+										res_uri = cand;
+									}
 								}
+								if (res_uri.is_empty()) {
+									const String fname = decoded_uri.get_file();
+									if (!fname.is_empty()) {
+										const String user_cand = String("user://save/resources/") + fname;
+										if (probe_candidate(user_cand)) {
+											res_uri = user_cand;
+										} else {
+											const String assets_cand = String("res://assets/") + fname;
+											if (probe_candidate(assets_cand)) {
+												res_uri = assets_cand;
+											}
+										}
+									}
+								}
+								if (res_uri.is_empty() && ext_resolver.is_valid()) {
+									Variant arg = decoded_uri;
+									const Variant *argp = &arg;
+									Variant resolved_var;
+									Callable::CallError cerr;
+									ext_resolver.callp(&argp, 1, resolved_var, cerr);
+									if (cerr.error == Callable::CallError::CALL_OK && resolved_var.get_type() == Variant::STRING) {
+										const String cand = String(resolved_var);
+										if (probe_candidate(cand)) {
+											res_uri = cand;
+										}
+									}
+								}
+								ERR_FAIL_COND_V_MSG(res_uri.is_empty(), ERR_FILE_NOT_FOUND,
+										vformat("GLTF-KTX2-002: External KTX2 texture '%s' (image %d) was not found.", decoded_uri, ii));
+								item.pool_key = res_uri;
+								item.label = res_uri;
+								item.is_memory_slice = false;
 							}
 						}
-						ERR_FAIL_COND_V_MSG(res_uri.is_empty(), ERR_FILE_NOT_FOUND,
-								vformat("GLTF-KTX2-002: External KTX2 texture '%s' (image %d) was not found.", decoded_uri, ii));
-
-						resolved_uris[uint32_t(ii)] = res_uri;
 						ii++;
 					}
 
 					if (img_mode != GLTFState::HANDLE_BINARY_IMAGE_MODE_DISCARD_TEXTURES) {
 						const bool has_custom_pool = ktx2_lookup.is_valid() && ktx2_register.is_valid();
-						if (has_custom_pool || use_rescache_parallel) {
-							LocalVector<String> unique_uris;
-							LocalVector<Ref<Texture2D>> unique_texs;
-							LocalVector<int32_t> img_to_unique;
-							img_to_unique.resize(uint32_t(img_cnt));
-							HashMap<String, uint32_t> uri_to_idx;
+						LocalVector<uint32_t> unique_rep_img;
+						LocalVector<Ref<Texture2D>> unique_texs;
+						LocalVector<int32_t> img_to_unique;
+						img_to_unique.resize(uint32_t(img_cnt));
+						HashMap<String, uint32_t> key_to_uidx;
 
-							for (int k = 0; k < img_cnt; k++) {
-								const String &u_str = resolved_uris[uint32_t(k)];
-								HashMap<String, uint32_t>::Iterator E = uri_to_idx.find(u_str);
-								if (E) {
-									img_to_unique[uint32_t(k)] = int32_t(E->value);
-								} else {
-									const uint32_t uidx = unique_uris.size();
-									unique_uris.push_back(u_str);
-									unique_texs.push_back(Ref<Texture2D>());
-									uri_to_idx.insert(u_str, uidx);
-									img_to_unique[uint32_t(k)] = int32_t(uidx);
-								}
+						for (int k = 0; k < img_cnt; k++) {
+							const String &pkey = items[uint32_t(k)].pool_key;
+							HashMap<String, uint32_t>::Iterator E = key_to_uidx.find(pkey);
+							if (E) {
+								img_to_unique[uint32_t(k)] = int32_t(E->value);
+							} else {
+								const uint32_t uidx = unique_rep_img.size();
+								unique_rep_img.push_back(uint32_t(k));
+								unique_texs.push_back(Ref<Texture2D>());
+								key_to_uidx.insert(pkey, uidx);
+								img_to_unique[uint32_t(k)] = int32_t(uidx);
 							}
+						}
 
-							LocalVector<uint32_t> miss_indices;
-							for (uint32_t u = 0; u < unique_uris.size(); u++) {
-								Ref<Texture2D> hit_tex;
-								if (has_custom_pool) {
-									Variant arg = unique_uris[u];
-									const Variant *argp = &arg;
-									Variant found_var;
-									Callable::CallError cerr;
-									ktx2_lookup.callp(&argp, 1, found_var, cerr);
-									if (cerr.error == Callable::CallError::CALL_OK) {
-										hit_tex = Ref<Texture2D>(found_var);
-									}
-								} else {
-									hit_tex = ResourceCache::get_ref(unique_uris[u]);
+						LocalVector<uint32_t> miss_indices;
+						for (uint32_t u = 0; u < unique_rep_img.size(); u++) {
+							const StrictKtx2Item &uitem = items[unique_rep_img[u]];
+							Ref<Texture2D> hit_tex;
+							if (has_custom_pool) {
+								Variant arg = uitem.pool_key;
+								const Variant *argp = &arg;
+								Variant found_var;
+								Callable::CallError cerr;
+								ktx2_lookup.callp(&argp, 1, found_var, cerr);
+								if (cerr.error == Callable::CallError::CALL_OK) {
+									hit_tex = Ref<Texture2D>(found_var);
 								}
-								if (hit_tex.is_valid()) {
-									unique_texs[u] = hit_tex;
-								} else {
-									miss_indices.push_back(u);
-								}
+							} else if (!uitem.is_memory_slice && use_rescache_parallel) {
+								hit_tex = ResourceCache::get_ref(uitem.pool_key);
 							}
+							if (hit_tex.is_valid()) {
+								unique_texs[u] = hit_tex;
+							} else {
+								miss_indices.push_back(u);
+							}
+						}
 
-							if (!miss_indices.is_empty()) {
-								LocalVector<Ref<Image>> miss_imgs;
-								miss_imgs.resize(miss_indices.size());
-								for (uint32_t m = 0; m < miss_indices.size(); m++) {
-									const uint32_t u = miss_indices[m];
+						if (!miss_indices.is_empty()) {
+							ERR_FAIL_COND_V_MSG(!Image::_ktx_mem_loader_func, ERR_UNAVAILABLE, "GLTF-KTX2-003: KTX2 memory loader is unavailable.");
+							LocalVector<Ref<Image>> miss_imgs;
+							miss_imgs.resize(miss_indices.size());
+							for (uint32_t m = 0; m < miss_indices.size(); m++) {
+								const uint32_t u = miss_indices[m];
+								const StrictKtx2Item &uitem = items[unique_rep_img[u]];
+								if (uitem.is_memory_slice) {
+									miss_imgs[m] = Image::_ktx_mem_loader_func(uitem.mem_ptr, static_cast<int>(uitem.mem_len));
+								} else {
 									FileAccessMMapView kview;
-									if (Image::_ktx_mem_loader_func && kview.open(unique_uris[u]) == OK && kview.is_valid()) {
-										if (kview.size() > 0 && kview.size() <= INT32_MAX) {
-											miss_imgs[m] = Image::_ktx_mem_loader_func(kview.ptr(), static_cast<int>(kview.size()));
-										}
+									if (kview.open(uitem.pool_key) == OK && kview.is_valid()) {
+										ERR_FAIL_COND_V_MSG(!verify_ktx2_uastc_slice(kview.ptr(), kview.size()), ERR_FILE_UNRECOGNIZED,
+												vformat("GLTF-KTX2-001: External KTX2 texture '%s' is not UASTC encoded.", uitem.label));
+										miss_imgs[m] = Image::_ktx_mem_loader_func(kview.ptr(), static_cast<int>(kview.size()));
 									} else {
-										miss_imgs[m] = Image::load_from_file(unique_uris[u]);
+										const Vector<uint8_t> fbytes = FileAccess::get_file_as_bytes(uitem.pool_key);
+										ERR_FAIL_COND_V_MSG(!verify_ktx2_uastc_slice(fbytes.ptr(), size_t(fbytes.size())), ERR_FILE_UNRECOGNIZED,
+												vformat("GLTF-KTX2-001: External KTX2 texture '%s' is not UASTC encoded.", uitem.label));
+										miss_imgs[m] = Image::_ktx_mem_loader_func(fbytes.ptr(), static_cast<int>(fbytes.size()));
 									}
-								}
-
-								for (uint32_t m = 0; m < miss_indices.size(); m++) {
-									const uint32_t u = miss_indices[m];
-									ERR_FAIL_COND_V_MSG(miss_imgs[m].is_null() || miss_imgs[m]->is_empty(), ERR_FILE_CORRUPT,
-											vformat("GLTF-KTX2-003: Failed to transcode external KTX2 texture '%s'.", unique_uris[u]));
-									Ref<Texture2D> reg_tex;
-									if (has_custom_pool) {
-										Variant arg_u = unique_uris[u];
-										Variant arg_i = miss_imgs[m];
-										const Variant *argsp[2] = { &arg_u, &arg_i };
-										Variant reg_var;
-										Callable::CallError cerr;
-										ktx2_register.callp(argsp, 2, reg_var, cerr);
-										if (cerr.error == Callable::CallError::CALL_OK) {
-											reg_tex = Ref<Texture2D>(reg_var);
-										}
-									} else {
-										Ref<ImageTexture> itex = ImageTexture::create_from_image(miss_imgs[m]);
-										if (itex.is_valid()) {
-											itex->set_meta("_ange_authored_block_texture", true);
-											itex->set_path(unique_uris[u], true);
-											reg_tex = itex;
-										}
-									}
-									ERR_FAIL_COND_V_MSG(reg_tex.is_null(), ERR_FILE_CORRUPT,
-											vformat("GLTF-KTX2-003: Failed to upload external KTX2 texture '%s'.", unique_uris[u]));
-									unique_texs[u] = reg_tex;
 								}
 							}
 
-							for (int k = 0; k < img_cnt; k++) {
-								state_images.write[k] = unique_texs[uint32_t(img_to_unique[uint32_t(k)])];
+							for (uint32_t m = 0; m < miss_indices.size(); m++) {
+								const uint32_t u = miss_indices[m];
+								const StrictKtx2Item &uitem = items[unique_rep_img[u]];
+								ERR_FAIL_COND_V_MSG(miss_imgs[m].is_null() || miss_imgs[m]->is_empty(), ERR_FILE_CORRUPT,
+										vformat("GLTF-KTX2-003: Failed to transcode KTX2+UASTC texture '%s'.", uitem.label));
+								Ref<Texture2D> reg_tex;
+								if (has_custom_pool) {
+									Variant arg_u = uitem.pool_key;
+									Variant arg_i = miss_imgs[m];
+									const Variant *argsp[2] = { &arg_u, &arg_i };
+									Variant reg_var;
+									Callable::CallError cerr;
+									ktx2_register.callp(argsp, 2, reg_var, cerr);
+									if (cerr.error == Callable::CallError::CALL_OK) {
+										reg_tex = Ref<Texture2D>(reg_var);
+									}
+								} else {
+									Ref<ImageTexture> itex = ImageTexture::create_from_image(miss_imgs[m]);
+									if (itex.is_valid()) {
+										itex->set_meta("_ange_authored_block_texture", true);
+										if (!uitem.is_memory_slice && use_rescache_parallel) {
+											itex->set_path(uitem.pool_key, true);
+										}
+										reg_tex = itex;
+									}
+								}
+								ERR_FAIL_COND_V_MSG(reg_tex.is_null(), ERR_FILE_CORRUPT,
+										vformat("GLTF-KTX2-003: Failed to upload KTX2+UASTC texture '%s'.", uitem.label));
+								unique_texs[u] = reg_tex;
 							}
-						} else {
-							for (int k = 0; k < img_cnt; k++) {
-								Ref<Texture2D> ext_tex = ResourceLoader::load(resolved_uris[uint32_t(k)], "Texture2D", ResourceFormatLoader::CACHE_MODE_REUSE);
-								ERR_FAIL_COND_V_MSG(ext_tex.is_null(), ERR_FILE_CORRUPT,
-										vformat("GLTF-KTX2-003: Failed to transcode external KTX2 texture '%s'.", resolved_uris[uint32_t(k)]));
-								state_images.write[k] = ext_tex;
-							}
+						}
+
+						for (int k = 0; k < img_cnt; k++) {
+							state_images.write[k] = unique_texs[uint32_t(img_to_unique[uint32_t(k)])];
 						}
 					}
 				} else {
@@ -1857,6 +1947,7 @@ Error gltf_yyjson_populate_state(
 				Ref<GLTFTexture> gtex;
 				gtex.instantiate();
 				int src_img = -1;
+				bool has_webp_ext = false;
 				if (yyjson_val *texts = yyjson_obj_get(tobj, "extensions")) {
 					if (yyjson_is_obj(texts)) {
 						if (yyjson_val *kt = yyjson_obj_get(texts, "KHR_texture_basisu")) {
@@ -1864,9 +1955,10 @@ Error gltf_yyjson_populate_state(
 								src_img = int(yj_int(yyjson_obj_get(kt, "source"), -1));
 							}
 						}
-						if (src_img < 0 && !strict_ext_ktx2) {
-							if (yyjson_val *wt = yyjson_obj_get(texts, "EXT_texture_webp")) {
-								if (yyjson_is_obj(wt)) {
+						if (yyjson_val *wt = yyjson_obj_get(texts, "EXT_texture_webp")) {
+							if (yyjson_is_obj(wt)) {
+								has_webp_ext = true;
+								if (src_img < 0 && !strict_ext_ktx2) {
 									src_img = int(yj_int(yyjson_obj_get(wt, "source"), -1));
 								}
 							}
@@ -1874,8 +1966,13 @@ Error gltf_yyjson_populate_state(
 					}
 				}
 				if (strict_ext_ktx2) {
-					ERR_FAIL_COND_V_MSG(src_img < 0, ERR_FILE_UNRECOGNIZED,
-							vformat("GLTF-KTX2-001: Texture index '%d' must reference an external KTX2 image via extensions.KHR_texture_basisu.", ti));
+					ERR_FAIL_COND_V_MSG(has_webp_ext && src_img < 0, ERR_FILE_UNRECOGNIZED,
+							vformat("GLTF-KTX2-001: Texture index '%d' uses forbidden 'EXT_texture_webp'; only KTX2+UASTC is permitted.", ti));
+					if (src_img < 0) {
+						src_img = int(yj_int(yyjson_obj_get(tobj, "source"), -1));
+					}
+					ERR_FAIL_COND_V_MSG(src_img < 0 || src_img >= state_images.size(), ERR_FILE_UNRECOGNIZED,
+							vformat("GLTF-KTX2-001: Texture index '%d' does not reference a valid KTX2+UASTC image.", ti));
 				} else if (src_img < 0) {
 					src_img = int(yj_int(yyjson_obj_get(tobj, "source"), -1));
 				}
