@@ -1691,9 +1691,9 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 
 					RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, !is_reflection_probe);
 					render_list_params.framebuffer_format = fb_format;
-					render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
 
 					draw_list = RD::get_singleton()->draw_list_begin(framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, p_render_data->render_region, breadcrumb);
+					render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
 					_render_list(draw_list, fb_format, &render_list_params, 0, render_list_params.element_count);
 					RD::get_singleton()->draw_list_end();
 

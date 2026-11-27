@@ -5585,6 +5585,7 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin_for_screen(DisplayS
 #ifdef DEBUG_ENABLED
 	draw_list_framebuffer_format = screen_get_framebuffer_format(p_screen);
 #endif
+	draw_list_current_subpass = 0;
 	draw_list_subpass_count = 1;
 
 	RDD::RenderPassClearValue clear_value;
@@ -6424,6 +6425,8 @@ void RenderingDevice::draw_list_end() {
 	}
 
 	draw_list_bound_textures.clear();
+	draw_list_current_subpass = 0;
+	draw_list_subpass_count = 0;
 }
 
 /***************************/
